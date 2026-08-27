@@ -12,11 +12,9 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 
 let serviceAccount;
 try {
-  // Mencoba membersihkan newline ganda jika ada
   let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
   serviceAccount = JSON.parse(rawEnv);
 } catch (e) {
-  // Jika gagal parse langsung, perbaiki escape character \n pada private_key secara otomatis
   const fixedEnv = process.env.FIREBASE_SERVICE_ACCOUNT.replace(/\\n/g, '\n');
   serviceAccount = JSON.parse(fixedEnv);
 }
