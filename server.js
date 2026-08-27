@@ -5,13 +5,24 @@ const cors = require('cors');
 const { Bot: TelegramBot } = require('node-telegram-bot-api');
 const midtransClient = require('midtrans-client');
 
-// --- 1. INISIALISASI DATABASE FIREBASE (AMAN DENGAN VERCEL ENV) ---
+// --- 1. INISIALISASI DATABASE FIREBASE (AMAN TANPA JSON.PARSE ERROR) ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   throw new Error('FIREBASE_SERVICE_ACCOUNT environment variable is missing!');
 }
 
+let serviceAccount;
+try {
+  // Mencoba membersihkan newline ganda jika ada
+  let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+  serviceAccount = JSON.parse(rawEnv);
+} catch (e) {
+  // Jika gagal parse langsung, perbaiki escape character \n pada private_key secara otomatis
+  const fixedEnv = process.env.FIREBASE_SERVICE_ACCOUNT.replace(/\\n/g, '\n');
+  serviceAccount = JSON.parse(fixedEnv);
+}
+
 initializeApp({
-  credential: cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+  credential: cert(serviceAccount)
 });
 
 const db = getFirestore();
@@ -25,7 +36,6 @@ const TELEGRAM_BOT_TOKEN = '8897773724:AAGhoy1QDZF63Ws-8X7VhNNa-Mer8LXuYvc';
 const VIP_GROUP_ID = '-1004477570254'; 
 const PAYMENT_WEB_URL = 'https://aphelion-pay.vercel.app'; 
 
-// Inisialisasi bot TANPA polling karena berjalan secara Serverless (Webhook)
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
 console.log('Bot Telegram @aphelion_gatekeeper_bot dikonfigurasi untuk Vercel Webhook...');
@@ -48,7 +58,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
     
-    // Tangani Perintah /start atau /beli di DM
     if (update.message && update.message.text) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -68,7 +77,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
-    // Tangani Anggota Baru di Grup Publik
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
