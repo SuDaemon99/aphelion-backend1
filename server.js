@@ -5,18 +5,17 @@ const cors = require('cors');
 const { Bot: TelegramBot } = require('node-telegram-bot-api');
 const midtransClient = require('midtrans-client');
 
-// --- 1. INISIALISASI DATABASE FIREBASE (AMAN TANPA JSON.PARSE ERROR) ---
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-  throw new Error('FIREBASE_SERVICE_ACCOUNT environment variable is missing!');
+// --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
+if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
+  throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 environment variable is missing!');
 }
 
 let serviceAccount;
 try {
-  let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-  serviceAccount = JSON.parse(rawEnv);
+  const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8');
+  serviceAccount = JSON.parse(decoded);
 } catch (e) {
-  const fixedEnv = process.env.FIREBASE_SERVICE_ACCOUNT.replace(/\\n/g, '\n');
-  serviceAccount = JSON.parse(fixedEnv);
+  throw new Error('Gagal parse FIREBASE_SERVICE_ACCOUNT_B64: ' + e.message);
 }
 
 initializeApp({
@@ -30,19 +29,19 @@ app.use(express.json());
 app.use(cors());
 
 // --- 2. KONFIGURASI BOT TELEGRAM & URL ---
-const TELEGRAM_BOT_TOKEN = '8897773724:AAGhoy1QDZF63Ws-8X7VhNNa-Mer8LXuYvc';
-const VIP_GROUP_ID = '-1004477570254'; 
-const PAYMENT_WEB_URL = 'https://aphelion-pay.vercel.app'; 
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
+const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
-console.log('Bot Telegram @aphelion_gatekeeper_bot dikonfigurasi untuk Vercel Webhook...');
+console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
 // --- 3. KONFIGURASI MIDTRANS SNAP ---
 const snap = new midtransClient.Snap({
   isProduction: true,
-  serverKey: 'Mid-server-Xgr6izH0aExAYKVr9tySgqPU',
-  clientKey: 'Mid-client-gHmbjVrTmM94Zeek'
+  serverKey: process.env.MIDTRANS_SERVER_KEY,
+  clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
 // --- 4. ENDPOINT RUTE BACKEND ---
@@ -55,7 +54,7 @@ app.get('/', (req, res) => {
 app.post('/api/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
-    
+
     if (update.message && update.message.text) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -99,7 +98,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 app.post('/api/get-snap-token', async (req, res) => {
   try {
     const { username, email, amount } = req.body;
-    
+
     if (!username || !email || !amount) {
       return res.status(400).json({ error: 'Username, Email, dan Nominal wajib diisi!' });
     }
@@ -111,17 +110,17 @@ app.post('/api/get-snap-token', async (req, res) => {
 
     const userId = username.replace('@', '').toLowerCase();
     const orderId = 'APHELION-' + Date.now();
-    
+
     const parameter = {
       transaction_details: {
         order_id: orderId,
         gross_amount: payAmount
       },
-      custom_field1: userId, 
-      custom_field2: email,    
+      custom_field1: userId,
+      custom_field2: email,
       customer_details: {
         first_name: userId,
-        email: email             
+        email: email
       },
       item_details: [{
         id: 'aphelion-sub',
@@ -145,22 +144,22 @@ app.post('/api/payment-webhook', async (req, res) => {
     const notification = req.body;
     const transactionStatus = notification.transaction_status;
     const fraudStatus = notification.fraud_status;
-    
-    const userId = notification.custom_field1; 
-    const userEmail = notification.custom_field2; 
+
+    const userId = notification.custom_field1;
+    const userEmail = notification.custom_field2;
 
     if (transactionStatus == 'capture' || transactionStatus == 'settlement') {
       if (fraudStatus == 'accept' || !fraudStatus) {
-        
+
         const tokenMod = 'APHELION-' + Math.random().toString(36).substring(2, 10).toUpperCase();
         const expiredDate = new Date();
-        expiredDate.setDate(expiredDate.getDate() + 30); 
+        expiredDate.setDate(expiredDate.getDate() + 30);
 
         await db.collection('users').doc(userId).set({
           username: userId,
           email: userEmail || 'tidak_ada_email',
           token: tokenMod,
-          deviceId: null, 
+          deviceId: null,
           expiredAt: expiredDate,
           status: 'ACTIVE'
         });
@@ -172,9 +171,9 @@ app.post('/api/payment-webhook', async (req, res) => {
           if (chatDoc.exists) {
             const chatId = chatDoc.data().chatId;
             const invite = await bot.createChatInviteLink(VIP_GROUP_ID, { member_limit: 1 });
-            
+
             const msg = `🔥 **PEMBAYARAN BERHASIL!** 🔥\n\nSelamat datang di ekosistem Aphelion.\n\n🔑 **TOKEN MOD LU:** \`${tokenMod}\`\n\nSilakan bergabung ke Grup VIP melalui link sekali-pakai ini:\n👉 ${invite.invite_link}\n\n*Catatan: Saat login Mod nanti, token ini akan otomatis mengunci Device ID HP lu. Jangan berikan token ini ke siapapun.*`;
-            
+
             await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
           }
         } catch (err) {
@@ -182,7 +181,7 @@ app.post('/api/payment-webhook', async (req, res) => {
         }
       }
     }
-    
+
     res.status(200).json({ status: 'OK' });
   } catch (error) {
     console.error('Webhook Error:', error);
@@ -193,21 +192,21 @@ app.post('/api/payment-webhook', async (req, res) => {
 // D. Route Verifikasi Token Mod & Binding HWID (Device ID)
 app.post('/api/mod/verify', async (req, res) => {
   try {
-    const { username, token, deviceId } = req.body; 
-    
+    const { username, token, deviceId } = req.body;
+
     if (!username || !token || !deviceId) {
       return res.status(400).json({ error: 'Username, Token, dan Device ID wajib dikirim dari App!' });
     }
 
     const userId = username.replace('@', '').toLowerCase();
     const userDoc = await db.collection('users').doc(userId).get();
-    
+
     if (!userDoc.exists) {
       return res.status(404).json({ status: 'NOT_FOUND', message: 'User tidak terdaftar!' });
     }
 
     const userData = userDoc.data();
-    
+
     if (userData.token !== token) {
       return res.status(401).json({ status: 'INVALID_TOKEN', message: 'Token salah atau tidak valid!' });
     }
