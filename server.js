@@ -2,7 +2,7 @@ const express = require('express');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const cors = require('cors');
-const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
 const midtransClient = require('midtrans-client');
 
 // --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
@@ -35,8 +35,38 @@ app.use(cors());
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+// Helper function untuk send Telegram message
+const sendTelegramMessage = async (chatId, text, options = {}) => {
+  try {
+    const payload = {
+      chat_id: chatId,
+      text: text,
+      ...options
+    };
+    const response = await axios.post(`${TELEGRAM_API}/sendMessage`, payload);
+    return response.data;
+  } catch (error) {
+    console.error('Error sending Telegram message:', error.message);
+    throw error;
+  }
+};
+
+// Helper function untuk create invite link
+const createInviteLink = async (chatId, options = {}) => {
+  try {
+    const payload = {
+      chat_id: chatId,
+      ...options
+    };
+    const response = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, payload);
+    return response.data.result;
+  } catch (error) {
+    console.error('Error creating invite link:', error.message);
+    throw error;
+  }
+};
 
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
@@ -66,13 +96,13 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
       if (text.startsWith('/start') || text.startsWith('/beli')) {
         if (!username) {
-          await bot.sendMessage(chatId, "⚠️ Lu belum pasang Username Telegram! Pasang dulu di pengaturan profil lu biar sistem bisa ngenalin data lu.");
+          await sendTelegramMessage(chatId, "⚠️ Lu belum pasang Username Telegram! Pasang dulu di pengaturan profil lu biar sistem bisa ngenalin data lu.");
         } else {
           const userId = username.replace('@', '').toLowerCase();
           await db.collection('telegram_chats').doc(userId).set({ chatId: chatId });
 
           const pesan = `🌌 **Selamat Datang di Aphelion System!**\n\nUntuk mendapatkan akses Mod VIP dan Token, silakan lakukan pendaftaran dan pembayaran melalui gateway resmi kami:\n👉 ${PAYMENT_WEB_URL}\n\nPastikan lu mengisi form dengan username **@${username}** agar sistem bisa memproses akses lu secara otomatis.`;
-          await bot.sendMessage(chatId, pesan, { parse_mode: 'Markdown', disable_web_page_preview: true });
+          await sendTelegramMessage(chatId, pesan, { parse_mode: 'Markdown', disable_web_page_preview: true });
         }
       }
     }
@@ -85,7 +115,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       for (const member of newMembers) {
         if (!member.is_bot) {
           const pesan = `Halo [${member.first_name}](tg://user?id=${member.id})! Selamat datang di Aphelion Publik 🌌\n\nMau akses Mod VIP dan Token System? Langsung DM/Chat gua di @aphelion_gatekeeper_bot dan ketik perintah **/beli** untuk mendapatkan link pendaftaran resmi.`;
-          await bot.sendMessage(chatId, pesan, { parse_mode: 'Markdown' });
+          await sendTelegramMessage(chatId, pesan, { parse_mode: 'Markdown' });
         }
       }
     }
@@ -173,11 +203,11 @@ app.post('/api/payment-webhook', async (req, res) => {
           const chatDoc = await db.collection('telegram_chats').doc(userId).get();
           if (chatDoc.exists) {
             const chatId = chatDoc.data().chatId;
-            const invite = await bot.createChatInviteLink(VIP_GROUP_ID, { member_limit: 1 });
+            const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
 
             const msg = `🔥 **PEMBAYARAN BERHASIL!** 🔥\n\nSelamat datang di ekosistem Aphelion.\n\n🔑 **TOKEN MOD LU:** \`${tokenMod}\`\n\nSilakan bergabung ke Grup VIP melalui link sekali-pakai ini:\n👉 ${invite.invite_link}\n\n*Catatan: Saat login Mod nanti, token ini akan otomatis mengunci Device ID HP lu. Jangan berikan token ini ke siapapun.*`;
 
-            await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+            await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
           }
         } catch (err) {
           console.error("Gagal mengirim DM/Invite Link:", err.message);
