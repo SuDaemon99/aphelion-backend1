@@ -5,8 +5,8 @@ const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
+const { notifyOps, runReminders } = require('./ops');
 
-// --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
   throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 environment variable is missing!');
 }
@@ -29,7 +29,6 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// --- 2. KONFIGURASI BOT TELEGRAM & URL ---
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
@@ -64,7 +63,6 @@ const kickFromGroup = async (userId) => {
 
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
-// --- 3. KONFIGURASI MIDTRANS SNAP ---
 const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
 const isProduction = MIDTRANS_MODE === 'production';
 
@@ -74,23 +72,22 @@ const snap = new midtransClient.Snap({
   clientKey: isProduction ? process.env.MIDTRANS_CLIENT_KEY : process.env.MIDTRANS_SANDBOX_CLIENT_KEY
 });
 
-// --- 4. ENDPOINT RUTE BACKEND ---
-
 app.get('/', (req, res) => {
   res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Vercel!' });
 });
 
-// A. Endpoint Webhook Telegram
+// A. Webhook Telegram (+ health ping)
 app.post('/api/telegram-webhook', async (req, res) => {
-  // 🛡️ STEP 1: Validasi secret token Telegram
   if (req.headers['x-telegram-bot-api-secret-token'] !== process.env.TELEGRAM_SECRET_TOKEN) {
     return res.status(403).send('Invalid Telegram Secret Token');
   }
 
+  // 📡 health ping (fire & forget)
+  db.collection('settings').doc('app').set({ lastTelegramPing: new Date().toISOString() }, { merge: true }).catch(() => {});
+
   try {
     const update = req.body;
 
-    // --- Handle /start & /beli ---
     if (update.message && update.message.text) {
       const msg = update.message;
       const uid = String(msg.from.id);
@@ -107,7 +104,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
             updatedAt: new Date().toISOString()
           }, { merge: true });
 
-          // 🛡️ FASE 1: Maintenance mode menahan penjualan
           const setDoc2 = await db.collection('settings').doc('app').get();
           if (setDoc2.exists && setDoc2.data().maintenance === true) {
             await sendTelegramMessage(msg.chat.id, '🛠️ <b>Maintenance</b>\n\nSistem sedang dalam pemeliharaan. Penjualan dibuka kembali setelah selesai. Terima kasih! 🙏', { parse_mode: 'HTML' });
@@ -137,7 +133,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
-    // --- Welcome member baru di grup publik ---
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -157,14 +152,14 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-// B. Endpoint Snap Token
+// B. Snap Token (min price dari settings)
 app.post('/api/get-snap-token', async (req, res) => {
   try {
-    // 🛡️ FASE 1: Maintenance mode
     const setDoc = await db.collection('settings').doc('app').get();
     if (setDoc.exists && setDoc.data().maintenance === true) {
       return res.status(503).json({ error: 'Sistem sedang maintenance. Coba lagi nanti.' });
     }
+    const minPrice = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
 
     const { telegram_id, email, amount } = req.body;
 
@@ -176,8 +171,8 @@ app.post('/api/get-snap-token', async (req, res) => {
     }
 
     const payAmount = parseInt(amount);
-    if (payAmount < 10000) {
-      return res.status(400).json({ error: 'Minimal pembayaran adalah Rp 10.000!' });
+    if (payAmount < minPrice) {
+      return res.status(400).json({ error: `Minimal pembayaran adalah Rp ${minPrice}!` });
     }
 
     const uid = String(telegram_id);
@@ -199,12 +194,11 @@ app.post('/api/get-snap-token', async (req, res) => {
   }
 });
 
-// C. Webhook Midtrans (Auto-Invite & DM Token + 📒 LEDGER FINANSIAL)
+// C. Webhook Midtrans (ledger + planDays dinamis + OPS alert)
 app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
 
-    // 🛡️ STEP 2: Validasi signature Midtrans
     const serverKey = isProduction ? process.env.MIDTRANS_SERVER_KEY : process.env.MIDTRANS_SANDBOX_SERVER_KEY;
     const expectedSignature = crypto.createHash('sha512')
       .update(`${notification.order_id}${notification.status_code}${notification.gross_amount}${serverKey}`)
@@ -227,9 +221,16 @@ app.post('/api/payment-webhook', async (req, res) => {
           return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
         }
 
+        // 📡 health ping
+        db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
+
+        // ⚙️ planDays dinamis dari settings
+        const setDocP = await db.collection('settings').doc('app').get();
+        const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
+
         const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
         const expiredDate = new Date();
-        expiredDate.setDate(expiredDate.getDate() + 30);
+        expiredDate.setDate(expiredDate.getDate() + planDays);
 
         let username = null;
         try {
@@ -237,7 +238,6 @@ app.post('/api/payment-webhook', async (req, res) => {
           if (chatInfo.exists) username = chatInfo.data().username || null;
         } catch (e) { /* abaikan */ }
 
-        // 🛡️ FASE 1: simpan createdAt (buat statistik "new today")
         const existingUser = await db.collection('users').doc(uid).get();
         await db.collection('users').doc(uid).set({
           uid: uid,
@@ -247,10 +247,11 @@ app.post('/api/payment-webhook', async (req, res) => {
           deviceId: null,
           expiredAt: expiredDate,
           status: 'ACTIVE',
+          remindedH3: false,
+          remindedH1: false,
           createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
         });
 
-        // 📒 FASE 1: LEDGER FINANSIAL
         try {
           const amount = parseInt(notification.gross_amount) || 0;
           const dateKey = new Date().toISOString().slice(0, 10);
@@ -264,11 +265,13 @@ app.post('/api/payment-webhook', async (req, res) => {
           await db.collection('finance_daily').doc(dateKey).set({ date: dateKey }, { merge: true });
           await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
           await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
+
+          // 🚨 OPS ROOM: pembayaran masuk
+          await notifyOps(`💰 <b>Pembayaran Masuk</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code>\nOrder: ${notification.order_id}`);
         } catch (e) { console.error('Ledger write gagal:', e.message); }
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
 
-        // DM token + tombol VIP
         try {
           const chatDoc = await db.collection('telegram_chats').doc(uid).get();
           const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
@@ -304,7 +307,7 @@ app.post('/api/payment-webhook', async (req, res) => {
   }
 });
 
-// D. Verifikasi Token & Binding HWID
+// D. Verifikasi Token & Binding HWID (+ OPS alert mismatch)
 app.post('/api/mod/verify', async (req, res) => {
   try {
     const { token, deviceId } = req.body;
@@ -337,6 +340,7 @@ app.post('/api/mod/verify', async (req, res) => {
       console.log(`[HWID BOUND] Token dikunci ke Device ID: ${deviceId}`);
     } else if (userData.deviceId !== deviceId) {
       console.log(`[HWID MISMATCH] Upaya pemakaian token di perangkat lain: ${uid}`);
+      await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`);
       return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Akses Ditolak! Token ini sudah terikat di perangkat lain.' });
     }
 
@@ -346,7 +350,7 @@ app.post('/api/mod/verify', async (req, res) => {
   }
 });
 
-// E. Cron Job Pengecek Masa Aktif
+// E. Cron (expiry sweep + reminders + OPS alert)
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -378,17 +382,23 @@ app.get('/api/cron/check-expired', async (req, res) => {
       }
     }
 
-    // 🛡️ FASE 1: catat waktu cron terakhir
+    // ⏰ reminder H-3/H-1
+    let reminded = 0;
+    try { reminded = await runReminders(); } catch (e) { console.error('Reminders gagal:', e.message); }
+
     await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
 
-    res.status(200).json({ status: 'CRON_SUCCESS', user_expired: expiredCount });
+    if (expiredCount > 0 || reminded > 0) {
+      await notifyOps(`⏰ <b>Cron</b>: ${expiredCount} expired disapu • ${reminded} reminder terkirim`);
+    }
+
+    res.status(200).json({ status: 'CRON_SUCCESS', user_expired: expiredCount, reminders_sent: reminded });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// --- G. FASE 1: ADMIN PANEL API (JWT + RBAC) ---
+// G. ADMIN PANEL API
 app.use('/api/admin', require('./adminRoutes'));
 
-// --- 5. EKSPOR UNTUK VERCEL ---
 module.exports = app;
