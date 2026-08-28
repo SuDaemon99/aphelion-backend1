@@ -1,6 +1,6 @@
 const express = require('express');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
@@ -35,7 +35,6 @@ const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-// Helper: escape HTML biar nama user nggak ngerusak parse_mode HTML
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const sendTelegramMessage = async (chatId, text, options = {}) => {
@@ -94,14 +93,13 @@ app.post('/api/telegram-webhook', async (req, res) => {
     // --- Handle /start & /beli ---
     if (update.message && update.message.text) {
       const msg = update.message;
-      const uid = String(msg.from.id); // 🛡️ STEP 3: ID numerik, bukan username
+      const uid = String(msg.from.id);
       const text = msg.text;
 
       if (text.startsWith('/start') || text.startsWith('/beli')) {
         if (msg.chat.type !== 'private') {
           await sendTelegramMessage(msg.chat.id, '📩 Silakan buka chat pribadi (PM) dengan bot ini lalu ketik /beli untuk mendapatkan link pembayaran pribadi Anda.');
         } else {
-          // Simpan mapping uid -> chatId (chat pribadi)
           await db.collection('telegram_chats').doc(uid).set({
             chatId: msg.chat.id,
             username: msg.from.username || null,
@@ -109,7 +107,13 @@ app.post('/api/telegram-webhook', async (req, res) => {
             updatedAt: new Date().toISOString()
           }, { merge: true });
 
-          // Cek status langganan untuk ditampilkan
+          // 🛡️ FASE 1: Maintenance mode menahan penjualan
+          const setDoc2 = await db.collection('settings').doc('app').get();
+          if (setDoc2.exists && setDoc2.data().maintenance === true) {
+            await sendTelegramMessage(msg.chat.id, '🛠️ <b>Maintenance</b>\n\nSistem sedang dalam pemeliharaan. Penjualan dibuka kembali setelah selesai. Terima kasih! 🙏', { parse_mode: 'HTML' });
+            return res.status(200).json({ status: 'ok' });
+          }
+
           let statusText = '🔴 Belum ada langganan aktif';
           try {
             const uDoc = await db.collection('users').doc(uid).get();
@@ -123,7 +127,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 statusText = '🟠 Langganan kedaluwarsa';
               }
             }
-          } catch (e) { /* abaikan, status default */ }
+          } catch (e) { /* abaikan */ }
 
           const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
           const pesan = `🌌 <b>Aphelion Membership Bot</b>\n\nHalo, <b>${escapeHtml(msg.from.first_name)}</b>!\n\n📌 Status langganan: ${statusText}\n\nKlik link pembayaran pribadi Anda di bawah. Identitas Telegram terdeteksi otomatis — tidak perlu mengetik username.\n\n👉 <b><a href="${payLink}">[ BUKA HALAMAN PEMBAYARAN ]</a></b>\n\nSetelah pembayaran terverifikasi, token akses & undangan grup VIP dikirim otomatis ke chat ini.`;
@@ -153,9 +157,15 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-// B. Endpoint Snap Token — 🛡️ STEP 3: pakai telegram_id numerik
+// B. Endpoint Snap Token
 app.post('/api/get-snap-token', async (req, res) => {
   try {
+    // 🛡️ FASE 1: Maintenance mode
+    const setDoc = await db.collection('settings').doc('app').get();
+    if (setDoc.exists && setDoc.data().maintenance === true) {
+      return res.status(503).json({ error: 'Sistem sedang maintenance. Coba lagi nanti.' });
+    }
+
     const { telegram_id, email, amount } = req.body;
 
     if (!telegram_id || !email || !amount) {
@@ -189,12 +199,12 @@ app.post('/api/get-snap-token', async (req, res) => {
   }
 });
 
-// C. Webhook Midtrans (Auto-Invite & DM Token)
+// C. Webhook Midtrans (Auto-Invite & DM Token + 📒 LEDGER FINANSIAL)
 app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
 
-    // 🛡️ STEP 2: Validasi signature Midtrans (pakai key sesuai mode Sandbox/Production)
+    // 🛡️ STEP 2: Validasi signature Midtrans
     const serverKey = isProduction ? process.env.MIDTRANS_SERVER_KEY : process.env.MIDTRANS_SANDBOX_SERVER_KEY;
     const expectedSignature = crypto.createHash('sha512')
       .update(`${notification.order_id}${notification.status_code}${notification.gross_amount}${serverKey}`)
@@ -217,18 +227,18 @@ app.post('/api/payment-webhook', async (req, res) => {
           return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
         }
 
-        // Token akses acak kuat (bukan Math.random)
         const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
         const expiredDate = new Date();
         expiredDate.setDate(expiredDate.getDate() + 30);
 
-        // Ambil username tersimpan (opsional, hanya pelengkap)
         let username = null;
         try {
           const chatInfo = await db.collection('telegram_chats').doc(uid).get();
           if (chatInfo.exists) username = chatInfo.data().username || null;
         } catch (e) { /* abaikan */ }
 
+        // 🛡️ FASE 1: simpan createdAt (buat statistik "new today")
+        const existingUser = await db.collection('users').doc(uid).get();
         await db.collection('users').doc(uid).set({
           uid: uid,
           username: username,
@@ -236,12 +246,29 @@ app.post('/api/payment-webhook', async (req, res) => {
           token: tokenMod,
           deviceId: null,
           expiredAt: expiredDate,
-          status: 'ACTIVE'
+          status: 'ACTIVE',
+          createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
         });
+
+        // 📒 FASE 1: LEDGER FINANSIAL
+        try {
+          const amount = parseInt(notification.gross_amount) || 0;
+          const dateKey = new Date().toISOString().slice(0, 10);
+          await db.collection('transactions').doc(notification.order_id).set({
+            orderId: notification.order_id, uid, amount,
+            status: transactionStatus,
+            channel: notification.payment_type || 'unknown',
+            email: userEmail || null, mode: MIDTRANS_MODE,
+            paidAt: new Date().toISOString()
+          });
+          await db.collection('finance_daily').doc(dateKey).set({ date: dateKey }, { merge: true });
+          await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
+          await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
+        } catch (e) { console.error('Ledger write gagal:', e.message); }
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
 
-        // 🛡️ PATCH: DM token + TOMBOL INLINE VIP
+        // DM token + tombol VIP
         try {
           const chatDoc = await db.collection('telegram_chats').doc(uid).get();
           const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
@@ -277,10 +304,10 @@ app.post('/api/payment-webhook', async (req, res) => {
   }
 });
 
-// D. Verifikasi Token & Binding HWID — 🛡️ STEP 3: cari berdasarkan TOKEN (kompatibel app lama)
+// D. Verifikasi Token & Binding HWID
 app.post('/api/mod/verify', async (req, res) => {
   try {
-    const { token, deviceId } = req.body; // username opsional (legacy)
+    const { token, deviceId } = req.body;
 
     if (!token || !deviceId) {
       return res.status(400).json({ error: 'Token dan Device ID wajib dikirim dari App!' });
@@ -319,43 +346,7 @@ app.post('/api/mod/verify', async (req, res) => {
   }
 });
 
-// E. Endpoint Admin Kick
-app.post('/api/admin/kick', async (req, res) => {
-  try {
-    const { admin_secret, user_id, username, reason } = req.body;
-
-    if (admin_secret !== process.env.CRON_SECRET) {
-      return res.status(403).json({ error: 'Akses ditolak! Lu bukan Admin.' });
-    }
-
-    // Cari user: prioritas user_id numerik, fallback query username
-    let uid = null;
-    if (user_id && /^\d{5,15}$/.test(String(user_id))) {
-      uid = String(user_id);
-    } else if (username) {
-      const q = await db.collection('users').where('username', '==', username.replace('@', '').toLowerCase()).limit(1).get();
-      if (!q.empty) uid = q.docs[0].id;
-    }
-
-    if (!uid) return res.status(404).json({ error: 'User tidak ditemukan!' });
-
-    await db.collection('users').doc(uid).update({ status: 'BANNED' });
-
-    const chatDoc = await db.collection('telegram_chats').doc(uid).get();
-    const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-
-    try { await kickFromGroup(uid); } catch (e) { console.error('Gagal kick dari grup:', e.message); }
-
-    const msg = `🚫 <b>Akses Dicabut</b>\n\nAkses VIP Anda telah dicabut oleh admin.\nToken akses: 🔴 <i>nonaktif</i>\n\n<b>Alasan:</b> <i>${escapeHtml(reason) || 'Pelanggaran aturan.'}</i>\n\nJika merasa ini keliru, hubungi support.`;
-    await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML' });
-
-    res.json({ status: 'KICKED', message: `User ${uid} berhasil ditendang.` });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// F. Cron Job Pengecek Masa Aktif
+// E. Cron Job Pengecek Masa Aktif
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -387,11 +378,17 @@ app.get('/api/cron/check-expired', async (req, res) => {
       }
     }
 
+    // 🛡️ FASE 1: catat waktu cron terakhir
+    await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
+
     res.status(200).json({ status: 'CRON_SUCCESS', user_expired: expiredCount });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
+
+// --- G. FASE 1: ADMIN PANEL API (JWT + RBAC) ---
+app.use('/api/admin', require('./adminRoutes'));
 
 // --- 5. EKSPOR UNTUK VERCEL ---
 module.exports = app;
