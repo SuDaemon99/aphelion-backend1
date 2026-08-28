@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
+const { notifyOps, runReminders } = require('./ops');
 
 const db = getFirestore();
 const router = express.Router();
@@ -83,6 +84,7 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
     await db.collection('admin_accounts').doc(uname).update({ failCount: 0, lockedUntil: null, lastLoginAt: new Date().toISOString() });
     const token = jwt.sign({ sub: uname, role: acc.role }, JWT_SECRET, { expiresIn: '12h' });
     await logAudit(uname, 'LOGIN');
+    await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`);
     res.json({ token, role: acc.role, username: uname });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -148,7 +150,6 @@ router.get('/users', requireAuth, async (req, res) => {
       return res.json({ users: snap.docs.map(x => serializeUser(x.id, x.data())), nextCursor: null });
     }
     if (status) {
-      // Filter status → sort di memory (bebas composite index)
       const snap = await db.collection('users').where('status', '==', status).limit(200).get();
       const sorted = snap.docs
         .map(x => ({ id: x.id, u: x.data() }))
@@ -178,7 +179,7 @@ router.post('/users/:uid/extend', requireAuth, async (req, res) => {
     const u = d.data(); const now = new Date();
     const base = (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > now) ? u.expiredAt.toDate() : now;
     const newExp = new Date(base.getTime() + days * 86400000);
-    await db.collection('users').doc(req.params.uid).update({ expiredAt: newExp, status: 'ACTIVE' });
+    await db.collection('users').doc(req.params.uid).update({ expiredAt: newExp, status: 'ACTIVE', remindedH3: false, remindedH1: false });
     await logAudit(req.admin.sub, 'EXTEND', req.params.uid, { days });
     res.json({ status: 'OK', expiredAt: newExp.toISOString() });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -200,6 +201,7 @@ router.post('/users/:uid/ban', requireAuth, async (req, res) => {
       try { await sendTG(chatDoc.data().chatId, `🚫 <b>Akses Dicabut</b>\n\nAlasan: <i>${reason}</i>\nJika merasa keliru, hubungi support.`, { parse_mode: 'HTML' }); } catch (e) {}
     }
     await logAudit(req.admin.sub, 'BAN', req.params.uid, { reason });
+    await notifyOps(`🚫 <b>BAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> — ${reason}`);
     res.json({ status: 'BANNED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -211,6 +213,7 @@ router.post('/users/:uid/unban', requireAuth, async (req, res) => {
   const st = (u.expiredAt && u.expiredAt.toDate() > new Date()) ? 'ACTIVE' : 'EXPIRED';
   await db.collection('users').doc(req.params.uid).update({ status: st });
   await logAudit(req.admin.sub, 'UNBAN', req.params.uid, { newStatus: st });
+  await notifyOps(`🟢 <b>UNBAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> → ${st}`);
   res.json({ status: st });
 });
 
@@ -290,13 +293,19 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
 // ================= BOT CONTROL [OWNER] =================
 router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   const s = await db.collection('settings').doc('app').get();
-  res.json(s.exists ? s.data() : {});
+  let memberCount = null;
+  try {
+    const r = await axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: VIP_GROUP_ID });
+    memberCount = r.data.result;
+  } catch (e) { /* abaikan */ }
+  res.json({ ...(s.exists ? s.data() : {}), memberCount });
 });
 
 router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
   await db.collection('settings').doc('app').set({ maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled });
+  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub}`);
   res.json({ status: 'OK', maintenance: enabled });
 });
 
@@ -307,6 +316,7 @@ router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
   if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
   await sendTG(gid, String(text));
   await logAudit(req.admin.sub, 'BROADCAST', target, { length: text.length });
+  await notifyOps(`📢 <b>Broadcast</b> ke ${target} oleh ${req.admin.sub}`);
   res.json({ status: 'SENT' });
 });
 
@@ -319,9 +329,27 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
     try { await kickFromGroup(doc.id); } catch (e) {}
     n++;
   }
+  let reminded = 0;
+  try { reminded = await runReminders(); } catch (e) {}
   await db.collection('settings').doc('app').set({ lastCronRun: now.toISOString() }, { merge: true });
-  await logAudit(req.admin.sub, 'CRON_RUN', null, { expired: n });
-  res.json({ status: 'CRON_SUCCESS', user_expired: n });
+  await logAudit(req.admin.sub, 'CRON_RUN', null, { expired: n, reminded });
+  await notifyOps(`⏰ <b>Cron manual</b> oleh ${req.admin.sub}: ${n} expired • ${reminded} reminder`);
+  res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
+});
+
+// ================= SETTINGS [OWNER] =================
+router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
+  const { price, planDays } = req.body || {};
+  const patch = {};
+  if (price) patch.price = parseInt(price);
+  if (planDays) patch.planDays = parseInt(planDays);
+  if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Tidak ada yang diupdate' });
+  patch.updatedAt = new Date().toISOString();
+  patch.updatedBy = req.admin.sub;
+  await db.collection('settings').doc('app').set(patch, { merge: true });
+  await logAudit(req.admin.sub, 'SETTINGS_UPDATE', null, patch);
+  await notifyOps(`⚙️ <b>Settings</b> diubah ${req.admin.sub}: ${JSON.stringify(patch)}`);
+  res.json({ status: 'OK' });
 });
 
 // ================= ADMIN ACCOUNTS [OWNER] =================
@@ -341,6 +369,7 @@ router.post('/admins', requireAuth, requireOwner, async (req, res) => {
     createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null
   });
   await logAudit(req.admin.sub, 'ADMIN_CREATE', uname);
+  await notifyOps(`👥 <b>Admin baru</b>: ${uname} dibuat oleh ${req.admin.sub}`);
   res.json({ status: 'CREATED' });
 });
 
@@ -350,6 +379,7 @@ router.post('/admins/:username/deactivate', requireAuth, requireOwner, async (re
   if (t.data().role === 'owner' || req.params.username === req.admin.sub) return res.status(403).json({ error: 'Tidak bisa menonaktifkan owner / diri sendiri' });
   await db.collection('admin_accounts').doc(req.params.username).update({ active: false });
   await logAudit(req.admin.sub, 'ADMIN_DEACTIVATE', req.params.username);
+  await notifyOps(`⛔ <b>Admin dinonaktifkan</b>: ${req.params.username} oleh ${req.admin.sub}`);
   res.json({ status: 'OK' });
 });
 
