@@ -66,10 +66,13 @@ const kickFromGroup = async (userId) => {
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
 // --- 3. KONFIGURASI MIDTRANS SNAP ---
+const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
+const isProduction = MIDTRANS_MODE === 'production';
+
 const snap = new midtransClient.Snap({
-  isProduction: true,
-  serverKey: process.env.MIDTRANS_SERVER_KEY,
-  clientKey: process.env.MIDTRANS_CLIENT_KEY
+  isProduction: isProduction,
+  serverKey: isProduction ? process.env.MIDTRANS_SERVER_KEY : process.env.MIDTRANS_SANDBOX_SERVER_KEY,
+  clientKey: isProduction ? process.env.MIDTRANS_CLIENT_KEY : process.env.MIDTRANS_SANDBOX_CLIENT_KEY
 });
 
 // --- 4. ENDPOINT RUTE BACKEND ---
@@ -191,8 +194,8 @@ app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
 
-    // 🛡️ STEP 2: Validasi signature Midtrans
-    const serverKey = process.env.MIDTRANS_SERVER_KEY;
+        // 🛡️ STEP 2: Validasi signature Midtrans (pakai key sesuai mode Sandbox/Production)
+    const serverKey = isProduction ? process.env.MIDTRANS_SERVER_KEY : process.env.MIDTRANS_SANDBOX_SERVER_KEY;
     const expectedSignature = crypto.createHash('sha512')
       .update(`${notification.order_id}${notification.status_code}${notification.gross_amount}${serverKey}`)
       .digest('hex');
