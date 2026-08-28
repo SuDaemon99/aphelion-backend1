@@ -43,7 +43,7 @@ const sendTelegramMessage = async (chatId, text, options = {}) => {
     const response = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
     return response.data;
   } catch (error) {
-    console.error('Error sending Telegram message:', error.message);
+    console.error('Error sending Telegram message:', error.response ? JSON.stringify(error.response.data) : error.message);
     throw error;
   }
 };
@@ -53,7 +53,7 @@ const createInviteLink = async (chatId, options = {}) => {
     const response = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: chatId, ...options });
     return response.data.result;
   } catch (error) {
-    console.error('Error creating invite link:', error.message);
+    console.error('Error creating invite link:', error.response ? JSON.stringify(error.response.data) : error.message);
     throw error;
   }
 };
@@ -194,7 +194,7 @@ app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
 
-        // 🛡️ STEP 2: Validasi signature Midtrans (pakai key sesuai mode Sandbox/Production)
+    // 🛡️ STEP 2: Validasi signature Midtrans (pakai key sesuai mode Sandbox/Production)
     const serverKey = isProduction ? process.env.MIDTRANS_SERVER_KEY : process.env.MIDTRANS_SANDBOX_SERVER_KEY;
     const expectedSignature = crypto.createHash('sha512')
       .update(`${notification.order_id}${notification.status_code}${notification.gross_amount}${serverKey}`)
@@ -241,16 +241,25 @@ app.post('/api/payment-webhook', async (req, res) => {
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
 
+        // 🛡️ PATCH: DM token TETAP terkirim walau invite gagal
         try {
           const chatDoc = await db.collection('telegram_chats').doc(uid).get();
           const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-          const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
 
-          const msg = `✅ <b>Pembayaran Terverifikasi</b>\n\nTerima kasih! Langganan VIP Anda aktif sampai <b>${expiredDate.toLocaleString('id-ID')}</b>.\n\n🔑 <b>Token akses Anda:</b>\n<code>${tokenMod}</code>\n\n🚪 Masuk grup VIP (link khusus akun Anda):\n👉 <b>${invite.invite_link}</b>\n\n⚠️ Token bersifat pribadi & terikat satu perangkat setelah aktivasi pertama. Jangan bagikan ke siapa pun.`;
+          // Invite dicoba dulu; kalau gagal, DM token TETAP terkirim
+          let inviteText = '⚠️ Link invite VIP gagal dibuat otomatis. Hubungi admin untuk diundang manual.';
+          try {
+            const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
+            inviteText = `🚪 Masuk grup VIP (link khusus akun Anda):\n👉 <b>${invite.invite_link}</b>`;
+          } catch (invErr) {
+            console.error('Gagal buat invite link VIP:', invErr.response ? JSON.stringify(invErr.response.data) : invErr.message);
+          }
+
+          const msg = `✅ <b>Pembayaran Terverifikasi</b>\n\nTerima kasih! Langganan VIP Anda aktif sampai <b>${expiredDate.toLocaleString('id-ID')}</b>.\n\n🔑 <b>Token akses Anda:</b>\n<code>${tokenMod}</code>\n\n${inviteText}\n\n⚠️ Token bersifat pribadi & terikat satu perangkat setelah aktivasi pertama. Jangan bagikan ke siapa pun.`;
 
           await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML' });
         } catch (err) {
-          console.error("Gagal mengirim DM/Invite Link:", err.message);
+          console.error("Gagal mengirim DM:", err.response ? JSON.stringify(err.response.data) : err.message);
         }
       }
     }
