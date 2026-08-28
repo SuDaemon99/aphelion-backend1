@@ -296,7 +296,7 @@ router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   let memberCount = null;
   try {
     const r = await axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: VIP_GROUP_ID });
-    memberCount = r.data.result;
+    memberCount = Math.max((r.data.result || 0) - 1, 0);
   } catch (e) { /* abaikan */ }
   res.json({ ...(s.exists ? s.data() : {}), memberCount });
 });
@@ -343,6 +343,8 @@ router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
   const patch = {};
   if (price) patch.price = parseInt(price);
   if (planDays) patch.planDays = parseInt(planDays);
+  if (req.body.vipHumans !== undefined) patch.vipHumans = parseInt(req.body.vipHumans);
+  if (req.body.publicHumans !== undefined) patch.publicHumans = parseInt(req.body.publicHumans);
   if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Tidak ada yang diupdate' });
   patch.updatedAt = new Date().toISOString();
   patch.updatedBy = req.admin.sub;
