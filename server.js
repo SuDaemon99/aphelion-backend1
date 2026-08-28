@@ -1,5 +1,5 @@
 const express = require('express');
-const { initializeApp, cert } = require('firebase-admin/app');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const cors = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
@@ -18,9 +18,12 @@ try {
   throw new Error('Gagal parse FIREBASE_SERVICE_ACCOUNT_B64: ' + e.message);
 }
 
-initializeApp({
-  credential: cert(serviceAccount)
-});
+// Cek apakah Firebase sudah diinit
+if (getApps().length === 0) {
+  initializeApp({
+    credential: cert(serviceAccount)
+  });
+}
 
 const db = getFirestore();
 const app = express();
