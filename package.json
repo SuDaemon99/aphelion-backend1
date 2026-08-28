@@ -7,10 +7,10 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "axios": "^1.7.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "firebase-admin": "^14.3.0",
-    "midtrans-client": "^1.4.3",
-    "node-telegram-bot-api": "^2.1.0"
+    "midtrans-client": "^1.4.3"
   }
 }
