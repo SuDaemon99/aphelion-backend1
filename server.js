@@ -4,6 +4,7 @@ const { getFirestore } = require('firebase-admin/firestore');
 const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
+const crypto = require('crypto'); // 👈 TAMBAHAN: Untuk validasi signature Midtrans
 
 // --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
@@ -85,6 +86,11 @@ app.get('/', (req, res) => {
 
 // A. Endpoint Webhook untuk Menerima Pesan dari Telegram
 app.post('/api/telegram-webhook', async (req, res) => {
+  // 🛡️ STEP 1: VALIDASI TELEGRAM SECRET TOKEN
+  if (req.headers['x-telegram-bot-api-secret-token'] !== process.env.TELEGRAM_SECRET_TOKEN) {
+    return res.status(403).send('Invalid Telegram Secret Token');
+  }
+
   try {
     const update = req.body;
 
@@ -177,6 +183,18 @@ app.post('/api/get-snap-token', async (req, res) => {
 app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
+    
+    // 🛡️ STEP 2: VALIDASI SIGNATURE MIDTRANS
+    const serverKey = process.env.MIDTRANS_SERVER_KEY;
+    const expectedSignature = crypto.createHash('sha512')
+      .update(`${notification.order_id}${notification.status_code}${notification.gross_amount}${serverKey}`)
+      .digest('hex');
+
+    if (expectedSignature !== notification.signature_key) {
+      console.error('Midtrans Signature Mismatch! Potential spoofing attempt.');
+      return res.status(403).json({ error: 'Invalid signature' });
+    }
+
     const transactionStatus = notification.transaction_status;
     const fraudStatus = notification.fraud_status;
 
