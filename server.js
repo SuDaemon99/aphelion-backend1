@@ -241,23 +241,29 @@ app.post('/api/payment-webhook', async (req, res) => {
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
 
-        // 🛡️ PATCH: DM token TETAP terkirim walau invite gagal
+        // 🛡️ PATCH: DM token + TOMBOL INLINE VIP
         try {
           const chatDoc = await db.collection('telegram_chats').doc(uid).get();
           const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
 
-          // Invite dicoba dulu; kalau gagal, DM token TETAP terkirim
           let inviteText = '⚠️ Link invite VIP gagal dibuat otomatis. Hubungi admin untuk diundang manual.';
+          let inviteMarkup = undefined;
           try {
             const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
-            inviteText = `🚪 Masuk grup VIP (link khusus akun Anda):\n👉 <b>${invite.invite_link}</b>`;
+            inviteText = '🚪 Ketuk tombol di bawah untuk masuk (link sekali pakai, khusus akun Anda):';
+            inviteMarkup = {
+              inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]]
+            };
           } catch (invErr) {
             console.error('Gagal buat invite link VIP:', invErr.response ? JSON.stringify(invErr.response.data) : invErr.message);
           }
 
           const msg = `✅ <b>Pembayaran Terverifikasi</b>\n\nTerima kasih! Langganan VIP Anda aktif sampai <b>${expiredDate.toLocaleString('id-ID')}</b>.\n\n🔑 <b>Token akses Anda:</b>\n<code>${tokenMod}</code>\n\n${inviteText}\n\n⚠️ Token bersifat pribadi & terikat satu perangkat setelah aktivasi pertama. Jangan bagikan ke siapa pun.`;
 
-          await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML' });
+          await sendTelegramMessage(chatId, msg, {
+            parse_mode: 'HTML',
+            ...(inviteMarkup ? { reply_markup: inviteMarkup } : {})
+          });
         } catch (err) {
           console.error("Gagal mengirim DM:", err.response ? JSON.stringify(err.response.data) : err.message);
         }
