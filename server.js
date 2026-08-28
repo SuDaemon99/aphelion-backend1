@@ -2,7 +2,7 @@ const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const cors = require('cors');
-const { Bot: TelegramBot } = require('node-telegram-bot-api');
+const TelegramBot = require('node-telegram-bot-api');
 const midtransClient = require('midtrans-client');
 
 // --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
@@ -33,7 +33,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
