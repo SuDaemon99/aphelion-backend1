@@ -2,7 +2,7 @@ const express = require('express');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const cors = require('cors');
-const TelegramBot = require('node-telegram-bot-api');
+const TelegramBot = require('node-telegram-bot-api').default || require('node-telegram-bot-api');
 const midtransClient = require('midtrans-client');
 
 // --- 1. INISIALISASI FIREBASE PAKAI BASE64 ---
