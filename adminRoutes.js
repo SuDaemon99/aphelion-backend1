@@ -147,9 +147,15 @@ router.get('/users', requireAuth, async (req, res) => {
       const snap = await db.collection('users').where('username', '==', qq.toLowerCase()).limit(limit).get();
       return res.json({ users: snap.docs.map(x => serializeUser(x.id, x.data())), nextCursor: null });
     }
-    let ref = db.collection('users').orderBy('expiredAt', 'desc');
-    if (status) ref = ref.where('status', '==', status);
-    ref = ref.limit(limit);
+    if (status) {
+      // Filter status → sort di memory (bebas composite index)
+      const snap = await db.collection('users').where('status', '==', status).limit(200).get();
+      const sorted = snap.docs
+        .map(x => ({ id: x.id, u: x.data() }))
+        .sort((a, b) => (b.u.expiredAt && b.u.expiredAt.toMillis ? b.u.expiredAt.toMillis() : 0) - (a.u.expiredAt && a.u.expiredAt.toMillis ? a.u.expiredAt.toMillis() : 0));
+      return res.json({ users: sorted.map(x => serializeUser(x.id, x.u)), nextCursor: null });
+    }
+    let ref = db.collection('users').orderBy('expiredAt', 'desc').limit(limit);
     if (cursor) ref = ref.startAfter(new Date(parseInt(cursor)));
     const snap = await ref.get();
     const users = snap.docs.map(x => serializeUser(x.id, x.data()));
