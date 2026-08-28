@@ -21,6 +21,18 @@ const logAudit = async (admin, action, target = null, meta = {}) => {
   } catch (e) { console.error('Audit log gagal:', e.message); }
 };
 
+const serializeUser = (id, u) => ({
+  id,
+  uid: u.uid || null,
+  username: u.username || null,
+  email: u.email || null,
+  token: u.token || null,
+  deviceId: u.deviceId || null,
+  status: u.status || null,
+  expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
+  createdAt: u.createdAt || null
+});
+
 const sendTG = async (chatId, text, options = {}) => {
   const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
   return r.data;
@@ -130,17 +142,17 @@ router.get('/users', requireAuth, async (req, res) => {
       const qq = String(q).trim();
       if (/^\d{5,15}$/.test(qq)) {
         const d = await db.collection('users').doc(qq).get();
-        return res.json({ users: d.exists ? [{ id: qq, ...d.data() }] : [], nextCursor: null });
+        return res.json({ users: d.exists ? [serializeUser(qq, d.data())] : [], nextCursor: null });
       }
       const snap = await db.collection('users').where('username', '==', qq.toLowerCase()).limit(limit).get();
-      return res.json({ users: snap.docs.map(x => ({ id: x.id, ...x.data() })), nextCursor: null });
+      return res.json({ users: snap.docs.map(x => serializeUser(x.id, x.data())), nextCursor: null });
     }
     let ref = db.collection('users').orderBy('expiredAt', 'desc');
     if (status) ref = ref.where('status', '==', status);
     ref = ref.limit(limit);
     if (cursor) ref = ref.startAfter(new Date(parseInt(cursor)));
     const snap = await ref.get();
-    const users = snap.docs.map(x => ({ id: x.id, ...x.data() }));
+    const users = snap.docs.map(x => serializeUser(x.id, x.data()));
     const last = snap.docs[snap.docs.length - 1];
     res.json({ users, nextCursor: last && last.data().expiredAt ? last.data().expiredAt.toMillis() : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -149,7 +161,7 @@ router.get('/users', requireAuth, async (req, res) => {
 router.get('/users/:uid', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
-  res.json({ id: d.id, ...d.data() });
+  res.json(serializeUser(d.id, d.data()));
 });
 
 router.post('/users/:uid/extend', requireAuth, async (req, res) => {
