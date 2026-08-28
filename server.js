@@ -61,6 +61,17 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
+// 📊 counter member REAL (exclude bot & staff)
+const bumpHumans = async (chatId, delta) => {
+  const cid = String(chatId);
+  const field = cid === String(VIP_GROUP_ID) ? 'vipHumans'
+    : (PUBLIC_GROUP_ID_SAFE && cid === String(PUBLIC_GROUP_ID_SAFE) ? 'publicHumans' : null);
+  if (!field) return;
+  await db.collection('settings').doc('app').set({ [field]: FieldValue.increment(delta) }, { merge: true }).catch(() => {});
+};
+
+const PUBLIC_GROUP_ID_SAFE = process.env.PUBLIC_GROUP_ID || null;
+
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
 const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
@@ -82,7 +93,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
     return res.status(403).send('Invalid Telegram Secret Token');
   }
 
-  // 📡 health ping (fire & forget)
   db.collection('settings').doc('app').set({ lastTelegramPing: new Date().toISOString() }, { merge: true }).catch(() => {});
 
   try {
@@ -133,16 +143,31 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
+    // 📊 member baru masuk → hitung yang REAL (bukan bot, bukan staff)
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
 
       for (const member of update.message.new_chat_members) {
         if (!member.is_bot) {
+          let isStaff = false;
+          try {
+            const mc = await axios.post(`${TELEGRAM_API}/getChatMember`, { chat_id: chatId, user_id: member.id });
+            const st = mc.data.result.status;
+            isStaff = (st === 'creator' || st === 'administrator');
+          } catch (e) { /* abaikan */ }
+          if (!isStaff) await bumpHumans(chatId, +1);
+
           const pesan = `👋 Selamat datang di ruang publik Aphelion, <a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>!\n\nDi sini tempat info umum, pengumuman, dan komunitas.\nUntuk paket Premium/VIP, chat bot resmi kami dan ketik <b>/beli</b>.\n\n⚠️ Keamanan: Admin & bot tidak pernah meminta password/OTP. Pembayaran hanya melalui invoice Midtrans resmi.`;
           await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
         }
       }
+    }
+
+    // 📊 member keluar / di-kick → kurangi counter
+    if (update.message && update.message.left_chat_member) {
+      const m = update.message.left_chat_member;
+      if (!m.is_bot) await bumpHumans(update.message.chat.id, -1);
     }
 
     res.status(200).json({ status: 'ok' });
@@ -221,10 +246,8 @@ app.post('/api/payment-webhook', async (req, res) => {
           return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
         }
 
-        // 📡 health ping
         db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
 
-        // ⚙️ planDays dinamis dari settings
         const setDocP = await db.collection('settings').doc('app').get();
         const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
 
@@ -266,7 +289,6 @@ app.post('/api/payment-webhook', async (req, res) => {
           await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
           await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
 
-          // 🚨 OPS ROOM: pembayaran masuk
           await notifyOps(`💰 <b>Pembayaran Masuk</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code>\nOrder: ${notification.order_id}`);
         } catch (e) { console.error('Ledger write gagal:', e.message); }
 
@@ -382,7 +404,6 @@ app.get('/api/cron/check-expired', async (req, res) => {
       }
     }
 
-    // ⏰ reminder H-3/H-1
     let reminded = 0;
     try { reminded = await runReminders(); } catch (e) { console.error('Reminders gagal:', e.message); }
 
