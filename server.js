@@ -96,12 +96,13 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
       if (text.startsWith('/start') || text.startsWith('/beli')) {
         if (!username) {
-          await sendTelegramMessage(chatId, "⚠️ Lu belum pasang Username Telegram! Pasang dulu di pengaturan profil lu biar sistem bisa ngenalin data lu.");
+          await sendTelegramMessage(chatId, "⚠️ <b>Akses Tertunda!</b> Lu belum memasang Username Telegram. Pasang dulu di pengaturan profil lu agar AI kami bisa mengenali dan mengamankan data lu.");
         } else {
           const userId = username.replace('@', '').toLowerCase();
           await db.collection('telegram_chats').doc(userId).set({ chatId: chatId });
 
-          const pesan = `🌌 <b>Selamat Datang di Aphelion System!</b>\n\nUntuk mendapatkan akses Mod VIP dan Token, silakan lakukan pendaftaran dan pembayaran melalui gateway resmi kami:\n👉 ${PAYMENT_WEB_URL}\n\nPastikan lu mengisi form dengan username <b>@${username}</b> agar sistem bisa memproses akses lu secara otomatis.`;
+          const pesan = `🌌 <b>[ APHELION SYSTEM PROTOCOL INITIATED ]</b> 🌌\n\nStatus Akses: 🔴 <i>UNAUTHORIZED</i>\nUser Terdeteksi: <b>@${username}</b>\n\nSistem eksklusif Aphelion tidak terbuka untuk umum. Ini adalah <i>private circle</i> bagi mereka yang menginginkan supremasi sistem mutlak.\n\n⚡ <b>Kenapa bergabung?</b>\nAkses VIP memberikan lu token bypass dan modifikasi sistem tingkat dewa yang tidak akan lu temukan di publik.\n\nBuktikan lu layak masuk. Lakukan otorisasi dan amankan slot lu sekarang sebelum kuota penuh:\n👉 <b><a href="${PAYMENT_WEB_URL}">[ KLIK UNTUK REGISTRASI & PEMBAYARAN ]</a></b>\n\n<i>Note: Masukkan persis username <b>@${username}</b> di form pembayaran agar sistem kami bisa membuka gerbang otomatis untuk lu.</i>`;
+          
           await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML', disable_web_page_preview: true });
         }
       }
@@ -114,7 +115,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
       for (const member of newMembers) {
         if (!member.is_bot) {
-          const pesan = `Halo <a href="tg://user?id=${member.id}">${member.first_name}</a>! Selamat datang di Aphelion Publik 🌌\n\nMau akses Mod VIP dan Token System? Langsung DM/Chat gua di @aphelion_gatekeeper_bot dan ketik perintah <b>/beli</b> untuk mendapatkan link pendaftaran resmi.`;
+          const pesan = `⚠️ <b>SYSTEM ALERT: NEW ENTITY DETECTED</b> ⚠️\n\nSelamat datang di ruang tunggu Aphelion, <a href="tg://user?id=${member.id}">${member.first_name}</a>.\n\nLu saat ini berada di zona publik. Kekuatan sesungguhnya (VIP Mod, Token Bypass, & Private Community) tersembunyi di balik tembok eksklusif kami.\n\nPunya nyali buat <i>upgrade</i> level lu?\nLangsung chat AI Penjaga Gerbang kami di @aphelion_gatekeeper_bot dan ketik <b>/beli</b> untuk mengklaim kunci VIP lu sekarang.`;
+          
           await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
         }
       }
@@ -159,7 +161,7 @@ app.post('/api/get-snap-token', async (req, res) => {
         id: 'aphelion-sub',
         price: payAmount,
         quantity: 1,
-        name: 'Aphelion System Access'
+        name: 'Aphelion VIP Access'
       }]
     };
 
@@ -205,7 +207,7 @@ app.post('/api/payment-webhook', async (req, res) => {
             const chatId = chatDoc.data().chatId;
             const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
 
-            const msg = `🔥 <b>PEMBAYARAN BERHASIL!</b> 🔥\n\nSelamat datang di ekosistem Aphelion.\n\n🔑 <b>TOKEN MOD LU:</b> <code>${tokenMod}</code>\n\nSilakan bergabung ke Grup VIP melalui link sekali-pakai ini:\n👉 ${invite.invite_link}\n\n<i>Catatan: Saat login Mod nanti, token ini akan otomatis mengunci Device ID HP lu. Jangan berikan token ini ke siapapun.</i>`;
+            const msg = `✅ <b>[ TRANSACTION VERIFIED: ACCESS GRANTED ]</b> ✅\n\nSelamat datang di <i>Elite Circle</i> Aphelion. Pembayaran lu berhasil divalidasi.\n\n🔑 <b>TOKEN OTORISASI MOD LU:</b>\n<code>${tokenMod}</code>\n\nBergegaslah, gerbang VIP telah terbuka. Gunakan link sekali-pakai ini untuk masuk ke markas utama:\n👉 <b>${invite.invite_link}</b>\n\n⚠️ <b>PERINGATAN PROTOKOL:</b>\nToken di atas akan mengunci <b>Device ID (HWID)</b> HP lu saat login Mod pertama kali. Sistem keamanan kami sangat ketat. Berbagi token = <b>BANNED PERMANEN</b> tanpa <i>refund</i>.`;
 
             await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML' });
           }
@@ -259,6 +261,77 @@ app.post('/api/mod/verify', async (req, res) => {
     }
 
     res.status(200).json({ status: 'ACTIVE', message: 'Otentikasi Berhasil!', expiredAt: expDate });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// E. Endpoint Admin Kick (Cabut Akses Paksa)
+app.post('/api/admin/kick', async (req, res) => {
+  try {
+    const { admin_secret, username, reason } = req.body;
+    
+    if (admin_secret !== process.env.CRON_SECRET) {
+      return res.status(403).json({ error: 'Akses ditolak! Lu bukan Admin.' });
+    }
+
+    const userId = username.replace('@', '').toLowerCase();
+    await db.collection('users').doc(userId).update({ status: 'BANNED' });
+
+    const chatDoc = await db.collection('telegram_chats').doc(userId).get();
+    if (chatDoc.exists) {
+      const numericId = chatDoc.data().chatId;
+      
+      await axios.post(`${TELEGRAM_API}/banChatMember`, { chat_id: VIP_GROUP_ID, user_id: numericId });
+      await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: numericId });
+      
+      const msg = `🚫 <b>[ PROTOKOL ELIMINASI AKTIF ]</b> 🚫\n\nAkses VIP lu telah <b>DICABUT PAKSA</b> oleh sistem. \nToken Mod: 🔴 <i>DESTROYED</i>\n\n<b>Alasan:</b> <i>${reason || 'Pelanggaran keamanan / Aturan sistem.'}</i>\n\nDi Aphelion, aturan adalah mutlak.`;
+      await sendTelegramMessage(numericId, msg, { parse_mode: 'HTML' });
+    }
+
+    res.json({ status: 'KICKED', message: `User ${username} berhasil ditendang dan diblokir dari Mod.` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// F. Endpoint Cron Job (Pengecek Masa Aktif Otomatis)
+app.get('/api/cron/check-expired', async (req, res) => {
+  try {
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).send('Unauthorized CRON trigger');
+    }
+
+    const now = new Date();
+    const snapshot = await db.collection('users')
+      .where('status', '==', 'ACTIVE')
+      .where('expiredAt', '<', now)
+      .get();
+
+    let expiredCount = 0;
+    for (const doc of snapshot.docs) {
+      const userData = doc.data();
+      const userId = userData.username;
+
+      await db.collection('users').doc(userId).update({ status: 'EXPIRED' });
+      expiredCount++;
+
+      const chatDoc = await db.collection('telegram_chats').doc(userId).get();
+      if (chatDoc.exists) {
+        const numericId = chatDoc.data().chatId;
+        try {
+          await axios.post(`${TELEGRAM_API}/banChatMember`, { chat_id: VIP_GROUP_ID, user_id: numericId });
+          await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: numericId });
+          
+          const msg = `⏳ <b>[ SYSTEM WARNING: AKSES EXPIRED ]</b> ⏳\n\nWaktu lu habis. Masa aktif langganan VIP dan Token Mod lu telah kedaluwarsa hari ini. \nStatus Mod: 🔴 <i>LOCKED</i>\n\nJangan biarkan supremasi lu hilang begitu saja. Lakukan perpanjangan sekarang untuk memulihkan akses dan kembali ke dalam VIP:\n👉 <b><a href="${PAYMENT_WEB_URL}">[ KLIK UNTUK PERPANJANG AKSES ]</a></b>`;
+          await sendTelegramMessage(numericId, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
+        } catch (err) {
+          console.error(`Gagal kick/DM user ${userId}:`, err.message);
+        }
+      }
+    }
+
+    res.status(200).json({ status: 'CRON_SUCCESS', user_expired: expiredCount });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
