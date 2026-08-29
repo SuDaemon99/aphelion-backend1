@@ -46,6 +46,16 @@ const broadcastAll = async (text) => {
   }
 };
 
+const liveHumans = async (gid) => {
+  try {
+    const [c, a] = await Promise.all([
+      axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: gid }),
+      axios.post(`${TELEGRAM_API}/getChatAdministrators`, { chat_id: gid })
+    ]);
+    return Math.max((c.data.result || 0) - (a.data.result || []).length, 0);
+  } catch (e) { return 0; }
+};
+
 const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/banChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
