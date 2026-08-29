@@ -31,6 +31,7 @@ app.use(cors());
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
+const PUBLIC_GROUP_ID_SAFE = process.env.PUBLIC_GROUP_ID || null;
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
@@ -61,7 +62,6 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
-// 📊 counter member REAL (exclude bot & staff)
 const bumpHumans = async (chatId, delta) => {
   const cid = String(chatId);
   const field = cid === String(VIP_GROUP_ID) ? 'vipHumans'
@@ -69,8 +69,6 @@ const bumpHumans = async (chatId, delta) => {
   if (!field) return;
   await db.collection('settings').doc('app').set({ [field]: FieldValue.increment(delta) }, { merge: true }).catch(() => {});
 };
-
-const PUBLIC_GROUP_ID_SAFE = process.env.PUBLIC_GROUP_ID || null;
 
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
@@ -143,7 +141,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
-    // 📊 member baru masuk → hitung yang REAL (bukan bot, bukan staff)
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -164,7 +161,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
-    // 📊 member keluar / di-kick → kurangi counter
     if (update.message && update.message.left_chat_member) {
       const m = update.message.left_chat_member;
       if (!m.is_bot) await bumpHumans(update.message.chat.id, -1);
@@ -289,7 +285,7 @@ app.post('/api/payment-webhook', async (req, res) => {
           await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
           await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
 
-          await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`, { critical: true });
+          await notifyOps(`💰 <b>Pembayaran Masuk</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code>\nOrder: ${notification.order_id}`, { safe: `💰 Pembayaran masuk • UID ${uid}` });
         } catch (e) { console.error('Ledger write gagal:', e.message); }
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
@@ -362,7 +358,7 @@ app.post('/api/mod/verify', async (req, res) => {
       console.log(`[HWID BOUND] Token dikunci ke Device ID: ${deviceId}`);
     } else if (userData.deviceId !== deviceId) {
       console.log(`[HWID MISMATCH] Upaya pemakaian token di perangkat lain: ${uid}`);
-      await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`);
+      await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`, { critical: true });
       return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Akses Ditolak! Token ini sudah terikat di perangkat lain.' });
     }
 
@@ -410,7 +406,7 @@ app.get('/api/cron/check-expired', async (req, res) => {
     await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
 
     if (expiredCount > 0 || reminded > 0) {
-      await notifyOps(`⏰ <b>Cron</b>: ${expiredCount} expired disapu • ${reminded} reminder terkirim`);
+      await notifyOps(`⏰ <b>Cron</b>: ${expiredCount} expired disapu • ${reminded} reminder terkirim`, { safe: `⏰ Cron: ${expiredCount} expired • ${reminded} reminder` });
     }
 
     res.status(200).json({ status: 'CRON_SUCCESS', user_expired: expiredCount, reminders_sent: reminded });
