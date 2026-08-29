@@ -13,6 +13,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
+const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
 
 // ---------- HELPERS ----------
 const logAudit = async (admin, action, target = null, meta = {}) => {
@@ -37,6 +38,12 @@ const serializeUser = (id, u) => ({
 const sendTG = async (chatId, text, options = {}) => {
   const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
   return r.data;
+};
+
+const broadcastAll = async (text) => {
+  for (const gid of ALL_GROUPS) {
+    try { await sendTG(gid, text, { parse_mode: 'HTML' }); } catch (e) { console.error('Broadcast gagal:', e.message); }
+  }
 };
 
 const kickFromGroup = async (userId) => {
@@ -120,7 +127,8 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
 
     const out = {
       users: { active, expired, banned, newToday, expiringIn3Days: expiring },
-      bot: { maintenance: settings.maintenance === true, lastCronRun: settings.lastCronRun || null }
+      bot: { maintenance: settings.maintenance === true, lastCronRun: settings.lastCronRun || null },
+      community: { vipHumans: settings.vipHumans || 0, publicHumans: settings.publicHumans || 0 }
     };
     if (req.admin.role === 'owner') {
       const dk = now.toISOString().slice(0, 10);
@@ -351,28 +359,32 @@ router.get('/team/unread', requireAuth, async (req, res) => {
 // ================= BOT CONTROL [OWNER] =================
 router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   const s = await db.collection('settings').doc('app').get();
-  let memberCount = null;
-  try {
-    const r = await axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: VIP_GROUP_ID });
-    memberCount = Math.max((r.data.result || 0) - 1, 0);
-  } catch (e) { /* abaikan */ }
-  res.json({ ...(s.exists ? s.data() : {}), memberCount });
+  res.json(s.exists ? s.data() : {});
 });
 
+// ✨ MAINTENANCE: broadcast otomatis ke PUBLIK + VIP dengan bahasa rapi + durasi
 router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
+  const duration = String(req.body.duration || 'belum dipastikan');
   await db.collection('settings').doc('app').set({ maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub }, { merge: true });
-  await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled });
-  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub}`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, critical: enabled });
+  await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
+
+  const msgOn = `🛠 <b>INFO PEMELIHARAAN</b>\n\nKepada keluarga besar Aphelion,\nKami sedang melakukan pemeliharaan sistem demi kualitas layanan yang lebih baik.\n\n⏳ Estimasi durasi: <b>${duration}</b>\n🔒 Selama pemeliharaan, pembelian & perpanjangan dijeda sementara.\n✅ Langganan yang sudah aktif tetap aman & bisa dipakai normal.\n\nKami akan umumkan kembali saat semua normal. Terima kasih atas pengertiannya! 🙏\n\n— Manajemen Aphelion`;
+  const msgOff = `✅ <b>SEMUA LAYANAN NORMAL KEMBALI</b>\n\nPemeliharaan telah selesai! Pembelian & perpanjangan sudah dibuka kembali.\n\nTerima kasih atas kesabaran Anda, keluarga Aphelion! 🌌\n\n— Manajemen Aphelion`;
+
+  await broadcastAll(enabled ? msgOn : msgOff);
+  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}` });
   res.json({ status: 'OK', maintenance: enabled });
 });
 
+// ✨ BROADCAST: otomatis berkop surat
 router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
   const { target, text } = req.body || {};
   if (!text) return res.status(400).json({ error: 'Text wajib' });
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
   if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
-  await sendTG(gid, String(text));
+  const wrapped = `📢 <b>PENGUMUMAN APHELION</b>\n\n${String(text)}\n\n— Manajemen Aphelion`;
+  await sendTG(gid, wrapped, { parse_mode: 'HTML' });
   await logAudit(req.admin.sub, 'BROADCAST', target, { length: text.length });
   await notifyOps(`📢 <b>Broadcast</b> ke ${target} oleh ${req.admin.sub}`, { safe: `📢 Broadcast ke ${target} oleh ${req.admin.sub}` });
   res.json({ status: 'SENT' });
@@ -395,7 +407,7 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
 });
 
-// ================= SETTINGS [OWNER] =================
+// ✨ SETTINGS: simpan + umumkan info baru ke PUBLIK + VIP
 router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
   const { price, planDays } = req.body || {};
   const patch = {};
@@ -409,6 +421,14 @@ router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
   await db.collection('settings').doc('app').set(patch, { merge: true });
   await logAudit(req.admin.sub, 'SETTINGS_UPDATE', null, patch);
   await notifyOps(`⚙️ <b>Settings</b> diubah ${req.admin.sub}`, { safe: `⚙️ Settings diubah ${req.admin.sub}` });
+
+  if (patch.price || patch.planDays) {
+    const cur = await db.collection('settings').doc('app').get();
+    const p = cur.exists && cur.data().price ? cur.data().price : 10000;
+    const d = cur.exists && cur.data().planDays ? cur.data().planDays : 30;
+    const info = `💡 <b>INFO UPDATE</b>\n\n📌 Minimal donasi: <b>Rp ${Number(p).toLocaleString('id-ID')}</b>\n⏳ Durasi aktif: <b>${d} hari</b>\n\nLangganan yang sudah berjalan tidak terpengaruh. Terima kasih atas dukungan Anda! 🙏\n\n— Manajemen Aphelion`;
+    await broadcastAll(info);
+  }
   res.json({ status: 'OK' });
 });
 
