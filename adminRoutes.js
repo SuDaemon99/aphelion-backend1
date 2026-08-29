@@ -663,4 +663,26 @@ router.post('/admins/:username/activate', requireAuth, requireOwner, async (req,
   res.json({ status: 'OK' });
 });
 
+// ================= ARCADE =================
+router.get('/arcade/leaderboard', requireAuth, async (req, res) => {
+  try {
+    const range = req.query.range || 'weekly';
+    const since = range === 'daily' ? new Date(Date.now() - 86400000).toISOString()
+      : range === 'weekly' ? new Date(Date.now() - 7 * 86400000).toISOString()
+      : '1970-01-01T00:00:00Z';
+    const snap = await db.collection('arcade_scores').where('at', '>=', since).orderBy('at', 'desc').limit(500).get();
+    const best = {};
+    snap.docs.forEach(d => { const s = d.data(); if (!best[s.username] || s.score > best[s.username].score) best[s.username] = s; });
+    const list = Object.values(best).sort((a, b) => b.score - a.score).slice(0, 20);
+    res.json({ scores: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/arcade/score', requireAuth, async (req, res) => {
+  const score = parseInt(req.body.score) || 0;
+  if (score <= 0) return res.json({ status: 'IGNORED' });
+  await db.collection('arcade_scores').add({ username: req.admin.sub, score, ship: String(req.body.ship || '-'), at: new Date().toISOString() });
+  res.json({ status: 'OK' });
+});
+
 module.exports = router;
