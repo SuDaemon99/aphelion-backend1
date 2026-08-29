@@ -6,11 +6,13 @@ const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || null;
 
 const notifyOps = async (full, opts = {}) => {
   const db = getFirestore();
+  const type = opts.type || (opts.critical ? 'critical' : 'system');
   try {
     const exp = new Date(); exp.setDate(exp.getDate() + 180);
     await db.collection('ops_feed').add({
       full,
       safe: opts.safe || full,
+      type,
       at: new Date().toISOString(),
       exp
     });
