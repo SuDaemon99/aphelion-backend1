@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
+const { getTpl } = require('./templates');
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || null;
@@ -45,14 +46,14 @@ const runReminders = async () => {
       if (daysLeft === 3 && !u.remindedH3) {
         await axios.post(`${TELEGRAM_API}/sendMessage`, {
           chat_id: chatId, parse_mode: 'HTML',
-          text: `⏰ <b>PENGINGAT RAMAH</b>\n\nHalo! Langganan VIP Anda akan berakhir dalam <b>3 hari</b> (${dateStr}).\n\nPerpanjang sekarang agar tetap nyaman di grup VIP tanpa jeda:\n👉 ketik /beli di chat ini.\n\nTerima kasih! 🌌`
+          text: await getTpl('reminder_h3', { tanggal: dateStr })
         });
         await db.collection('users').doc(doc.id).update({ remindedH3: true });
         sent++;
       } else if (daysLeft === 1 && !u.remindedH1) {
         await axios.post(`${TELEGRAM_API}/sendMessage`, {
           chat_id: chatId, parse_mode: 'HTML',
-          text: `🚨 <b>PEMBERITAHUAN TERAKHIR</b>\n\nLangganan VIP Anda berakhir <b>besok/hari ini</b> (${dateStr}). Setelah itu Anda otomatis dikeluarkan dari grup VIP.\n\n👉 Ketik /beli untuk perpanjang sekarang. Sampai jumpa di dalam! 🌌`
+          text: await getTpl('reminder_h1', { tanggal: dateStr })
         });
         await db.collection('users').doc(doc.id).update({ remindedH1: true });
         sent++;
