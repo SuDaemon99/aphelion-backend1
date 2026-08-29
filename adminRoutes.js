@@ -51,13 +51,26 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
-// ---------- MIDDLEWARE RBAC ----------
-const requireAuth = (req, res, next) => {
+// ---------- MIDDLEWARE RBAC (+ cek DB: active & epoch) ----------
+const requireAuth = async (req, res, next) => {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try { req.admin = jwt.verify(token, JWT_SECRET); next(); }
+  let payload;
+  try { payload = jwt.verify(token, JWT_SECRET); }
   catch (e) { return res.status(401).json({ error: 'Token invalid/kadaluarsa' }); }
+  try {
+    const doc = await db.collection('admin_accounts').doc(payload.sub).get();
+    if (!doc.exists || doc.data().active !== true) {
+      return res.status(401).json({ error: 'Akun nonaktif. Sesi berakhir.' });
+    }
+    const epoch = doc.data().epoch || 0;
+    if ((payload.ep || 0) !== epoch) {
+      return res.status(401).json({ error: 'Sesi berakhir. Login ulang.' });
+    }
+    req.admin = payload;
+    next();
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 };
 
 const requireOwner = (req, res, next) => {
@@ -89,7 +102,8 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Kredensial salah' });
     }
     await db.collection('admin_accounts').doc(uname).update({ failCount: 0, lockedUntil: null, lastLoginAt: new Date().toISOString() });
-    const token = jwt.sign({ sub: uname, role: acc.role }, JWT_SECRET, { expiresIn: '12h' });
+    const epoch = acc.epoch || 0;
+    const token = jwt.sign({ sub: uname, role: acc.role, ep: epoch }, JWT_SECRET, { expiresIn: '12h' });
     await logAudit(uname, 'LOGIN');
     await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`, { safe: `🔐 Login: ${uname}` });
     res.json({ token, role: acc.role, username: uname });
@@ -362,7 +376,6 @@ router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   res.json(s.exists ? s.data() : {});
 });
 
-// ✨ MAINTENANCE: broadcast otomatis ke PUBLIK + VIP dengan bahasa rapi + durasi
 router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
   const duration = String(req.body.duration || 'belum dipastikan');
@@ -377,7 +390,6 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'OK', maintenance: enabled });
 });
 
-// ✨ BROADCAST: otomatis berkop surat
 router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
   const { target, text } = req.body || {};
   if (!text) return res.status(400).json({ error: 'Text wajib' });
@@ -407,7 +419,7 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
 });
 
-// ✨ SETTINGS: simpan + umumkan info baru ke PUBLIK + VIP
+// ================= SETTINGS [OWNER] =================
 router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
   const { price, planDays } = req.body || {};
   const patch = {};
@@ -446,11 +458,32 @@ router.post('/admins', requireAuth, requireOwner, async (req, res) => {
   if (ex.exists) return res.status(409).json({ error: 'Username sudah ada' });
   await db.collection('admin_accounts').doc(uname).set({
     username: uname, passHash: await bcrypt.hash(password, 10), role: 'admin', active: true,
-    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null
+    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null, epoch: 0
   });
   await logAudit(req.admin.sub, 'ADMIN_CREATE', uname);
   await notifyOps(`👥 <b>Admin baru</b>: ${uname} dibuat oleh ${req.admin.sub}`, { safe: `👥 Admin baru: ${uname}` });
   res.json({ status: 'CREATED' });
+});
+
+// ✨ RESET PASSWORD ADMIN (owner) — putus semua sesi lama via epoch
+router.post('/admins/:username/reset-password', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const { newPassword } = req.body || {};
+    if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Password min. 8 karakter' });
+    const t = await db.collection('admin_accounts').doc(req.params.username).get();
+    if (!t.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
+    if (t.data().role === 'owner') return res.status(403).json({ error: 'Owner mengganti password lewat menu Ganti Password' });
+    const epoch = (t.data().epoch || 0) + 1;
+    await db.collection('admin_accounts').doc(req.params.username).update({
+      passHash: await bcrypt.hash(newPassword, 10),
+      epoch,
+      failCount: 0,
+      lockedUntil: null
+    });
+    await logAudit(req.admin.sub, 'ADMIN_RESET_PASS', req.params.username);
+    await notifyOps(`🔑 <b>Password direset</b>: ${req.params.username} oleh ${req.admin.sub} (sesi lama diputus)`, { safe: `🔑 Reset pass: ${req.params.username}`, critical: true });
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.post('/admins/:username/deactivate', requireAuth, requireOwner, async (req, res) => {
