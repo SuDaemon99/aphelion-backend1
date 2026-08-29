@@ -366,7 +366,12 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     const chatSnap = await db.collection('team_chat').where('at', '>', lastChat).get();
     const chat = chatSnap.docs.filter(x => x.data().sender !== req.admin.sub).length;
     const feedSnap = await db.collection('ops_feed').where('at', '>', lastFeed).get();
-    res.json({ chat, feed: feedSnap.size });
+    const types = feedSnap.docs.map(x => x.data().type || 'system');
+    let sound = null;
+    if (req.admin.role === 'owner' && types.includes('pay')) sound = 'pay';
+    else if (types.includes('critical')) sound = 'critical';
+    else if (types.includes('maint')) sound = 'maint';
+    res.json({ chat, feed: feedSnap.size, sound });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -386,7 +391,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const msgOff = `✅ <b>SEMUA LAYANAN NORMAL KEMBALI</b>\n\nPemeliharaan telah selesai! Pembelian & perpanjangan sudah dibuka kembali.\n\nTerima kasih atas kesabaran Anda, keluarga Aphelion! 🌌\n\n— Manajemen Aphelion`;
 
   await broadcastAll(enabled ? msgOn : msgOff);
-  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}` });
+    await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' });
   res.json({ status: 'OK', maintenance: enabled });
 });
 
