@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const cors = require('cors');
@@ -30,6 +31,10 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// 🚦 RATE LIMIT: anti-spam invoice & anti brute-force verify
+const snapLimiter = rateLimit({ windowMs: 60 * 1000, max: 5 });
+const verifyLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
@@ -37,7 +42,6 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// kirim TG + fallback plain-text kalau HTML rusak
 const sendTelegramMessage = async (chatId, text, options = {}) => {
   try {
     const response = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
@@ -167,8 +171,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
   }
 });
 
-// B. Snap Token (min price dari settings)
-app.post('/api/get-snap-token', async (req, res) => {
+// B. Snap Token (min price + RATE LIMIT anti-spam invoice)
+app.post('/api/get-snap-token', snapLimiter, async (req, res) => {
   try {
     const setDoc = await db.collection('settings').doc('app').get();
     if (setDoc.exists && setDoc.data().maintenance === true) {
@@ -323,8 +327,8 @@ app.post('/api/payment-webhook', async (req, res) => {
   }
 });
 
-// D. Verifikasi Token & Binding HWID (+ OPS alert mismatch)
-app.post('/api/mod/verify', async (req, res) => {
+// D. Verifikasi Token & Binding HWID (+ RATE LIMIT anti brute-force)
+app.post('/api/mod/verify', verifyLimiter, async (req, res) => {
   try {
     const { token, deviceId } = req.body;
 
@@ -366,7 +370,7 @@ app.post('/api/mod/verify', async (req, res) => {
   }
 });
 
-// E. Cron (expiry sweep + reminders + OPS alert)
+// E. Cron (expiry sweep + reminders + WATCHDOG + OPS alert)
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -399,6 +403,16 @@ app.get('/api/cron/check-expired', async (req, res) => {
 
     let reminded = 0;
     try { reminded = await runReminders(); } catch (e) { console.error('Reminders gagal:', e.message); }
+
+    // 🐕 WATCHDOG: kalau bot senyap > 24 jam (bukan maintenance) → alarm ke owner
+    const setW = await db.collection('settings').doc('app').get();
+    const st = setW.exists ? setW.data() : {};
+    if (st.maintenance !== true && st.lastTelegramPing) {
+      const age = Date.now() - new Date(st.lastTelegramPing).getTime();
+      if (age > 26 * 3600 * 1000) {
+        await notifyOps(`🚨 <b>WATCHDOG</b>\nBot tidak menerima pesan > 24 jam. Cek webhook / token Telegram!`, { critical: true });
+      }
+    }
 
     await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
 
