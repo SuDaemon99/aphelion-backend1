@@ -2,14 +2,26 @@ const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
-const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID || null;
+const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || null;
 
-// 🚨 Kirim alert ke OPS ROOM (grup privat admin)
-const notifyOps = async (text) => {
-  if (!ADMIN_GROUP_ID) return;
+// 🚨 notifyOps: tulis ke ops_feed (dibaca app) + DM kritis ke owner (opsional)
+const notifyOps = async (full, opts = {}) => {
+  const db = getFirestore();
   try {
-    await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: ADMIN_GROUP_ID, text, parse_mode: 'HTML' });
-  } catch (e) { console.error('OPS alert gagal:', e.message); }
+    const exp = new Date(); exp.setDate(exp.getDate() + 180);
+    await db.collection('ops_feed').add({
+      full,
+      safe: opts.safe || full,   // versi tanpa angka duit (buat admin)
+      at: new Date().toISOString(),
+      exp
+    });
+  } catch (e) { console.error('ops_feed write gagal:', e.message); }
+
+  if (opts.critical && OWNER_TELEGRAM_ID) {
+    try {
+      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: OWNER_TELEGRAM_ID, text: full, parse_mode: 'HTML' });
+    } catch (e) { console.error('DM kritis gagal:', e.message); }
+  }
 };
 
 // ⏰ Reminder H-3 & H-1 sebelum expired
