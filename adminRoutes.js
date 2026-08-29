@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
 const { notifyOps, runReminders } = require('./ops');
+const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
 
 const db = getFirestore();
 const router = express.Router();
@@ -14,6 +15,8 @@ const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOK
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
 const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
+
+const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // ---------- HELPERS ----------
 const logAudit = async (admin, action, target = null, meta = {}) => {
@@ -35,9 +38,20 @@ const serializeUser = (id, u) => ({
   createdAt: u.createdAt || null
 });
 
+// kirim TG + fallback plain-text kalau HTML rusak
 const sendTG = async (chatId, text, options = {}) => {
-  const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
-  return r.data;
+  try {
+    const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
+    return r.data;
+  } catch (error) {
+    if (options.parse_mode) {
+      try {
+        const r2 = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text });
+        return r2.data;
+      } catch (e2) { console.error('Plain resend gagal:', e2.message); }
+    }
+    throw error;
+  }
 };
 
 const broadcastAll = async (text) => {
@@ -46,6 +60,7 @@ const broadcastAll = async (text) => {
   }
 };
 
+// 📊 hitung user REAL live: total anggota − admin (owner+admin+bot)
 const liveHumans = async (gid) => {
   try {
     const [c, a] = await Promise.all([
@@ -152,7 +167,7 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
     const out = {
       users: { active, expired, banned, newToday, expiringIn3Days: expiring },
       bot: { maintenance: settings.maintenance === true, lastCronRun: settings.lastCronRun || null },
-            community: {
+      community: {
         vipHumans: await liveHumans(VIP_GROUP_ID),
         publicHumans: PUBLIC_GROUP_ID ? await liveHumans(PUBLIC_GROUP_ID) : 0
       }
@@ -233,7 +248,7 @@ router.post('/users/:uid/ban', requireAuth, async (req, res) => {
     try { await kickFromGroup(req.params.uid); } catch (e) { console.error('Kick gagal:', e.message); }
     const chatDoc = await db.collection('telegram_chats').doc(req.params.uid).get();
     if (chatDoc.exists) {
-      try { await sendTG(chatDoc.data().chatId, `🚫 <b>Akses Dicabut</b>\n\nAlasan: <i>${reason}</i>\nJika merasa keliru, hubungi support.`, { parse_mode: 'HTML' }); } catch (e) {}
+      try { await sendTG(chatDoc.data().chatId, await getTpl('ban_dm', { alasan: escapeHtml(reason) }), { parse_mode: 'HTML' }); } catch (e) {}
     }
     await logAudit(req.admin.sub, 'BAN', req.params.uid, { reason });
     await notifyOps(`🚫 <b>BAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> — ${reason}`, { safe: `🚫 BAN oleh ${req.admin.sub} • UID ${req.params.uid}`, critical: true });
@@ -266,7 +281,7 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
     const chatDoc = await db.collection('telegram_chats').doc(req.params.uid).get();
     const chatId = chatDoc.exists ? chatDoc.data().chatId : req.params.uid;
     const invite = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: VIP_GROUP_ID, member_limit: 1 });
-    await sendTG(chatId, `🔑 <b>Token akses Anda:</b>\n<code>${u.token}</code>\n\n🚪 Ketuk tombol di bawah untuk masuk VIP:`, {
+    await sendTG(chatId, await getTpl('resend_dm', { token: u.token }), {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.data.result.invite_link }]] }
     });
@@ -388,6 +403,47 @@ router.get('/team/unread', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ================= TEMPLATES PESAN BOT [OWNER] =================
+router.get('/templates', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const snap = await db.collection('templates').get();
+    const custom = {};
+    snap.docs.forEach(d => { custom[d.id] = d.data().text; });
+    const list = Object.keys(DEFAULT_TPL).map(key => ({
+      key,
+      vars: VARS[key] || [],
+      custom: !!custom[key],
+      text: custom[key] || DEFAULT_TPL[key]
+    }));
+    res.json({ templates: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/templates/:key', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const key = req.params.key;
+    if (!DEFAULT_TPL[key]) return res.status(404).json({ error: 'Template tidak dikenal' });
+    const text = String(req.body.text || '').trim();
+    if (!text) return res.status(400).json({ error: 'Text wajib' });
+    if (text.length > 4000) return res.status(400).json({ error: 'Maksimal 4000 karakter' });
+    await db.collection('templates').doc(key).set({ text, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub });
+    await logAudit(req.admin.sub, 'TEMPLATE_UPDATE', key);
+    await notifyOps(`📝 <b>Pesan bot diubah</b>: ${key} oleh ${req.admin.sub}`, { safe: `📝 Template diubah: ${key}` });
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.delete('/templates/:key', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const key = req.params.key;
+    if (!DEFAULT_TPL[key]) return res.status(404).json({ error: 'Template tidak dikenal' });
+    await db.collection('templates').doc(key).delete();
+    await logAudit(req.admin.sub, 'TEMPLATE_RESET', key);
+    await notifyOps(`♻️ <b>Template direset</b>: ${key} oleh ${req.admin.sub}`, { safe: `♻️ Template reset: ${key}` });
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ================= BOT CONTROL [OWNER] =================
 router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   const s = await db.collection('settings').doc('app').get();
@@ -400,11 +456,9 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   await db.collection('settings').doc('app').set({ maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
 
-  const msgOn = `🛠 <b>INFO PEMELIHARAAN</b>\n\nKepada keluarga besar Aphelion,\nKami sedang melakukan pemeliharaan sistem demi kualitas layanan yang lebih baik.\n\n⏳ Estimasi durasi: <b>${duration}</b>\n🔒 Selama pemeliharaan, pembelian & perpanjangan dijeda sementara.\n✅ Langganan yang sudah aktif tetap aman & bisa dipakai normal.\n\nKami akan umumkan kembali saat semua normal. Terima kasih atas pengertiannya! 🙏\n\n— Manajemen Aphelion`;
-  const msgOff = `✅ <b>SEMUA LAYANAN NORMAL KEMBALI</b>\n\nPemeliharaan telah selesai! Pembelian & perpanjangan sudah dibuka kembali.\n\nTerima kasih atas kesabaran Anda, keluarga Aphelion! 🌌\n\n— Manajemen Aphelion`;
-
-  await broadcastAll(enabled ? msgOn : msgOff);
-    await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' });
+  const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
+  await broadcastAll(msg);
+  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' });
   res.json({ status: 'OK', maintenance: enabled });
 });
 
@@ -413,7 +467,7 @@ router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Text wajib' });
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
   if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
-  const wrapped = `📢 <b>PENGUMUMAN APHELION</b>\n\n${String(text)}\n\n— Manajemen Aphelion`;
+  const wrapped = await getTpl('broadcast_kop', { text: String(text) });
   await sendTG(gid, wrapped, { parse_mode: 'HTML' });
   await logAudit(req.admin.sub, 'BROADCAST', target, { length: text.length });
   await notifyOps(`📢 <b>Broadcast</b> ke ${target} oleh ${req.admin.sub}`, { safe: `📢 Broadcast ke ${target} oleh ${req.admin.sub}` });
@@ -456,7 +510,7 @@ router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
     const cur = await db.collection('settings').doc('app').get();
     const p = cur.exists && cur.data().price ? cur.data().price : 10000;
     const d = cur.exists && cur.data().planDays ? cur.data().planDays : 30;
-    const info = `💡 <b>INFO UPDATE</b>\n\n📌 Minimal donasi: <b>Rp ${Number(p).toLocaleString('id-ID')}</b>\n⏳ Durasi aktif: <b>${d} hari</b>\n\nLangganan yang sudah berjalan tidak terpengaruh. Terima kasih atas dukungan Anda! 🙏\n\n— Manajemen Aphelion`;
+    const info = await getTpl('settings_info', { harga: Number(p).toLocaleString('id-ID'), hari: d });
     await broadcastAll(info);
   }
   res.json({ status: 'OK' });
@@ -483,7 +537,6 @@ router.post('/admins', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'CREATED' });
 });
 
-// ✨ RESET PASSWORD ADMIN (owner) — putus semua sesi lama via epoch
 router.post('/admins/:username/reset-password', requireAuth, requireOwner, async (req, res) => {
   try {
     const { newPassword } = req.body || {};
