@@ -729,4 +729,33 @@ router.post('/arcade/raid/damage', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ================= FCM PUSH =================
+let messaging = null;
+try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
+
+router.post('/fcm-token', requireAuth, async (req, res) => {
+  const token = String(req.body.token || '');
+  if (!token) return res.status(400).json({ error: 'Token wajib' });
+  await db.collection('fcm_tokens').doc(req.admin.sub).set({
+    token, role: req.admin.role, updatedAt: new Date().toISOString()
+  });
+  res.json({ status: 'OK' });
+});
+
+const pushAll = async (title, body, type) => {
+  if (!messaging) return;
+  try {
+    const snap = await db.collection('fcm_tokens').get();
+    const tokens = snap.docs.map(d => d.data().token).filter(Boolean);
+    if (!tokens.length) return;
+    const msg = { tokens, data: { title, body, type: type || 'info' } };
+    if (messaging.sendEachForMulticast) await messaging.sendEachForMulticast(msg);
+    else await messaging.sendMulticast(msg);
+  } catch (e) { console.error('Push gagal:', e.message); }
+};
+
+// push otomatis: maintenance & raid tumbang
+const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on ? 'ON' : 'OFF'} (${dur}) oleh ${by}`, 'maint');
+const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${by}! Squad 🏅`, 'critical');
+
 module.exports = router;
