@@ -294,7 +294,7 @@ app.post('/api/payment-webhook', async (req, res) => {
             const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
             inviteText = '🚪 Ketuk tombol di bawah untuk masuk (link sekali pakai, khusus akun Anda):';
             inviteMarkup = {
-              inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] }
+              inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]]
             };
           } catch (invErr) {
             console.error('Gagal buat invite link VIP:', invErr.response ? JSON.stringify(invErr.response.data) : invErr.message);
