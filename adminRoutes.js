@@ -381,7 +381,7 @@ router.get('/team/unread', requireAuth, async (req, res) => {
 // ================= BOT CONTROL [OWNER] =================
 router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   const s = await db.collection('settings').doc('app').get();
-  res.json(s.exists ? s.data() : {});
+  res.json({ ...(s.exists ? s.data() : {}), memberCount: await liveHumans(VIP_GROUP_ID) });
 });
 
 router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
