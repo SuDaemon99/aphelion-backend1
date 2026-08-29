@@ -289,7 +289,7 @@ app.post('/api/payment-webhook', async (req, res) => {
           await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
           await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
 
-          await notifyOps(`💰 <b>Pembayaran Masuk</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code>\nOrder: ${notification.order_id}`);
+          await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`, { critical: true });
         } catch (e) { console.error('Ledger write gagal:', e.message); }
 
         console.log(`Pembayaran lunas: ${uid}. Token: ${tokenMod}`);
