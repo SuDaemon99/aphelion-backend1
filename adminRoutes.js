@@ -84,7 +84,7 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
     await db.collection('admin_accounts').doc(uname).update({ failCount: 0, lockedUntil: null, lastLoginAt: new Date().toISOString() });
     const token = jwt.sign({ sub: uname, role: acc.role }, JWT_SECRET, { expiresIn: '12h' });
     await logAudit(uname, 'LOGIN');
-    await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`);
+    await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`, { safe: `🔐 Login: ${uname}` });
     res.json({ token, role: acc.role, username: uname });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -201,7 +201,7 @@ router.post('/users/:uid/ban', requireAuth, async (req, res) => {
       try { await sendTG(chatDoc.data().chatId, `🚫 <b>Akses Dicabut</b>\n\nAlasan: <i>${reason}</i>\nJika merasa keliru, hubungi support.`, { parse_mode: 'HTML' }); } catch (e) {}
     }
     await logAudit(req.admin.sub, 'BAN', req.params.uid, { reason });
-    await notifyOps(`🚫 <b>BAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> — ${reason}`);
+    await notifyOps(`🚫 <b>BAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> — ${reason}`, { safe: `🚫 BAN oleh ${req.admin.sub} • UID ${req.params.uid}`, critical: true });
     res.json({ status: 'BANNED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -213,7 +213,7 @@ router.post('/users/:uid/unban', requireAuth, async (req, res) => {
   const st = (u.expiredAt && u.expiredAt.toDate() > new Date()) ? 'ACTIVE' : 'EXPIRED';
   await db.collection('users').doc(req.params.uid).update({ status: st });
   await logAudit(req.admin.sub, 'UNBAN', req.params.uid, { newStatus: st });
-  await notifyOps(`🟢 <b>UNBAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> → ${st}`);
+  await notifyOps(`🟢 <b>UNBAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> → ${st}`, { safe: `🟢 UNBAN oleh ${req.admin.sub} • UID ${req.params.uid}` });
   res.json({ status: st });
 });
 
@@ -290,105 +290,10 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
   res.json({ logs, nextCursor: last ? last.data().at : null });
 });
 
-// ================= BOT CONTROL [OWNER] =================
-router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
-  const s = await db.collection('settings').doc('app').get();
-  let memberCount = null;
+// ================= TEAM FEED & CHAT =================
+router.get('/feed', requireAuth, async (req, res) => {
   try {
-    const r = await axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: VIP_GROUP_ID });
-    memberCount = Math.max((r.data.result || 0) - 1, 0);
-  } catch (e) { /* abaikan */ }
-  res.json({ ...(s.exists ? s.data() : {}), memberCount });
-});
-
-router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
-  const enabled = req.body.enabled === true;
-  await db.collection('settings').doc('app').set({ maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub }, { merge: true });
-  await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled });
-  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub}`);
-  res.json({ status: 'OK', maintenance: enabled });
-});
-
-router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
-  const { target, text } = req.body || {};
-  if (!text) return res.status(400).json({ error: 'Text wajib' });
-  const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
-  if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
-  await sendTG(gid, String(text));
-  await logAudit(req.admin.sub, 'BROADCAST', target, { length: text.length });
-  await notifyOps(`📢 <b>Broadcast</b> ke ${target} oleh ${req.admin.sub}`);
-  res.json({ status: 'SENT' });
-});
-
-router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
-  const now = new Date();
-  const snap = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', now).get();
-  let n = 0;
-  for (const doc of snap.docs) {
-    await db.collection('users').doc(doc.id).update({ status: 'EXPIRED' });
-    try { await kickFromGroup(doc.id); } catch (e) {}
-    n++;
-  }
-  let reminded = 0;
-  try { reminded = await runReminders(); } catch (e) {}
-  await db.collection('settings').doc('app').set({ lastCronRun: now.toISOString() }, { merge: true });
-  await logAudit(req.admin.sub, 'CRON_RUN', null, { expired: n, reminded });
-  await notifyOps(`⏰ <b>Cron manual</b> oleh ${req.admin.sub}: ${n} expired • ${reminded} reminder`);
-  res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
-});
-
-// ================= SETTINGS [OWNER] =================
-router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
-  const { price, planDays } = req.body || {};
-  const patch = {};
-  if (price) patch.price = parseInt(price);
-  if (planDays) patch.planDays = parseInt(planDays);
-  if (req.body.vipHumans !== undefined) patch.vipHumans = parseInt(req.body.vipHumans);
-  if (req.body.publicHumans !== undefined) patch.publicHumans = parseInt(req.body.publicHumans);
-  if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Tidak ada yang diupdate' });
-  patch.updatedAt = new Date().toISOString();
-  patch.updatedBy = req.admin.sub;
-  await db.collection('settings').doc('app').set(patch, { merge: true });
-  await logAudit(req.admin.sub, 'SETTINGS_UPDATE', null, patch);
-  await notifyOps(`⚙️ <b>Settings</b> diubah ${req.admin.sub}: ${JSON.stringify(patch)}`);
-  res.json({ status: 'OK' });
-});
-
-// ================= ADMIN ACCOUNTS [OWNER] =================
-router.get('/admins', requireAuth, requireOwner, async (req, res) => {
-  const snap = await db.collection('admin_accounts').get();
-  res.json({ admins: snap.docs.map(x => { const a = x.data(); return { username: a.username, role: a.role, active: a.active, lastLoginAt: a.lastLoginAt }; }) });
-});
-
-router.post('/admins', requireAuth, requireOwner, async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password || password.length < 8) return res.status(400).json({ error: 'Username & password (min 8) wajib' });
-  const uname = String(username).toLowerCase();
-  const ex = await db.collection('admin_accounts').doc(uname).get();
-  if (ex.exists) return res.status(409).json({ error: 'Username sudah ada' });
-  await db.collection('admin_accounts').doc(uname).set({
-    username: uname, passHash: await bcrypt.hash(password, 10), role: 'admin', active: true,
-    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null
-  });
-  await logAudit(req.admin.sub, 'ADMIN_CREATE', uname);
-  await notifyOps(`👥 <b>Admin baru</b>: ${uname} dibuat oleh ${req.admin.sub}`);
-  res.json({ status: 'CREATED' });
-});
-
-router.post('/admins/:username/deactivate', requireAuth, requireOwner, async (req, res) => {
-  const t = await db.collection('admin_accounts').doc(req.params.username).get();
-  if (!t.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
-  if (t.data().role === 'owner' || req.params.username === req.admin.sub) return res.status(403).json({ error: 'Tidak bisa menonaktifkan owner / diri sendiri' });
-  await db.collection('admin_accounts').doc(req.params.username).update({ active: false });
-  await logAudit(req.admin.sub, 'ADMIN_DEACTIVATE', req.params.username);
-  await notifyOps(`⛔ <b>Admin dinonaktifkan</b>: ${req.params.username} oleh ${req.admin.sub}`);
-  res.json({ status: 'OK' });
-});
-
-router.post('/admins/:username/activate', requireAuth, requireOwner, async (req, res) => {
-  await db.collection('admin_accounts').doc(req.params.username).update({ active: true });
-  await logAudit(req.admin.sub, 'ADMIN_ACTIVATE', req.params.username);
-  res.json({ status: 'OK' });
-});
-
-module.exports = router;
+    const limit = 30;
+    let ref = db.collection('ops_feed').orderBy('at', 'desc').limit(limit);
+    if (req.query.cursor) ref = ref.startAfter(String(req.query.cursor));
+    const snap =
