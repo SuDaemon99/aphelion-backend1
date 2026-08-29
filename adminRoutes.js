@@ -16,6 +16,11 @@ const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
 const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
 
+// 🎭 avatar eksklusif per role
+const OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];
+const ADMIN_AVATARS = ['admin_1', 'admin_2', 'admin_3', 'admin_4', 'admin_5', 'admin_6'];
+const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];
+
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // ---------- HELPERS ----------
@@ -38,7 +43,6 @@ const serializeUser = (id, u) => ({
   createdAt: u.createdAt || null
 });
 
-// kirim TG + fallback plain-text kalau HTML rusak
 const sendTG = async (chatId, text, options = {}) => {
   try {
     const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
@@ -60,7 +64,6 @@ const broadcastAll = async (text) => {
   }
 };
 
-// 📊 hitung user REAL live: total anggota − admin (owner+admin+bot)
 const liveHumans = async (gid) => {
   try {
     const [c, a] = await Promise.all([
@@ -76,7 +79,7 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
-// ---------- MIDDLEWARE RBAC (+ cek DB: active & epoch) ----------
+// ---------- MIDDLEWARE RBAC ----------
 const requireAuth = async (req, res, next) => {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -136,7 +139,17 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
 });
 
 router.get('/auth/me', requireAuth, async (req, res) => {
-  res.json({ username: req.admin.sub, role: req.admin.role });
+  const d = await db.collection('admin_accounts').doc(req.admin.sub).get();
+  res.json({ username: req.admin.sub, role: req.admin.role, avatar: d.exists ? (d.data().avatar || null) : null });
+});
+
+// 🎭 ganti avatar sendiri (sesuai set role)
+router.post('/auth/avatar', requireAuth, async (req, res) => {
+  const avatar = String(req.body.avatar || '');
+  const set = req.admin.role === 'owner' ? OWNER_AVATARS : ADMIN_AVATARS;
+  if (!set.includes(avatar)) return res.status(400).json({ error: 'Avatar tidak tersedia untuk role Anda' });
+  await db.collection('admin_accounts').doc(req.admin.sub).update({ avatar });
+  res.json({ status: 'OK' });
 });
 
 router.post('/auth/change-password', requireAuth, async (req, res) => {
@@ -177,7 +190,7 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
       const fDoc = await db.collection('finance_daily').doc(dk).get();
       const tDoc = await db.collection('finance_total').doc('all').get();
       out.finance = {
-        today: fDoc.exists ? { gross: fDoc.data().gross || 0, count: fDoc.data().count || 0 } : { gross: 0, count: 0 },
+        today: fDoc.exists ? { gross: f.data().gross || 0, count: f.data().count || 0 } : { gross: 0, count: 0 },
         total: tDoc.exists ? { gross: tDoc.data().gross || 0, count: tDoc.data().count || 0 } : { gross: 0, count: 0 }
       };
     }
@@ -362,6 +375,7 @@ router.post('/feed/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
+// 💬 chat list + pinned terbaru
 router.get('/team/chat', requireAuth, async (req, res) => {
   const limit = 50;
   let ref = db.collection('team_chat').orderBy('at', 'desc').limit(limit);
@@ -369,15 +383,31 @@ router.get('/team/chat', requireAuth, async (req, res) => {
   const snap = await ref.get();
   const logs = snap.docs.map(x => ({ id: x.id, ...x.data() }));
   const last = snap.docs[snap.docs.length - 1];
-  res.json({ logs, nextCursor: last ? last.data().at : null });
+  const pinSnap = await db.collection('team_chat').where('pinned', '==', true).limit(50).get();
+  const pins = pinSnap.docs.sort((a, b) => (b.data().at || '').localeCompare(a.data().at || ''));
+  const pinned = pins.length ? { id: pins[0].id, ...pins[0].data() } : null;
+  res.json({ logs, nextCursor: last ? last.data().at : null, pinned });
 });
 
+// 💬 kirim chat (bawa avatar + replyTo)
 router.post('/team/chat', requireAuth, async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Text wajib' });
   if (text.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
   const exp = new Date(); exp.setDate(exp.getDate() + 180);
-  await db.collection('team_chat').add({ sender: req.admin.sub, role: req.admin.role, text, at: new Date().toISOString(), exp });
+  const doc = {
+    sender: req.admin.sub, role: req.admin.role, text,
+    avatar: req.body.avatar || null,
+    at: new Date().toISOString(), exp
+  };
+  if (req.body.replyTo && req.body.replyTo.id) {
+    doc.replyTo = {
+      id: String(req.body.replyTo.id),
+      sender: String(req.body.replyTo.sender || ''),
+      text: String(req.body.replyTo.text || '').slice(0, 80)
+    };
+  }
+  await db.collection('team_chat').add(doc);
   res.json({ status: 'OK' });
 });
 
@@ -386,13 +416,73 @@ router.post('/team/chat/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
+// ✅ centang dibaca: map username → lastChatRead
+router.get('/team/reads', requireAuth, async (req, res) => {
+  try {
+    const accs = await db.collection('admin_accounts').get();
+    const metas = await db.collection('team_meta').get();
+    const metaMap = {};
+    metas.docs.forEach(x => { metaMap[x.id] = x.data().lastChatRead || null; });
+    const out = {};
+    accs.docs.forEach(a => { out[a.id] = metaMap[a.id] || null; });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🎯 reaksi toggle
+router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
+  try {
+    const emoji = String(req.body.emoji || '');
+    if (!REACT_EMOJI.includes(emoji)) return res.status(400).json({ error: 'Emoji tidak didukung' });
+    const ref = db.collection('team_chat').doc(req.params.id);
+    const d = await ref.get();
+    if (!d.exists) return res.status(404).json({ error: 'Pesan tidak ditemukan' });
+    const reactions = d.data().reactions || {};
+    const had = (reactions[emoji] || []).includes(req.admin.sub);
+    for (const k of Object.keys(reactions)) {
+      reactions[k] = (reactions[k] || []).filter(u => u !== req.admin.sub);
+    }
+    if (!had) reactions[emoji] = [...(reactions[emoji] || []), req.admin.sub];
+    for (const k of Object.keys(reactions)) if (!(reactions[k] || []).length) delete reactions[k];
+    await ref.update({ reactions });
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 📌 pin / unpin (owner)
+router.post('/team/chat/:id/pin', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const ref = db.collection('team_chat').doc(req.params.id);
+    const d = await ref.get();
+    if (!d.exists) return res.status(404).json({ error: 'Pesan tidak ditemukan' });
+    const pinned = !(d.data().pinned === true);
+    await ref.update({ pinned });
+    res.json({ status: 'OK', pinned });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🗑 hapus (sendiri atau owner)
+router.post('/team/chat/:id/delete', requireAuth, async (req, res) => {
+  try {
+    const ref = db.collection('team_chat').doc(req.params.id);
+    const d = await ref.get();
+    if (!d.exists) return res.status(404).json({ error: 'Pesan tidak ditemukan' });
+    const data = d.data();
+    if (data.sender !== req.admin.sub && req.admin.role !== 'owner') {
+      return res.status(403).json({ error: 'Tidak bisa hapus pesan orang lain' });
+    }
+    await ref.update({ deleted: true, text: '' });
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/team/unread', requireAuth, async (req, res) => {
   try {
     const meta = await db.collection('team_meta').doc(req.admin.sub).get();
     const lastChat = meta.exists && meta.data().lastChatRead ? meta.data().lastChatRead : '1970-01-01T00:00:00Z';
     const lastFeed = meta.exists && meta.data().lastFeedSeen ? meta.data().lastFeedSeen : '1970-01-01T00:00:00Z';
     const chatSnap = await db.collection('team_chat').where('at', '>', lastChat).get();
-    const chat = chatSnap.docs.filter(x => x.data().sender !== req.admin.sub).length;
+    const chat = chatSnap.docs.filter(x => x.data().sender !== req.admin.sub && x.data().deleted !== true).length;
     const feedSnap = await db.collection('ops_feed').where('at', '>', lastFeed).get();
     const types = feedSnap.docs.map(x => x.data().type || 'system');
     let sound = null;
@@ -519,7 +609,7 @@ router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
 // ================= ADMIN ACCOUNTS [OWNER] =================
 router.get('/admins', requireAuth, requireOwner, async (req, res) => {
   const snap = await db.collection('admin_accounts').get();
-  res.json({ admins: snap.docs.map(x => { const a = x.data(); return { username: a.username, role: a.role, active: a.active, lastLoginAt: a.lastLoginAt }; }) });
+  res.json({ admins: snap.docs.map(x => { const a = x.data(); return { username: a.username, role: a.role, active: a.active, lastLoginAt: a.lastLoginAt, avatar: a.avatar || null }; }) });
 });
 
 router.post('/admins', requireAuth, requireOwner, async (req, res) => {
@@ -530,7 +620,7 @@ router.post('/admins', requireAuth, requireOwner, async (req, res) => {
   if (ex.exists) return res.status(409).json({ error: 'Username sudah ada' });
   await db.collection('admin_accounts').doc(uname).set({
     username: uname, passHash: await bcrypt.hash(password, 10), role: 'admin', active: true,
-    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null, epoch: 0
+    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null, epoch: 0, avatar: null
   });
   await logAudit(req.admin.sub, 'ADMIN_CREATE', uname);
   await notifyOps(`👥 <b>Admin baru</b>: ${uname} dibuat oleh ${req.admin.sub}`, { safe: `👥 Admin baru: ${uname}` });
