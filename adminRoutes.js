@@ -142,7 +142,10 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
     const out = {
       users: { active, expired, banned, newToday, expiringIn3Days: expiring },
       bot: { maintenance: settings.maintenance === true, lastCronRun: settings.lastCronRun || null },
-      community: { vipHumans: settings.vipHumans || 0, publicHumans: settings.publicHumans || 0 }
+            community: {
+        vipHumans: await liveHumans(VIP_GROUP_ID),
+        publicHumans: PUBLIC_GROUP_ID ? await liveHumans(PUBLIC_GROUP_ID) : 0
+      }
     };
     if (req.admin.role === 'owner') {
       const dk = now.toISOString().slice(0, 10);
