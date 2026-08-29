@@ -141,21 +141,16 @@ app.post('/api/telegram-webhook', async (req, res) => {
       }
     }
 
-    if (update.message && update.message.new_chat_members) {
+        if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
+      const isVip = String(chatId) === String(VIP_GROUP_ID);
 
       for (const member of update.message.new_chat_members) {
         if (!member.is_bot) {
-          let isStaff = false;
-          try {
-            const mc = await axios.post(`${TELEGRAM_API}/getChatMember`, { chat_id: chatId, user_id: member.id });
-            const st = mc.data.result.status;
-            isStaff = (st === 'creator' || st === 'administrator');
-          } catch (e) { /* abaikan */ }
-          if (!isStaff) await bumpHumans(chatId, +1);
-
-          const pesan = `👋 Selamat datang di ruang publik Aphelion, <a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>!\n\nDi sini tempat info umum, pengumuman, dan komunitas.\nUntuk paket Premium/VIP, chat bot resmi kami dan ketik <b>/beli</b>.\n\n⚠️ Keamanan: Admin & bot tidak pernah meminta password/OTP. Pembayaran hanya melalui invoice Midtrans resmi.`;
+          const pesan = isVip
+            ? `🌟 <b>SELAMAT DATANG DI APHELION PRIME!</b>\n\nHalo, <a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>! Selamat bergabung di lingkaran VIP. 🌌\n\nDi sini Anda mendapatkan:\n✅ Akses fitur & konten premium\n✅ Info update & prioritas support\n✅ Komunitas eksklusif\n\nSimpan baik-baik token akses Anda. Jika butuh bantuan, hubungi admin.\n\nNikmati pengalamannya! 🚀\n\n— Manajemen Aphelion`
+            : `👋 Selamat datang di ruang publik Aphelion, <a href="tg://user?id=${member.id}">${escapeHtml(member.first_name)}</a>!\n\nDi sini tempat info umum, pengumuman, dan komunitas.\nUntuk paket Premium/VIP, chat bot resmi kami dan ketik <b>/beli</b>.\n\n⚠️ Keamanan: Admin & bot tidak pernah meminta password/OTP. Pembayaran hanya melalui invoice Midtrans resmi.`;
           await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
         }
       }
