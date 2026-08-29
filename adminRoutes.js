@@ -685,4 +685,48 @@ router.post('/arcade/score', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
+// ================= ARCADE RAID (boss mingguan bersama) =================
+const weekKey = () => {
+  const d = new Date();
+  const jan1 = new Date(d.getFullYear(), 0, 1);
+  const week = Math.ceil((((d - jan1) / 86400000) + jan1.getDay() + 1) / 7);
+  return `${d.getFullYear()}-W${week}`;
+};
+
+router.get('/arcade/raid', requireAuth, async (req, res) => {
+  try {
+    const wk = weekKey();
+    const ref = db.collection('arcade_raid').doc(wk);
+    let d = await ref.get();
+    if (!d.exists) {
+      await ref.set({ week: wk, hpMax: 100000, hpLeft: 100000, killedBy: null });
+      d = await ref.get();
+    }
+    res.json(d.data());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/arcade/raid/damage', requireAuth, async (req, res) => {
+  try {
+    const wk = weekKey();
+    const dmg = parseInt(req.body.dmg) || 0;
+    const ref = db.collection('arcade_raid').doc(wk);
+    let d = await ref.get();
+    if (!d.exists) {
+      await ref.set({ week: wk, hpMax: 100000, hpLeft: 100000, killedBy: null });
+      d = await ref.get();
+    }
+    const cur = d.data();
+    if (cur.killedBy) return res.json({ status: 'ALREADY_DEAD', hpLeft: cur.hpLeft, killedBy: cur.killedBy });
+    let hpLeft = cur.hpLeft - dmg;
+    let killedBy = null;
+    if (hpLeft <= 0) {
+      hpLeft = 0; killedBy = req.admin.sub;
+      await notifyOps(`👹 <b>RAID</b>: GALAXY WARDEN tumbang oleh ${req.admin.sub}! Seluruh squad dapat badge 🏅`, { safe: `👹 Raid boss tumbang oleh ${req.admin.sub}!` });
+    }
+    await ref.update({ hpLeft, killedBy });
+    res.json({ status: 'OK', hpLeft, killedBy });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
