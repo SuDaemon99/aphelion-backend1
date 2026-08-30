@@ -786,24 +786,26 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
     const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
     if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
 
-    // 1) ambil ID bot
+    // 1) ID bot
     const me = await axios.post(`${TELEGRAM_API}/getMe`);
     const botId = me.data.result.id;
 
-    // 2) scan history grup, kumpulkan message_id milik bot
-    const maxScan = Math.min(parseInt(req.body.maxScan) || 1000, 5000);
+    // 2) Scan history — DIBATASI 300 biar aman di bawah timeout Vercel 10 dtk
+    const MAX_SCAN = 300;
     let ids = [];
     let offset = 0;
-    while (offset < maxScan) {
+    while (offset < MAX_SCAN) {
       const h = await axios.post(`${TELEGRAM_API}/getChatHistory`, { chat_id: gid, offset, limit: 100 });
       const msgs = h.data.result || [];
       if (!msgs.length) break;
-      msgs.forEach(m => { if (m.from && m.from.id === botId) ids.push(m.message_id); });
+      for (const m of msgs) if (m.from && m.from.id === botId) ids.push(m.message_id);
       offset += 100;
       if (msgs.length < 100) break;
     }
 
-    // 3) hapus batch 100 (deleteMessages), fallback satu-satu
+    if (!ids.length) return res.json({ status: 'OK', deleted: 0 });
+
+    // 3) Hapus batch (deleteMessages max 100 per call), fallback satu-satu
     let deleted = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
@@ -820,7 +822,12 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
     await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted });
     await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} pesan dihapus`, { safe: `🧹 Clean ${target}: ${deleted} pesan dihapus` });
     res.json({ status: 'OK', deleted });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // 🔍 error detail dari Telegram biar gampang debug
+    const desc = (e.response && e.response.data && e.response.data.description) ? e.response.data.description : e.message;
+    console.error('CLEAN ERROR:', desc);
+    res.status(500).json({ error: desc });
+  }
 });
 
 module.exports = router;
