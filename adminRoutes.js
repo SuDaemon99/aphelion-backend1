@@ -179,6 +179,8 @@ router.get('/users', requireAuth, async (req, res) => {
   try {
     const { status, q, cursor } = req.query;
     const limit = 20;
+
+    // Handle Pencarian Search Box
     if (q) {
       const qq = String(q).trim();
       if (/^\d{5,15}$/.test(qq)) {
@@ -188,19 +190,34 @@ router.get('/users', requireAuth, async (req, res) => {
       const snap = await db.collection('users').where('username','==',qq.toLowerCase()).limit(limit).get();
       return res.json({ users: snap.docs.map(x => serializeUser(x.id, x.data())), nextCursor: null });
     }
-    if (status) {
-      const snap = await db.collection('users').where('status','==',status).limit(200).get();
+
+    // Handle Filter Kategori (Abaikan jika "ALL" dan jadikan UPPERCASE)
+    if (status && status.toUpperCase() !== 'ALL') {
+      const snap = await db.collection('users').where('status','==',status.toUpperCase()).limit(200).get();
       const sorted = snap.docs.map(x => ({ id: x.id, u: x.data() }))
         .sort((a,b) => (b.u.expiredAt && b.u.expiredAt.toMillis ? b.u.expiredAt.toMillis() : 0) - (a.u.expiredAt && a.u.expiredAt.toMillis ? a.u.expiredAt.toMillis() : 0));
       return res.json({ users: sorted.map(x => serializeUser(x.id, x.u)), nextCursor: null });
     }
+
+    // Handle Fetching Default ALL + Pagination
     let ref = db.collection('users').orderBy('expiredAt','desc').limit(limit);
-    if (cursor) ref = ref.startAfter(new Date(parseInt(cursor)));
+    
+    // Validasi aman agar cursor string "null" / NaN tidak membuat Firestore crash
+    if (cursor && cursor !== 'null' && cursor !== 'NaN') {
+      const parsedCursor = parseInt(cursor);
+      if (!isNaN(parsedCursor)) {
+        ref = ref.startAfter(new Date(parsedCursor));
+      }
+    }
+
     const snap = await ref.get();
     const users = snap.docs.map(x => serializeUser(x.id, x.data()));
     const last = snap.docs[snap.docs.length-1];
+    
     res.json({ users, nextCursor: last && last.data().expiredAt ? last.data().expiredAt.toMillis() : null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 router.get('/users/:uid', requireAuth, async (req, res) => {
