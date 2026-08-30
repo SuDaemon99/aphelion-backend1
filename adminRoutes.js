@@ -560,15 +560,32 @@ router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
 router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
   const duration = String(req.body.duration || 'belum dipastikan');
-  await db.collection('settings').doc('app').set({ maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub }, { merge: true });
+  
+  // 1. Update DB + Audit (cepat)
+  await db.collection('settings').doc('app').set({ 
+    maintenance: enabled, 
+    updatedAt: new Date().toISOString(), 
+    updatedBy: req.admin.sub 
+  }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
 
-  const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
-  await broadcastAll(msg);
-  await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' });
-  await pushMaint(enabled, duration, req.admin.sub);
-  await pushAllAdmins('🛠 Maintenance', `Maintenance ${enabled ? 'ON' : 'OFF'} (${duration}) oleh ${req.admin.sub}`, 'maint');
+  // 🔥 FIX DELAY: Balas client DULU (instant 50ms), UI langsung update
   res.json({ status: 'OK', maintenance: enabled });
+
+  // 2. Background tasks (fire-and-forget, nggak nge-block client)
+  setImmediate(async () => {
+    try {
+      const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
+      await broadcastAll(msg);
+      await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { 
+        safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, 
+        type: 'maint' 
+      });
+      await pushMaint(enabled, duration, req.admin.sub);
+    } catch (e) {
+      console.error('Background maintenance task failed:', e.message);
+    }
+  });
 });
 
 router.post('/bot/broadcast', requireAuth, requireOwner, async (req, res) => {
