@@ -1141,44 +1141,13 @@ const buildDeepSnapshot = async (role) => {
 };
 
 // ================= LOGIKA DEWAN YANG SUDAH DI-UPGRADE =================
-const councilRounds = async (q, snapStr) => {
-  const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nATURAN MUTLAK:\n1. Jadilah SANGAT SKEPTIS. Jangan mudah setuju.\n2. Fokus HANYA pada metrik/data yang relevan dengan spesialisasimu.\n3. WAJIB kutip angka/fakta spesifik dari SNAPSHOT di bawah.\n4. Akhiri dengan "CONFIDENCE: <0-100>".\n\nSNAPSHOT LIVE:\n${snapStr}`;
+// ================= 🏛️ DEWAN PROFESOR (STATE-BASED, ANTI-TIMEOUT) =================
+// Split jadi 4 request: init → round1 → round2 → verdict
+// Tiap request < 10 dtk, aman di Vercel Hobby. UI kasih progress step-by-step.
 
-  // ROUND 1: Independen
-  const tasksR1 = COUNCIL.map(m => async () => {
-    return callLLMSafe(m, [
-      { role: 'system', content: baseFor(m) },
-      { role: 'user', content: q }
-    ], { timeout: 8000, max_tokens: 450 }).then(t => ({ ...m, opini: t }));
-  });
-  
-  const r1 = await runWithDelay(tasksR1, 300);
-  const alive = r1.filter(x => x.opini);
-  if (alive.length < 2) return null;
+const baseForCouncil = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nATURAN MUTLAK:\n1. SKEPTIS. Jangan mudah setuju.\n2. Fokus HANYA pada metrik relevan spesialisasimu.\n3. WAJIB kutip angka/fakta spesifik dari SNAPSHOT.\n4. Akhiri dengan "CONFIDENCE: <0-100>".`;
 
-  // ROUND 2: Diskusi/Debat Berdarah
-  const others = alive.map(x => `[OPINI ${x.label}]:\n${x.opini}`).join('\n\n');
-  const tasksR2 = alive.map(m => async () => {
-    const debatePrompt = `ROUND 2 (DEBAT & REVISI CROSS-EXAMINATION).
-Tugasmu:
-1. BACA opini rekan-rekanmu di bawah ini.
-2. CARI KESALAHAN LOGIKA, asumsi sesat, atau data snapshot yang mereka abaikan.
-3. Jika opinimu di Round 1 ternyata salah/kurang tepat, REVISI posisimu berdasar data mereka.
-4. Jika opinimu yang benar, SERANG balik argumen mereka menggunakan fakta dari snapshot.
-Format jawaban: [KRITIK UNTUK REKAN] lalu [POSISI FINALKU]. Maks 250 kata.`;
-
-    return callLLMSafe(m, [
-      { role: 'system', content: baseFor(m) + '\n\n' + debatePrompt },
-      { role: 'user', content: q },
-      { role: 'assistant', content: m.opini },
-      { role: 'user', content: 'OPINI REKAN DEWAN LAINNYA UNTUK KAMU KRITIK:\n' + others }
-    ], { timeout: 8000, max_tokens: 450 }).then(t => ({ ...m, final: t || m.opini }));
-  });
-
-  const r2 = await runWithDelay(tasksR2, 300);
-  return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DEBAT:\n${x.final}`).join('\n=====\n');
-};
-
+// 🔧 STEP 1: INIT (simpan pertanyaan + snapshot)
 router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   try {
     const q = String(req.body.q || '').trim();
@@ -1189,52 +1158,26 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (mode === 'council') {
       const now = Date.now();
       const last = councilCooldown[req.admin.sub] || 0;
-      if (now - last < 20000) return res.status(429).json({ error: `🏛️ Dewan istirahat dulu. Tunggu ${Math.ceil((20000 - (now - last)) / 1000)} dtk lagi.` });
+      if (now - last < 15000) return res.status(429).json({ error: `🏛️ Dewan istirahat. Tunggu ${Math.ceil((15000 - (now - last)) / 1000)} dtk.` });
       councilCooldown[req.admin.sub] = now;
 
       const snapshot = await buildDeepSnapshot(req.admin.role);
-      const snapStr = JSON.stringify(snapshot);
-      const debate = await councilRounds(q, snapStr);
-
-      if (!debate) {
-        const messages = [
-          { role: 'system', content: aiSystemPrompt(req.admin) + '\n(Catatan: dewan tidak kuorum — jawab solo secara mendalam.)' },
-          { role: 'user', content: q }
-        ];
-        let solo = '(tanpa jawaban)';
-        for (let round = 0; round < 3; round++) {
-          const data = await callGroq(messages, 'openai/gpt-oss-120b');
-          const msg = data.choices[0].message;
-          if (msg.tool_calls && msg.tool_calls.length) {
-            messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
-            for (const tc of msg.tool_calls.slice(0, 3)) {
-              let out;
-              try { out = await execTool(tc.function.name, JSON.parse(tc.function.arguments || '{}'), req.admin.role); }
-              catch (e) { out = { error: e.message }; }
-              messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
-            }
-            continue;
-          }
-          solo = msg.content || solo;
-          break;
-        }
-        return res.json({ answer: '🛟 *(Dewan gagal kuorum — beralih ke analisis Solo-Deep)*\n\n' + solo });
-      }
-
-      const ref = await db.collection('ai_council').add({ q, debate, snap: snapStr, at: new Date().toISOString() });
+      const ref = await db.collection('ai_council').add({
+        q, snap: JSON.stringify(snapshot), step: 'init', role: req.admin.role,
+        at: new Date().toISOString()
+      });
       return res.json({ councilId: ref.id });
     }
 
-    // FAST / DEEP Mode...
+    // FAST / DEEP MODE
     const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
     const history = histDoc.exists ? (histDoc.data().history || []) : [];
-
     const messages = [
       { role: 'system', content: aiSystemPrompt(req.admin) },
       ...history,
       { role: 'user', content: q }
     ];
-    if (mode === 'deep') messages.push({ role: 'system', content: 'MODE DEEP: analisis mendalam, terstruktur, sertakan data & rekomendasi konkret.' });
+    if (mode === 'deep') messages.push({ role: 'system', content: 'MODE DEEP: analisis mendalam, terstruktur, data & rekomendasi konkret.' });
 
     let answer = '(tanpa jawaban)';
     for (let round = 0; round < 3; round++) {
@@ -1244,10 +1187,8 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
         messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
         for (const tc of msg.tool_calls.slice(0, 3)) {
           let out;
-          try {
-            const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
-            out = await execTool(tc.function.name, args, req.admin.role);
-          } catch (e) { out = { error: e.message }; }
+          try { out = await execTool(tc.function.name, JSON.parse(tc.function.arguments || '{}'), req.admin.role); }
+          catch (e) { out = { error: e.message }; }
           messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
         }
         continue;
@@ -1261,63 +1202,126 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     res.json({ answer });
   } catch (e) {
     const gcode = e.response?.data?.error?.code;
-    if (gcode === 'rate_limit_exceeded') return res.status(429).json({ error: '⏳ AI lagi antre. Coba 15 detik lagi ya.' });
+    if (gcode === 'rate_limit_exceeded') return res.status(429).json({ error: '⏳ AI lagi antre. Coba 15 detik lagi.' });
+    console.error('AI ERROR:', e.response?.data || e.message);
     res.status(500).json({ error: 'AI error: ' + (e.response?.data?.error?.message || e.message) });
   }
 });
 
-router.post('/ai/verdict', requireAuth, async (req, res) => {
+// 🔧 STEP 2/3/4: SIDANG PER STEP (anti-timeout Vercel)
+router.post('/ai/council/step', requireAuth, async (req, res) => {
   try {
     const id = String(req.body.id || '');
+    const step = String(req.body.step || '');
     const d = await db.collection('ai_council').doc(id).get();
     if (!d.exists) return res.status(404).json({ error: 'Sidang tidak ditemukan.' });
-    const { q, debate, snap } = d.data();
+    const data = d.data();
+    if (data.step !== (step === 'round2' ? 'round1' : step === 'verdict' ? 'round2' : 'init')) {
+      return res.status(400).json({ error: `Step mismatch: expected after ${data.step}` });
+    }
+    const snapStr = data.snap;
+    const q = data.q;
 
-    // HAKIM MENGGUNAKAN CHAIN OF THOUGHT (Diinstruksikan berpikir sebelum output)
-    const judgeSys = `Kamu KETUA SIDANG, profesor senior paling berpengalaman. Tugasmu merangkum debat 4 spesialis menjadi 1 kesimpulan final yang sangat akurat.
+    // ===== ROUND 1: 4 analis paralel =====
+    if (step === 'round1') {
+      const results = await Promise.all(COUNCIL.map(async (m) => {
+        const opini = await callLLMSafe(m, [
+          { role: 'system', content: baseForCouncil(m) + '\n\nSNAPSHOT LIVE:\n' + snapStr },
+          { role: 'user', content: q }
+        ], { timeout: 8000, max_tokens: 450 });
+        return { id: m.id, label: m.label, opini: opini || null };
+      }));
+      const alive = results.filter(x => x.opini);
+      await db.collection('ai_council').doc(id).update({ step: 'round1', round1: results });
+      return res.json({ status: 'round1', alive: alive.length, results });
+    }
 
-PROSES KERJAMU WAJIB SEPERTI INI:
-1. Gunakan tag <thinking> untuk menganalisis isi debat agen. Siapa agen yang datanya paling valid berdasarkan snapshot? Siapa yang berhalusinasi?
-2. Setelah merenung, tutup dengan </thinking> dan keluarkan format final secara persis.
+    // ===== ROUND 2: DEBAT (berdarah!) =====
+    if (step === 'round2') {
+      const round1 = data.round1 || [];
+      const alive = round1.filter(x => x.opini);
+      if (alive.length < 2) return res.status(400).json({ error: 'Analis aktif < 2.' });
 
-FORMAT FINAL WAJIB (keluarkan setelah thinking):
+      const others = alive.map(x => `[OPINI ${x.label}]:\n${x.opini}`).join('\n\n---\n\n');
+      const results = await Promise.all(alive.map(async (m) => {
+        const original = COUNCIL.find(c => c.id === m.id);
+        const final = await callLLMSafe(original, [
+          { role: 'system', content: baseForCouncil(original) + '\n\nSNAPSHOT LIVE:\n' + snapStr + '\n\n=== ROUND 2: DEBAT ===\nBaca opini rekan di bawah. CARI KESALAHAN LOGIKA, asumsi sesat, atau data yang mereka abaikan. REVISI posisimu kalau kamu salah, atau SERANG balik argumen mereka dengan fakta snapshot.\nFormat: [KRITIK UNTUK REKAN] lalu [POSISI FINALKU]. Maks 250 kata.' },
+          { role: 'user', content: q },
+          { role: 'assistant', content: m.opini },
+          { role: 'user', content: 'OPINI REKAN DEWAN:\n' + others }
+        ], { timeout: 8000, max_tokens: 450 });
+        return { id: m.id, label: m.label, opini: m.opini, final: final || m.opini };
+      }));
+      await db.collection('ai_council').doc(id).update({ step: 'round2', round2: results });
+      return res.json({ status: 'round2', results });
+    }
+
+    // ===== VERDICT: KETUA SIDANG =====
+    if (step === 'verdict') {
+      const round1 = data.round1 || [];
+      const round2 = data.round2 || [];
+      const debate = round2.map(x =>
+        `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DEBAT:\n${x.final}`
+      ).join('\n\n=====\n\n');
+
+      const judgeSys = `Kamu KETUA SIDANG, profesor senior paling berpengalaman. Tugasmu merangkum debat 4 spesialis menjadi 1 kesimpulan final yang sangat akurat.
+
+PROSES WAJIB (internal, jangan bocorkan):
+1. Verifikasi setiap klaim analis ke SNAPSHOT (buang halusinasi).
+2. Rekonsiliasi konflik.
+3. Tulis jawaban final level profesor + rekomendasi konkret.
+
+FORMAT OUTPUT WAJIB (ikuti persis):
 ## ✅ KESIMPULAN & SOLUSI
-<Jawaban final yang komprehensif, langsung ke akar masalah, dan beri solusi konkret yang bisa dieksekusi>
+<Jawaban komprehensif, langsung ke akar, rekomendasi konkret>
 
-TINGKAT KEPERCAYAAN: <0-100>%
+**TINGKAT KEPERCAYAAN: <0-100>%**
 
 ## 📜 ANALISIS SIDANG
-- <Nama Agen 1>: <Poin dia - DITERIMA/DITOLAK - Alasan>
-- <Nama Agen 2>: <Poin dia - DITERIMA/DITOLAK - Alasan>
-- ...
+- **<Label Agen 1>**: <poin utama> — DITERIMA/DITOLAK — <alasan 1 kalimat>
+- **<Label Agen 2>**: ...
 
 ## ⚖️ RESOLUSI KONFLIK
-<Jelaskan argumen mana yang menang dalam debat tersebut dan mengapa>
-
+<Argumen mana menang & mengapa, atau "Tidak ada konflik signifikan">
 ${AI_MANUAL}`;
 
-    let finalText = null;
-    for (const j of JUDGE_CHAIN) {
-      try {
-        finalText = await callLLM(j.provider, j.model, [
-          { role: 'system', content: judgeSys + '\nSNAPSHOT:\n' + snap },
-          { role: 'user', content: `PERTANYAAN:\n${q}\n\nTRANSKRIP SIDANG DEBAT (Round 1 & 2):\n${debate}` }
-        ], { timeout: 12000, max_tokens: 1500 });
-        
-        // Buang bagian <thinking> agar tidak muncul di layar user (jika model membocorkannya)
-        if (finalText) {
-            finalText = finalText.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').trim();
-            break;
-        }
-      } catch (e) { /* Lanjut ke model hakim cadangan */ }
+      let finalText = null;
+      for (const j of JUDGE_CHAIN) {
+        try {
+          finalText = await callLLM(j.provider, j.model, [
+            { role: 'system', content: judgeSys },
+            { role: 'user', content: `PERTANYAAN:\n${q}\n\nSNAPSHOT:\n${snapStr}\n\nTRANSKRIP DEBAT:\n${debate}` }
+          ], { timeout: 10000, max_tokens: 1500 });
+          if (finalText) break;
+        } catch (e) { /* coba hakim berikutnya */ }
+      }
+
+      // Cleanup doc sidang (state sudah dipindah ke chat history)
+      await db.collection('ai_council').doc(id).delete().catch(() => {});
+
+      if (!finalText) {
+        // fallback: pakai Qwen solo dengan debat sebagai context
+        const fallback = await callGroq([
+          { role: 'system', content: judgeSys },
+          { role: 'user', content: `PERTANYAAN:\n${q}\n\nSNAPSHOT:\n${snapStr}\n\nDEBAT:\n${debate}` }
+        ]);
+        finalText = fallback.choices?.[0]?.message?.content || '⚖️ Hakim sedang antre. Coba lagi.';
+      }
+
+      // Simpan ke chat history user
+      const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
+      const history = histDoc.exists ? (histDoc.data().history || []) : [];
+      const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: (finalText || '').slice(0, 1500) }].slice(-4);
+      await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
+
+      return res.json({ status: 'done', answer: finalText });
     }
-    
-    await db.collection('ai_council').doc(id).delete().catch(() => {});
-    if (!finalText) return res.status(500).json({ error: '⚖️ Semua hakim sedang antre. Coba lagi ±15 dtk.' });
-    res.json({ answer: finalText });
+
+    res.status(400).json({ error: 'Step tidak valid' });
   } catch (e) {
+    console.error('COUNCIL STEP ERROR:', e.response?.data || e.message);
     res.status(500).json({ error: e.message });
   }
 });
-
 module.exports = router;
