@@ -796,54 +796,75 @@ const pushAll = async (title, body, type) => {
 const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on ? 'ON' : 'OFF'} (${dur}) oleh ${by}`, 'maint');
 const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${by}! Squad 🏅`, 'critical');
 
-// ================= CLEAN PESAN BOT [OWNER] =================
 router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
+  const target = req.body.target === 'public' ? 'public' : 'vip';
+  const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
+  if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di environment variables` });
+
   try {
-    const target = req.body.target === 'public' ? 'public' : 'vip';
-    const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
-    if (!gid) return res.status(400).json({ error: 'Group ID belum diset' });
-
-    // 1) ID bot
-    const me = await axios.post(`${TELEGRAM_API}/getMe`);
-    const botId = me.data.result.id;
-
-    // 2) Scan history — DIBATASI 300 biar aman di bawah timeout Vercel 10 dtk
-    const MAX_SCAN = 300;
-    let ids = [];
-    let offset = 0;
-    while (offset < MAX_SCAN) {
-      const h = await axios.post(`${TELEGRAM_API}/getChatHistory`, { chat_id: gid, offset, limit: 100 });
-      const msgs = h.data.result || [];
-      if (!msgs.length) break;
-      for (const m of msgs) if (m.from && m.from.id === botId) ids.push(m.message_id);
-      offset += 100;
-      if (msgs.length < 100) break;
+    // 1) Dapatkan ID bot
+    let botId;
+    try {
+      const me = await axios.post(`${TELEGRAM_API}/getMe`);
+      botId = me.data.result.id;
+    } catch (e) {
+      console.error('CLEAN ERROR [getMe]:', e.response ? JSON.stringify(e.response.data) : e.message);
+      return res.status(500).json({ error: 'Gagal mendapatkan info bot. Cek TELEGRAM_BOT_TOKEN.' });
     }
 
-    if (!ids.length) return res.json({ status: 'OK', deleted: 0 });
-
-    // 3) Hapus batch (deleteMessages max 100 per call), fallback satu-satu
-    let deleted = 0;
-    for (let i = 0; i < ids.length; i += 100) {
-      const batch = ids.slice(i, i + 100);
-      try {
-        await axios.post(`${TELEGRAM_API}/deleteMessages`, { chat_id: gid, message_ids: batch });
-        deleted += batch.length;
-      } catch (e) {
-        for (const mid of batch) {
-          try { await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); deleted++; } catch (e2) { }
+    // 2) Scan history (batas 200 pesan untuk aman dari timeout Vercel 10s)
+    let ids = [];
+    let offset = 0;
+    try {
+      while (offset < 200) {
+        const h = await axios.post(`${TELEGRAM_API}/getChatHistory`, { chat_id: gid, offset, limit: 100 });
+        const msgs = h.data.result || [];
+        if (!msgs.length) break;
+        for (const m of msgs) {
+          if (m.from && m.from.id === botId) ids.push(m.message_id);
         }
+        offset += 100;
+        if (msgs.length < 100) break;
+      }
+    } catch (e) {
+      const desc = e.response ? e.response.data.description : e.message;
+      console.error(`CLEAN ERROR [history ${target}]:`, desc);
+      return res.status(500).json({ 
+        error: `Gagal baca history grup ${target}: ${desc}. Pastikan bot ADMIN di grup & Group ID benar (awali -100).` 
+      });
+    }
+
+    if (!ids.length) return res.json({ status: 'OK', deleted: 0, message: 'Tidak ada pesan bot ditemukan' });
+
+    // 3) Hapus satu per satu (lebih stabil daripada batch yang sering error permission)
+    let deleted = 0;
+    let failed = 0;
+    let firstError = null;
+    
+    for (const mid of ids) {
+      try {
+        await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid });
+        deleted++;
+      } catch (e) {
+        failed++;
+        if (!firstError) firstError = e.response ? e.response.data.description : e.message;
       }
     }
 
-    await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted });
-    await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} pesan dihapus`, { safe: `🧹 Clean ${target}: ${deleted} pesan dihapus` });
-    res.json({ status: 'OK', deleted });
+    await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted, failed });
+    await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} dihapus, ${failed} gagal`, { 
+      safe: `🧹 Clean ${target}: ${deleted} dihapus` 
+    });
+    
+    res.json({ 
+      status: 'OK', 
+      deleted, 
+      failed,
+      message: failed > 0 ? `Beberapa pesan gagal dihapus: ${firstError}` : 'Semua pesan bot berhasil dihapus'
+    });
   } catch (e) {
-    // 🔍 error detail dari Telegram biar gampang debug
-    const desc = (e.response && e.response.data && e.response.data.description) ? e.response.data.description : e.message;
-    console.error('CLEAN ERROR:', desc);
-    res.status(500).json({ error: desc });
+    console.error('CLEAN ERROR [catch-all]:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
