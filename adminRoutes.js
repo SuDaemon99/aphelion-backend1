@@ -407,7 +407,24 @@ router.post('/team/chat', requireAuth, async (req, res) => {
       text: String(req.body.replyTo.text || '').slice(0, 80)
     };
   }
-  await db.collection('team_chat').add(doc);
+    await db.collection('team_chat').add(doc);
+  
+  // 🔔 FCM: push chat baru ke semua HP admin (kecuali pengirim sendiri)
+  const snap = await db.collection('fcm_tokens').get();
+  const myToken = req.body.fcmToken || ''; // opsional, biar gak push ke diri sendiri
+  const tokens = snap.docs
+    .filter(d => d.id !== req.admin.sub)
+    .map(d => d.data().token)
+    .filter(Boolean);
+  if (tokens.length && messaging) {
+    try {
+      await messaging.sendEachForMulticast({
+        tokens,
+        data: { title: '💬 Chat Baru', body: `${req.admin.sub}: ${text.slice(0, 60)}`, type: 'chat' }
+      });
+    } catch (e) { console.error('Push chat gagal:', e.message); }
+  }
+  
   res.json({ status: 'OK' });
 });
 
