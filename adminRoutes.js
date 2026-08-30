@@ -741,6 +741,7 @@ router.post('/arcade/raid/damage', requireAuth, async (req, res) => {
     if (hpLeft <= 0) {
       hpLeft = 0; killedBy = req.admin.sub;
       await notifyOps(`👹 <b>RAID</b>: GALAXY WARDEN tumbang oleh ${req.admin.sub}! Seluruh squad dapat badge 🏅`, { safe: `👹 Raid boss tumbang oleh ${req.admin.sub}!` });
+      await pushAllAdmins('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${req.admin.sub}! Squad 🏅`, 'critical');
     }
     await ref.update({ hpLeft, killedBy });
     res.json({ status: 'OK', hpLeft, killedBy });
