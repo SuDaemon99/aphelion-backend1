@@ -46,6 +46,18 @@ const serializeUser = (id, u) => ({
 const sendTG = async (chatId, text, options = {}) => {
   try {
     const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
+    
+    // ===== 💾 TRACKING PESAN GRUP (PATCH BARU) =====
+    if (String(chatId) === String(VIP_GROUP_ID) || String(chatId) === String(PUBLIC_GROUP_ID)) {
+      const mid = r.data.result.message_id;
+      db.collection('bot_messages').add({
+        chatId: String(chatId),
+        messageId: mid,
+        at: new Date().toISOString()
+      }).catch(() => {}); // Biarkan berjalan di background
+    }
+    // ===============================================
+
     return r.data;
   } catch (error) {
     if (options.parse_mode) {
@@ -190,7 +202,7 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
       const fDoc = await db.collection('finance_daily').doc(dk).get();
       const tDoc = await db.collection('finance_total').doc('all').get();
       out.finance = {
-        today: fDoc.exists ? { gross: f.data().gross || 0, count: f.data().count || 0 } : { gross: 0, count: 0 },
+        today: fDoc.exists ? { gross: fDoc.data().gross || 0, count: fDoc.data().count || 0 } : { gross: 0, count: 0 },
         total: tDoc.exists ? { gross: tDoc.data().gross || 0, count: tDoc.data().count || 0 } : { gross: 0, count: 0 }
       };
     }
@@ -796,68 +808,58 @@ const pushAll = async (title, body, type) => {
 const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on ? 'ON' : 'OFF'} (${dur}) oleh ${by}`, 'maint');
 const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${by}! Squad 🏅`, 'critical');
 
-// ================= CLEAN PESAN BOT [OWNER] =================
+// ================= CLEAN PESAN BOT [OWNER] (PATCH BARU) =================
 router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   const target = req.body.target === 'public' ? 'public' : 'vip';
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
   if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Vercel.` });
 
-  const fail = (step, e) => {
-    const desc = (e.response && e.response.data && e.response.data.description) ? e.response.data.description : (e.message || 'unknown');
-    const msg = `[${step}] grup=${gid} :: ${desc}`;
-    console.error('CLEAN ERROR', msg);
-    return res.status(500).json({ error: msg });
-  };
-
   try {
-    // 0) PREFLIGHT: token + grup
-    let botId;
-    try {
-      const me = await axios.post(`${TELEGRAM_API}/getMe`);
-      botId = me.data.result.id;
-    } catch (e) {
-      return fail('getMe: TOKEN BOT TIDAK VALID — cek TELEGRAM_BOT_TOKEN di Vercel, hapus spasi/enter', e);
-    }
-    try {
-      await axios.post(`${TELEGRAM_API}/getChat`, { chat_id: gid });
-    } catch (e) {
-      return fail('getChat: ID GRUP SALAH atau bot bukan member — format wajib -100xxxxxxxxxx', e);
+    // 1) Tarik history ID pesan dari Firestore (Maks scan 1000)
+    const snap = await db.collection('bot_messages')
+      .where('chatId', '==', String(gid))
+      .limit(1000)
+      .get();
+
+    if (snap.empty) {
+      return res.json({ status: 'OK', deleted: 0, failed: 0, note: 'Data riwayat kosong.' });
     }
 
-    // 1) Scan history 300
-    let ids = [];
-    let offset = 0;
-    while (offset < 300) {
-      const h = await axios.post(`${TELEGRAM_API}/getChatHistory`, { chat_id: gid, offset, limit: 100 });
-      const msgs = h.data.result || [];
-      if (!msgs.length) break;
-      for (const m of msgs) if (m.from && m.from.id === botId) ids.push(m.message_id);
-      offset += 100;
-      if (msgs.length < 100) break;
-    }
+    const ids = snap.docs.map(d => d.data().messageId);
+    const docRefs = snap.docs.map(d => d.ref);
 
-    if (!ids.length) return res.json({ status: 'OK', deleted: 0 });
-
-    // 2) Hapus batch + fallback satuan
-    let deleted = 0, failed = 0, firstErr = null;
+    // 2) Hapus massal di Telegram
+    let deleted = 0, failed = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
       try {
         await axios.post(`${TELEGRAM_API}/deleteMessages`, { chat_id: gid, message_ids: batch });
         deleted += batch.length;
       } catch (e) {
+        // Fallback: hapus satuan jika bulk gagal
         for (const mid of batch) {
-          try { await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); deleted++; }
-          catch (e2) { failed++; if (!firstErr) firstErr = e2.response ? e2.response.data.description : e2.message; }
+          try { 
+            await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); 
+            deleted++; 
+          } catch (e2) { failed++; }
         }
       }
     }
 
+    // 3) Bersihkan dari Firestore (Chunk per 400 dokumen)
+    for (let i = 0; i < docRefs.length; i += 400) {
+      const batchDB = db.batch();
+      docRefs.slice(i, i + 400).forEach(ref => batchDB.delete(ref));
+      await batchDB.commit();
+    }
+
     await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted, failed });
     await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} dihapus${failed ? `, ${failed} gagal` : ''}`, { safe: `🧹 Clean ${target}: ${deleted} dihapus` });
+    
     res.json({ status: 'OK', deleted, failed });
   } catch (e) {
-    return fail('umum', e);
+    console.error('CLEAN ERROR', e.message);
+    return res.status(500).json({ error: e.message });
   }
 });
 
