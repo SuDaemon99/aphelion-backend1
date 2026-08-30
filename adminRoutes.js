@@ -829,9 +829,21 @@ const execTool = async (name, args, role) => {
 };
 
 const PROVIDERS = {
-  groq: { url:'https://api.groq.com/openai/v1/chat/completions', key:'GROQ_API_KEY', models:['openai/gpt-oss-120b','qwen/qwen3.8-27b','qwen/qwen3.6-27b'] },
-  gemini: { url:'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key:'GEMINI_API_KEY', models:['gemini-2.5-pro','gemini-2.5-flash'] },
-  openrouter: { url:'https://openrouter.ai/api/v1/chat/completions', key:'OPENROUTER_API_KEY', models:['deepseek/deepseek-chat-v3-0324:free','meta-llama/llama-3.3-70b-instruct:free'] }
+  groq: { 
+    url: 'https://api.groq.com/openai/v1/chat/completions', 
+    key: 'GROQ_API_KEY', 
+    models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'] 
+  },
+  gemini: { 
+    url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', 
+    key: 'GEMINI_API_KEY', 
+    models: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro'] 
+  },
+  openrouter: { 
+    url: 'https://openrouter.ai/api/v1/chat/completions', 
+    key: 'OPENROUTER_API_KEY', 
+    models: ['deepseek/deepseek-chat:free', 'meta-llama/llama-3.3-70b-instruct:free'] 
+  }
 };
 
 const callProvider = async (pname, messages) => {
