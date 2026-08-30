@@ -272,6 +272,23 @@ app.post('/api/payment-webhook', async (req, res) => {
 
         const existingUser = await db.collection('users').doc(uid).get();
         await db.collection('users').doc(uid).set({
+                  // 🔔 FCM: push user baru (hanya kalau ini PERTAMA KALI user ini dibuat)
+        if (!existingUser.exists) {
+          try {
+            const snapT = await db.collection('fcm_tokens').get();
+            const tokens = snapT.docs.map(d => d.data().token).filter(Boolean);
+            if (tokens.length && messaging) {
+              await messaging.sendEachForMulticast({
+                tokens,
+                data: { 
+                  title: '👥 User Baru!', 
+                  body: `${username || 'User-' + uid} baru daftar • Rp ${parseInt(notification.gross_amount).toLocaleString('id-ID')}`, 
+                  type: 'newuser' 
+                }
+              });
+            }
+          } catch (e) { console.error('Push user baru gagal:', e.message); }
+        }
           uid: uid,
           username: username,
           email: userEmail || 'tidak_ada_email',
