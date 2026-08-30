@@ -704,4 +704,193 @@ router.post('/arcade/raid/damage', requireAuth, async (req, res) => {
     const cur = d.data();
     if (cur.killedBy) return res.json({ status: 'ALREADY_DEAD', hpLeft: cur.hpLeft, killedBy: cur.killedBy });
     let hpLeft = cur.hpLeft - (parseInt(req.body.dmg)||0); let killedBy = null;
-    if (hpLeft <=
+    if (hpLeft <= 0) {
+      hpLeft = 0; killedBy = req.admin.sub;
+      await notifyOps(`👹 <b>RAID</b>: GALAXY WARDEN tumbang oleh ${req.admin.sub}!`, { safe: `👹 Raid boss tumbang oleh ${req.admin.sub}!` });
+      pushAllAdmins('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${req.admin.sub}! Squad 🏅`, 'critical');
+    }
+    await ref.update({ hpLeft, killedBy });
+    res.json({ status: 'OK', hpLeft, killedBy });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ================= FCM =================
+let messaging = null;
+try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
+
+router.post('/fcm-token', requireAuth, async (req, res) => {
+  const token = String(req.body.token || '');
+  if (!token) return res.status(400).json({ error: 'Token wajib' });
+  await db.collection('fcm_tokens').doc(req.admin.sub).set({ token, role: req.admin.role, updatedAt: new Date().toISOString() });
+  res.json({ status: 'OK' });
+});
+
+const pushAll = async (title, body, type) => {
+  if (!messaging) return;
+  try {
+    const snap = await db.collection('fcm_tokens').get();
+    const tokens = snap.docs.map(d => d.data().token).filter(Boolean);
+    if (!tokens.length) return;
+    if (messaging.sendEachForMulticast) await messaging.sendEachForMulticast({ tokens, data: { title, body, type: type||'info' } });
+    else await messaging.sendMulticast({ tokens, data: { title, body, type: type||'info' } });
+  } catch (e) { console.error('Push gagal:', e.message); }
+};
+const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on?'ON':'OFF'} (${dur}) oleh ${by}`, 'maint');
+const pushAllAdmins = pushAll;
+
+// ================= 🤖 APHELION AI (MULTI-PROVIDER) =================
+const aiLimiter = rateLimit({ windowMs: 60*1000, max: 15 });
+const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
+const maskUser = (u) => ({
+  uid: u.uid || u.id || null, username: u.username || null,
+  email: u.email ? (String(u.email).split('@')[0].slice(0,2)+'***@'+(String(u.email).split('@')[1]||'')) : null,
+  status: u.status || null, expiredAt: iso(u.expiredAt), createdAt: u.createdAt || null, hwidBound: !!u.deviceId
+});
+
+const AI_MANUAL = `STACK APHELION: Backend Node+Express di VERCEL SERVERLESS (BUKAN VPS/docker — jangan sarankan systemctl/docker). Log: Vercel Function Logs. DB: Firestore. Bot Telegram via webhook /api/telegram-webhook. Bayar: Midtrans webhook /api/payment-webhook. Cron eksternal: GET /api/cron/check-expired. App admin Android Compose+FCM. App user: mod Android + token + HWID. Bisnis: langganan VIP + grup Telegram.`;
+
+const aiSystemPrompt = (admin, provider) => `Kamu APHELION AI (${provider}), chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
+ATURAN: 1) Bahasa Indonesia santai-profesional, ringkas, solutif. 2) Gunakan TOOLS untuk data sistem, jangan menebak. 3) Jujur kalau data tidak ada. 4) Token/HWID/email/password/API key di-mask — jangan buka. 5) Non-owner dilarang dapat finance/audit. 6) Pertanyaan umum dijawab bebas. 7) Rekomendasi teknis konsisten dengan MANUAL.
+` + AI_MANUAL;
+
+const AI_TOOLS = [
+  { type:'function', function:{ name:'system_health', description:'Kesehatan sistem.', parameters:{type:'object',properties:{}} } },
+  { type:'function', function:{ name:'users_overview', description:'Statistik user.', parameters:{type:'object',properties:{}} } },
+  { type:'function', function:{ name:'search_user', description:'Cari user by UID/username.', parameters:{type:'object',properties:{q:{type:'string'}},required:['q']} } },
+  { type:'function', function:{ name:'user_timeline', description:'Profil + riwayat transaksi user.', parameters:{type:'object',properties:{uid:{type:'string'}},required:['uid']} } },
+  { type:'function', function:{ name:'finance_range', description:'[OWNER] Omzet N hari.', parameters:{type:'object',properties:{days:{type:'integer'}}} } },
+  { type:'function', function:{ name:'transactions_last', description:'[OWNER] N transaksi terakhir.', parameters:{type:'object',properties:{limit:{type:'integer'}}} } },
+  { type:'function', function:{ name:'audit_search', description:'[OWNER] Cari audit log.', parameters:{type:'object',properties:{admin:{type:'string'},action:{type:'string'},days:{type:'integer'}}} } },
+  { type:'function', function:{ name:'team_chat_last', description:'N pesan chat tim.', parameters:{type:'object',properties:{n:{type:'integer'}}} } },
+  { type:'function', function:{ name:'templates_list', description:'Template pesan bot.', parameters:{type:'object',properties:{}} } },
+  { type:'function', function:{ name:'arcade_status', description:'Raid + top 5 leaderboard.', parameters:{type:'object',properties:{}} } }
+];
+
+const execTool = async (name, args, role) => {
+  const deny = { error: 'AKSES DITOLAK: khusus owner.' };
+  switch (name) {
+    case 'system_health': { const d = await db.collection('settings').doc('app').get(); const s = d.exists?d.data():{}; return { maintenance: s.maintenance===true, price: s.price||null, planDays: s.planDays||null, lastCronRun: s.lastCronRun||null, lastTelegramPing: s.lastTelegramPing||null, lastPaymentPing: s.lastPaymentPing||null }; }
+    case 'users_overview': {
+      const cnt = async st => (await db.collection('users').where('status','==',st).count().get()).data().count;
+      const [active,expired,banned] = await Promise.all([cnt('ACTIVE'),cnt('EXPIRED'),cnt('BANNED')]);
+      const newWeek = (await db.collection('users').where('createdAt','>=',new Date(Date.now()-7*86400000).toISOString()).count().get()).data().count;
+      const exp = await db.collection('users').where('status','==','ACTIVE').where('expiredAt','<',new Date(Date.now()+3*86400000)).orderBy('expiredAt','asc').limit(10).get();
+      return { active, expired, banned, newLast7Days: newWeek, expiringIn3Days: exp.docs.map(x=>({uid:x.id,username:x.data().username||null,expiredAt:iso(x.data().expiredAt)})) };
+    }
+    case 'search_user': {
+      const qq = String(args.q||'').trim().toLowerCase(); if (!qq) return { error:'param q wajib' };
+      if (/^\d{5,15}$/.test(qq)) { const d = await db.collection('users').doc(qq).get(); if (d.exists) return maskUser({id:d.id,...d.data()}); }
+      const s = await db.collection('users').where('username','==',qq).limit(1).get();
+      return s.empty ? { error:'User tidak ditemukan' } : maskUser({id:s.docs[0].id,...s.docs[0].data()});
+    }
+    case 'user_timeline': {
+      const d = await db.collection('users').doc(String(args.uid||'')).get();
+      if (!d.exists) return { error:'User tidak ditemukan' };
+      const tx = await db.collection('transactions').where('uid','==',d.id).orderBy('paidAt','desc').limit(10).get();
+      return { user: maskUser({id:d.id,...d.data()}), transactions: tx.docs.map(x=>({orderId:x.data().orderId,amount:x.data().amount,channel:x.data().channel,status:x.data().status,paidAt:x.data().paidAt})) };
+    }
+    case 'finance_range': {
+      if (role!=='owner') return deny;
+      const days = Math.min(parseInt(args.days)||7,30); const daily=[];
+      for (let i=0;i<days;i++){ const dk=new Date(Date.now()-i*86400000).toISOString().slice(0,10); const f=await db.collection('finance_daily').doc(dk).get(); daily.push({date:dk,gross:f.exists?(f.data().gross||0):0,count:f.exists?(f.data().count||0):0}); }
+      const t = await db.collection('finance_total').doc('all').get();
+      return { daily, total: t.exists?{gross:t.data().gross||0,count:t.data().count||0}:{gross:0,count:0} };
+    }
+    case 'transactions_last': {
+      if (role!=='owner') return deny;
+      const s = await db.collection('transactions').orderBy('paidAt','desc').limit(Math.min(parseInt(args.limit)||10,20)).get();
+      return s.docs.map(x=>({orderId:x.data().orderId,uid:x.data().uid,amount:x.data().amount,channel:x.data().channel,status:x.data().status,paidAt:x.data().paidAt}));
+    }
+    case 'audit_search': {
+      if (role!=='owner') return deny;
+      let ref = db.collection('audit_logs').where('at','>=',new Date(Date.now()-(Math.min(parseInt(args.days)||7,90))*86400000).toISOString());
+      if (args.admin) ref = ref.where('admin','==',String(args.admin));
+      if (args.action) ref = ref.where('action','==',String(args.action));
+      const s = await ref.orderBy('at','desc').limit(30).get();
+      return s.docs.map(x=>({admin:x.data().admin,action:x.data().action,target:x.data().target,at:x.data().at}));
+    }
+    case 'team_chat_last': {
+      const s = await db.collection('team_chat').orderBy('at','desc').limit(Math.min(parseInt(args.n)||15,30)).get();
+      return s.docs.map(x=>`${x.data().sender}: ${x.data().deleted?'(dihapus)':x.data().text}`);
+    }
+    case 'templates_list': {
+      const snap = await db.collection('templates').get(); const custom={};
+      snap.docs.forEach(d=>{custom[d.id]=d.data().text;});
+      return Object.keys(DEFAULT_TPL).map(k=>({key:k,custom:!!custom[k],text:custom[k]||DEFAULT_TPL[k]}));
+    }
+    case 'arcade_status': {
+      const r = await db.collection('arcade_raid').doc(weekKey()).get();
+      const lb = await db.collection('arcade_scores').where('at','>=',new Date(Date.now()-7*86400000).toISOString()).orderBy('at','desc').limit(200).get();
+      const best={}; lb.docs.forEach(d=>{const s=d.data(); if(!best[s.username]||s.score>best[s.username].score) best[s.username]=s.score;});
+      return { week: weekKey(), raid: r.exists?{hpMax:r.data().hpMax,hpLeft:r.data().hpLeft,killedBy:r.data().killedBy}:null, top5: Object.entries(best).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([u,sc])=>({username:u,score:sc})) };
+    }
+    default: return { error: 'Tool tidak dikenal: '+name };
+  }
+};
+
+const PROVIDERS = {
+  groq: { url:'https://api.groq.com/openai/v1/chat/completions', key:'GROQ_API_KEY', models:['openai/gpt-oss-120b','qwen/qwen3.8-27b','qwen/qwen3.6-27b'] },
+  gemini: { url:'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key:'GEMINI_API_KEY', models:['gemini-2.5-pro','gemini-2.5-flash'] },
+  openrouter: { url:'https://openrouter.ai/api/v1/chat/completions', key:'OPENROUTER_API_KEY', models:['deepseek/deepseek-chat-v3-0324:free','meta-llama/llama-3.3-70b-instruct:free'] }
+};
+
+const callProvider = async (pname, messages) => {
+  const p = PROVIDERS[pname]; const key = process.env[p.key];
+  if (!key) throw new Error('Key belum diset: '+p.key);
+  let lastErr = null;
+  for (const model of p.models) {
+    try {
+      const r = await axios.post(p.url, { model, messages, tools: AI_TOOLS, tool_choice:'auto', temperature:0.4, max_tokens:900 },
+        { headers:{ Authorization:`Bearer ${key}`, 'Content-Type':'application/json' }, timeout:10000 });
+      return { data: r.data, model };
+    } catch (e) {
+      const st = e.response?.status; const code = e.response?.data?.error?.code;
+      console.error(`AI [${pname}/${model}] status=${st} :: ${String(e.message).slice(0,150)}`);
+      lastErr = e;
+      if (st === 429 || code === 'rate_limit_exceeded' || st === 404) continue;
+      throw e;
+    }
+  }
+  throw lastErr;
+};
+
+router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
+  try {
+    const q = String(req.body.q||'').trim();
+    const provider = String(req.body.provider||'groq').toLowerCase();
+    if (!q) return res.status(400).json({ error:'Pertanyaan kosong' });
+    if (q.length > 500) return res.status(400).json({ error:'Maksimal 500 karakter' });
+    if (!PROVIDERS[provider]) return res.status(400).json({ error:'Provider tidak valid' });
+
+    const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
+    const history = histDoc.exists ? (histDoc.data().history||[]) : [];
+    const messages = [ { role:'system', content: aiSystemPrompt(req.admin, provider) }, ...history, { role:'user', content: q } ];
+
+    let answer = '(tanpa jawaban)'; let usedModel = null;
+    for (let round = 0; round < 3; round++) {
+      const { data, model } = await callProvider(provider, messages);
+      usedModel = model;
+      const msg = data.choices?.[0]?.message;
+      if (!msg) break;
+      if (msg.tool_calls && msg.tool_calls.length) {
+        messages.push({ role:'assistant', content: msg.content||null, tool_calls: msg.tool_calls });
+        for (const tc of msg.tool_calls.slice(0,3)) {
+          let out; try { out = await execTool(tc.function.name, JSON.parse(tc.function.arguments||'{}'), req.admin.role); } catch (e) { out = { error: e.message }; }
+          messages.push({ role:'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
+        }
+        continue;
+      }
+      answer = msg.content || answer; break;
+    }
+
+    const newHist = [...history, {role:'user',content:q}, {role:'assistant',content:(answer||'').slice(0,1200)}].slice(-4);
+    await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
+    res.json({ answer, provider, model: usedModel });
+  } catch (e) {
+    if (e.response?.data?.error?.code === 'rate_limit_exceeded') return res.status(429).json({ error:'⏳ Provider antre. Coba 15 dtk lagi.' });
+    console.error('AI ERROR:', e.response?.data || e.message);
+    res.status(500).json({ error: 'AI error: ' + (e.response?.data?.error?.message || e.message) });
+  }
+});
+
+module.exports = router;
