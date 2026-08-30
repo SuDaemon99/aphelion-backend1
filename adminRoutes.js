@@ -1141,14 +1141,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
     if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
 
-    // kuota harian
-    const dk = new Date().toISOString().slice(0, 10);
-    const qRef = db.collection('ai_quota').doc(`${req.admin.sub}_${dk}`);
-    const qDoc = await qRef.get();
-    const used = qDoc.exists ? (qDoc.data().count || 0) : 0;
-    if (used >= AI_MAX) return res.status(429).json({ error: '⏳ Kuota harian habis (50/hari). Reset besok.' });
-    await qRef.set({ count: used + 1, date: dk }, { merge: true });
-
     const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
     const history = histDoc.exists ? (histDoc.data().history || []) : [];
 
@@ -1160,7 +1152,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
 
     let answer = '(tanpa jawaban)';
     for (let round = 0; round < 3; round++) {
-      // 🔥 FIX: PAKAI callGroq (fallback model AKTIF)
       const data = await callGroq(messages);
       const msg = data.choices[0].message;
       
@@ -1180,16 +1171,14 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
       break;
     }
 
-    // 🔥 HEMAT TOKEN: history lebih pendek
     const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: slim(answer, 800) }].slice(-4);
     await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
 
-    res.json({ answer, quotaLeft: AI_MAX - used - 1 });
+    res.json({ answer });
   } catch (e) {
-    // 🔥 PESAN RAMAH 429 (jangan 500 menakutkan)
     const gcode = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
     if (gcode === 'rate_limit_exceeded') {
-      return res.status(429).json({ error: '⏳ AI lagi antre (batas gratis Groq). Coba 15 detik lagi ya.' });
+      return res.status(429).json({ error: '⏳ AI lagi antre (Groq rate limit). Coba 15 detik lagi ya.' });
     }
     console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
     res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
