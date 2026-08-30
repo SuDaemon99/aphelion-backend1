@@ -913,4 +913,34 @@ router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
+// ================= CLEAR FEED / AKTIVITAS [OWNER] =================
+router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const countSnap = await db.collection('ops_feed').count().get();
+    const total = countSnap.data().count || 0;
+    if (total === 0) return res.json({ status: 'OK', deleted: 0, note: 'Feed sudah kosong' });
+
+    // Hapus chunks 400 (aman dari Firestore batch limit 500)
+    let deleted = 0;
+    const BATCH = 400;
+    while (true) {
+      const snap = await db.collection('ops_feed').limit(BATCH).get();
+      if (snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+      deleted += snap.size;
+      if (snap.size < BATCH) break;
+    }
+
+    await logAudit(req.admin.sub, 'CLEAR_FEED', null, { deleted });
+    // Tulis 1 entri baru biar layar nggak kosong & tim tau feed di-reset
+    await notifyOps(`🧹 <b>Riwayat Aktivitas dibersihkan</b> oleh ${req.admin.sub} (${deleted} entri dihapus)`, { safe: `🧹 Aktivitas dibersihkan oleh ${req.admin.sub}` });
+    res.json({ status: 'OK', deleted });
+  } catch (e) {
+    console.error('CLEAR FEED ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
