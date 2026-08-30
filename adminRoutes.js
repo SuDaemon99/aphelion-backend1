@@ -1146,7 +1146,7 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     const qRef = db.collection('ai_quota').doc(`${req.admin.sub}_${dk}`);
     const qDoc = await qRef.get();
     const used = qDoc.exists ? (qDoc.data().count || 0) : 0;
-    if (used >= AI_MAX) return res.status(429).json({ error: 'Kuota harian habis (50/hari). Reset besok.' });
+    if (used >= AI_MAX) return res.status(429).json({ error: '⏳ Kuota harian habis (50/hari). Reset besok.' });
     await qRef.set({ count: used + 1, date: dk }, { merge: true });
 
     const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
@@ -1160,19 +1160,10 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
 
     let answer = '(tanpa jawaban)';
     for (let round = 0; round < 3; round++) {
-      const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-        model: process.env.AI_MODEL || 'qwen/qwen3.8-27b',
-        messages,
-        tools: AI_TOOLS,
-        tool_choice: 'auto',
-        temperature: 0.4,
-        max_tokens: 1024
-      }, {
-        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-        timeout: 6000
-      });
-
-      const msg = r.data.choices[0].message;
+      // 🔥 FIX: PAKAI callGroq (fallback model AKTIF)
+      const data = await callGroq(messages);
+      const msg = data.choices[0].message;
+      
       if (msg.tool_calls && msg.tool_calls.length) {
         messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
         for (const tc of msg.tool_calls.slice(0, 3)) {
@@ -1189,14 +1180,19 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
       break;
     }
 
-    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: answer }].slice(-6);
+    // 🔥 HEMAT TOKEN: history lebih pendek
+    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: slim(answer, 800) }].slice(-4);
     await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
 
     res.json({ answer, quotaLeft: AI_MAX - used - 1 });
   } catch (e) {
+    // 🔥 PESAN RAMAH 429 (jangan 500 menakutkan)
+    const gcode = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
+    if (gcode === 'rate_limit_exceeded') {
+      return res.status(429).json({ error: '⏳ AI lagi antre (batas gratis Groq). Coba 15 detik lagi ya.' });
+    }
     console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
     res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
   }
 });
-
 module.exports = router;
