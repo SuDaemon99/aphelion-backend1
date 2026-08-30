@@ -973,12 +973,11 @@ router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
 });
 
 // ================= 🤖 APHELION AI (DEEP DIVE + TOOLS) =================
+// ================= 🤖 APHELION AI (DEEP DIVE + DEWAN) =================
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
-const AI_MAX = 50;
 
 const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
 
-// 🚧 GARIS MERAH: serializer mask — AI TIDAK PERNAH melihat kunci
 const maskUser = (u) => ({
   uid: u.uid || u.id || null,
   username: u.username || null,
@@ -1011,25 +1010,24 @@ ATURAN:
 7. Rekomendasi teknis WAJIB konsisten dengan MANUAL stack.
 ` + AI_MANUAL;
 
-// ---------- TOOLS ----------
 const AI_TOOLS = [
-  { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem: maintenance, ping Telegram/payment, cron, harga, planDays.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'users_overview', description: 'Statistik user.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'search_user', description: 'Cari user by UID/username (data ter-mask).', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } },
-  { type: 'function', function: { name: 'user_timeline', description: 'Profil ter-mask + riwayat transaksi satu user.', parameters: { type: 'object', properties: { uid: { type: 'string' } }, required: ['uid'] } } },
-  { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet per hari N hari terakhir + total keseluruhan.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'transactions_last', description: '[OWNER] N transaksi terakhir (max 20).', parameters: { type: 'object', properties: { limit: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'audit_search', description: '[OWNER] Cari audit log by admin/aksi/rentang hari.', parameters: { type: 'object', properties: { admin: { type: 'string' }, action: { type: 'string' }, days: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim (digest).', parameters: { type: 'object', properties: { n: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'templates_list', description: 'Semua template pesan bot (review/rewrite).', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'arcade_status', description: 'Raid boss mingguan + top 5 leaderboard.', parameters: { type: 'object', properties: {} } } }
+  { type: 'function', function: { name: 'user_timeline', description: 'Profil ter-mask + riwayat transaksi.', parameters: { type: 'object', properties: { uid: { type: 'string' } }, required: ['uid'] } } },
+  { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet N hari.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'transactions_last', description: '[OWNER] N transaksi terakhir.', parameters: { type: 'object', properties: { limit: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'audit_search', description: '[OWNER] Cari audit log.', parameters: { type: 'object', properties: { admin: { type: 'string' }, action: { type: 'string' }, days: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim.', parameters: { type: 'object', properties: { n: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'templates_list', description: 'Semua template pesan bot.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'arcade_status', description: 'Raid boss + top 5 leaderboard.', parameters: { type: 'object', properties: {} } } }
 ];
 
 const execTool = async (name, args, role) => {
   const deny = { error: 'AKSES DITOLAK: data ini khusus owner.' };
   switch (name) {
     case 'system_health': {
-      const d = (await db.collection('settings').doc('app').get());
+      const d = await db.collection('settings').doc('app').get();
       const s = d.exists ? d.data() : {};
       return { maintenance: s.maintenance === true, price: s.price || null, planDays: s.planDays || null, lastCronRun: s.lastCronRun || null, lastTelegramPing: s.lastTelegramPing || null, lastPaymentPing: s.lastPaymentPing || null };
     }
@@ -1109,7 +1107,6 @@ const execTool = async (name, args, role) => {
   }
 };
 
-// 🚦 Fallback model: tiap model punya kantong TPM sendiri
 const AI_MODELS = [process.env.AI_MODEL || 'qwen/qwen3.8-27b', 'qwen/qwen3.6-27b', 'openai/gpt-oss-20b'];
 
 const callGroq = async (messages, preferModel) => {
@@ -1136,6 +1133,77 @@ const callGroq = async (messages, preferModel) => {
 
 const slim = (s, n) => String(s || '').slice(0, n);
 
+// ================= 🏛️ DEWAN PROFESOR =================
+const callLLM = async (provider, model, messages, opts = {}) => {
+  const URLS = {
+    groq: 'https://api.groq.com/openai/v1/chat/completions',
+    openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+    gemini: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
+  };
+  const KEYS = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', gemini: 'GEMINI_API_KEY' };
+  const key = process.env[KEYS[provider]];
+  if (!key) throw new Error('Key belum diset: ' + KEYS[provider]);
+  const r = await axios.post(URLS[provider], {
+    model, messages, temperature: 0.4, max_tokens: opts.max_tokens || 600
+  }, {
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    timeout: opts.timeout || 5000
+  });
+  return (r.data.choices && r.data.choices[0] && (r.data.choices[0].message.content || '')) || '';
+};
+
+const COUNCIL = [
+  { id: 'eng', label: '🧑‍💻 TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: fokus webhook, cron, HWID, arsitektur, keamanan teknis.' },
+  { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: fokus angka, tren, forensik transaksi, churn, akuisisi.' },
+  { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: cari inkonsistensi, celah logika, asumsi tanpa bukti.' },
+  { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1-0528:free', persona: 'Deep Reasoner: rantai sebab-akibat, korelasi temporal, root-cause.' }
+];
+const JUDGE_CHAIN = [
+  { provider: 'gemini', model: 'gemini-2.5-pro' },
+  { provider: 'gemini', model: 'gemini-2.5-flash' },
+  { provider: 'groq', model: 'openai/gpt-oss-120b' }
+];
+const councilCooldown = {};
+
+const buildDeepSnapshot = async (role) => {
+  const [health, users, chat, arcade] = await Promise.all([
+    execTool('system_health', {}, role),
+    execTool('users_overview', {}, role),
+    execTool('team_chat_last', { n: 15 }, role),
+    execTool('arcade_status', {}, role)
+  ]);
+  const snap = { system_health: health, users, team_chat: chat, arcade };
+  if (role === 'owner') {
+    snap.finance_7d = await execTool('finance_range', { days: 7 }, role);
+    snap.transactions = await execTool('transactions_last', { limit: 10 }, role);
+    snap.audit_7d = await execTool('audit_search', { days: 7 }, role);
+  }
+  return snap;
+};
+
+const councilRounds = async (q, snapStr) => {
+  const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nSNAPSHOT LIVE:\n${snapStr}\nATURAN: maks 220 kata, WAJIB kutip evidence dari snapshot, akhiri dengan "CONFIDENCE: <0-100>".`;
+  const r1 = await Promise.all(COUNCIL.map(m =>
+    callLLM(m.provider, m.model, [
+      { role: 'system', content: baseFor(m) },
+      { role: 'user', content: q }
+    ]).then(t => ({ ...m, opini: t })).catch(() => ({ ...m, opini: null }))
+  ));
+  const alive = r1.filter(x => x.opini);
+  if (alive.length < 2) throw new Error('Analis aktif < 2. Cek GEMINI_API_KEY & OPENROUTER_API_KEY di env Vercel.');
+  const others = alive.map(x => `${x.label}: ${x.opini}`).join('\n---\n');
+  const r2 = await Promise.all(alive.map(m =>
+    callLLM(m.provider, m.model, [
+      { role: 'system', content: baseFor(m) + '\nROUND 2 (DISKUSI): Baca opini rekan di bawah. KRITIK yang tidak didukung data, PERKUAT yang valid, dan REVISI posisimu bila perlu. Maks 200 kata.' },
+      { role: 'user', content: q },
+      { role: 'assistant', content: m.opini },
+      { role: 'user', content: 'OPINI REKAN KAMU:\n' + others }
+    ]).then(t => ({ ...m, final: t })).catch(() => ({ ...m, final: m.opini }))
+  ));
+  return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DISKUSI:\n${x.final}`).join('\n=====\n');
+};
+
+// ===== ROUTE /ai/ask (3 MODE: FAST / DEEP / COUNCIL) =====
 router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   try {
     const q = String(req.body.q || '').trim();
@@ -1143,20 +1211,12 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
     if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
 
-    // 🏛️ cooldown dewan 20 dtk
     if (mode === 'council') {
       const now = Date.now();
       const last = councilCooldown[req.admin.sub] || 0;
       if (now - last < 20000) return res.status(429).json({ error: `🏛️ Dewan istirahat dulu. Tunggu ${Math.ceil((20000 - (now - last)) / 1000)} dtk lagi.` });
       councilCooldown[req.admin.sub] = now;
-    }
 
-    const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
-    const history = histDoc.exists ? (histDoc.data().history || []) : [];
-    let answer = '(tanpa jawaban)';
-
-    if (mode === 'council') {
-      // Round 1+2 dulu, hakim dipisah di /ai/verdict (biar aman dari timeout Vercel 10 dtk)
       const snapshot = await buildDeepSnapshot(req.admin.role);
       const debate = await councilRounds(q, JSON.stringify(snapshot));
       const ref = await db.collection('ai_council').add({
@@ -1165,6 +1225,9 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
       return res.json({ councilId: ref.id });
     }
 
+    const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
+    const history = histDoc.exists ? (histDoc.data().history || []) : [];
+
     const messages = [
       { role: 'system', content: aiSystemPrompt(req.admin) },
       ...history,
@@ -1172,6 +1235,7 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     ];
     if (mode === 'deep') messages.push({ role: 'system', content: 'MODE DEEP: analisis mendalam, terstruktur, sertakan data & rekomendasi konkret.' });
 
+    let answer = '(tanpa jawaban)';
     for (let round = 0; round < 3; round++) {
       const data = await callGroq(messages, mode === 'deep' ? 'openai/gpt-oss-120b' : null);
       const msg = data.choices[0].message;
@@ -1202,12 +1266,12 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   }
 });
 
-// ⚖️ ROUND 3+4: KETUA SIDANG menyimpulkan (terpisah biar <10 dtk)
+// ===== ROUTE /ai/verdict (Ketua Sidang menyimpulkan) =====
 router.post('/ai/verdict', requireAuth, async (req, res) => {
   try {
     const id = String(req.body.id || '');
     const d = await db.collection('ai_council').doc(id).get();
-    if (!d.exists) return res.status(404).json({ error: 'Sidang tidak ditemukan / sudah diambil.' });
+    if (!d.exists) return res.status(404).json({ error: 'Sidang tidak ditemukan.' });
     const { q, debate, snap } = d.data();
 
     const judgeSys = `Kamu KETUA SIDANG, profesor senior paling berpengalaman. Tugasmu:
@@ -1229,7 +1293,7 @@ ${AI_MANUAL}`;
       try {
         finalText = await callLLM(j.provider, j.model, [
           { role: 'system', content: judgeSys + '\nSNAPSHOT:\n' + snap },
-          { role: 'user', content: `PERTANYAAN OWNER:\n${q}\n\nTRANSKRIP SIDANG (Round 1+2):\n${debate}` }
+          { role: 'user', content: `PERTANYAAN:\n${q}\n\nTRANSKRIP SIDANG (Round 1+2):\n${debate}` }
         ], { timeout: 8000, max_tokens: 1200 });
         if (finalText) break;
       } catch (e) { /* coba hakim berikutnya */ }
@@ -1239,112 +1303,6 @@ ${AI_MANUAL}`;
     res.json({ answer: finalText });
   } catch (e) {
     res.status(500).json({ error: e.message });
-  }
-});
-
-    // ================= 🏛️ DEWAN PROFESOR (MULTI-AGENT DEBATE) =================
-const callLLM = async (provider, model, messages, opts = {}) => {
-  const URLS = {
-    groq: 'https://api.groq.com/openai/v1/chat/completions',
-    openrouter: 'https://openrouter.ai/api/v1/chat/completions',
-    gemini: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
-  };
-  const KEYS = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', gemini: 'GEMINI_API_KEY' };
-  const key = process.env[KEYS[provider]];
-  if (!key) throw new Error('Key belum diset: ' + KEYS[provider]);
-  const r = await axios.post(URLS[provider], {
-    model, messages, temperature: 0.4, max_tokens: opts.max_tokens || 600
-  }, {
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    timeout: opts.timeout || 4000
-  });
-  return (r.data.choices && r.data.choices[0] && (r.data.choices[0].message.content || '')) || '';
-};
-
-const COUNCIL = [
-  { id: 'eng', label: '🧑‍ TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: fokus webhook, cron, HWID, arsitektur, keamanan teknis.' },
-  { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: fokus angka, tren, forensik transaksi, churn, akuisisi.' },
-  { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: cari inkonsistensi, celah logika, dan asumsi tanpa bukti.' },
-  { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1-0528:free', persona: 'Deep Reasoner: rantai sebab-akibat, korelasi temporal, root-cause.' }
-];
-const JUDGE_CHAIN = [
-  { provider: 'gemini', model: 'gemini-2.5-pro' },
-  { provider: 'gemini', model: 'gemini-2.5-flash' },
-  { provider: 'groq', model: 'openai/gpt-oss-120b' }
-];
-const councilCooldown = {};
-
-const buildDeepSnapshot = async (role) => {
-  const [health, users, chat, arcade] = await Promise.all([
-    execTool('system_health', {}, role),
-    execTool('users_overview', {}, role),
-    execTool('team_chat_last', { n: 15 }, role),
-    execTool('arcade_status', {}, role)
-  ]);
-  const snap = { system_health: health, users, team_chat: chat, arcade };
-  if (role === 'owner') {
-    snap.finance_7d = await execTool('finance_range', { days: 7 }, role);
-    snap.transactions = await execTool('transactions_last', { limit: 10 }, role);
-    snap.audit_7d = await execTool('audit_search', { days: 7 }, role);
-  }
-  return snap;
-};
-
-// ROUND 1 + ROUND 2 (diskusi lintas AI) — jalan paralel, aman <10 dtk
-const councilRounds = async (q, snapStr) => {
-  const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nSNAPSHOT LIVE:\n${snapStr}\nATURAN: maks 220 kata, WAJIB kutip evidence dari snapshot, akhiri dengan "CONFIDENCE: <0-100>".`;
-  const r1 = await Promise.all(COUNCIL.map(m =>
-    callLLM(m.provider, m.model, [
-      { role: 'system', content: baseFor(m) },
-      { role: 'user', content: q }
-    ]).then(t => ({ ...m, opini: t })).catch(() => ({ ...m, opini: null }))
-  ));
-  const alive = r1.filter(x => x.opini);
-  if (alive.length < 2) throw new Error('Analis aktif < 2. Cek GEMINI_API_KEY & OPENROUTER_API_KEY di env Vercel.');
-  const others = alive.map(x => `${x.label}: ${x.opini}`).join('\n---\n');
-  const r2 = await Promise.all(alive.map(m =>
-    callLLM(m.provider, m.model, [
-      { role: 'system', content: baseFor(m) + '\nROUND 2 (DISKUSI): Baca opini rekan di bawah. KRITIK yang tidak didukung data, PERKUAT yang valid, dan REVISI posisimu bila perlu. Maks 200 kata.' },
-      { role: 'user', content: q },
-      { role: 'assistant', content: m.opini },
-      { role: 'user', content: 'OPINI REKAN KAMU:\n' + others }
-    ]).then(t => ({ ...m, final: t })).catch(() => ({ ...m, final: m.opini }))
-  ));
-  return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DISKUSI:\n${x.final}`).join('\n=====\n');
-};
-
-    let answer = '(tanpa jawaban)';
-    for (let round = 0; round < 3; round++) {
-      const data = await callGroq(messages);
-      const msg = data.choices[0].message;
-      
-      if (msg.tool_calls && msg.tool_calls.length) {
-        messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
-        for (const tc of msg.tool_calls.slice(0, 3)) {
-          let out;
-          try {
-            const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
-            out = await execTool(tc.function.name, args, req.admin.role);
-          } catch (e) { out = { error: e.message }; }
-          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
-        }
-        continue;
-      }
-      answer = msg.content || answer;
-      break;
-    }
-
-    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: slim(answer, 800) }].slice(-4);
-    await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
-
-    res.json({ answer });
-  } catch (e) {
-    const gcode = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
-    if (gcode === 'rate_limit_exceeded') {
-      return res.status(429).json({ error: '⏳ AI lagi antre (Groq rate limit). Coba 15 detik lagi ya.' });
-    }
-    console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
-    res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
   }
 });
 module.exports = router;
