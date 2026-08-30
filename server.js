@@ -28,6 +28,21 @@ if (getApps().length === 0) {
 const db = getFirestore();
 const app = express();
 
+let messaging = null;
+try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
+
+const pushAllAdmins = async (title, body, type) => {
+  if (!messaging) return;
+  try {
+    const snapT = await db.collection('fcm_tokens').get();
+    const tokens = snapT.docs.map(d => d.data().token).filter(Boolean);
+    if (!tokens.length) return;
+    const msg = { tokens, data: { title, body, type: type || 'info' } };
+    if (messaging.sendEachForMulticast) await messaging.sendEachForMulticast(msg);
+    else await messaging.sendMulticast(msg);
+  } catch (e) { console.error('Push gagal:', e.message); }
+};
+
 app.use(express.json());
 app.use(cors());
 
