@@ -1133,19 +1133,38 @@ const callGroq = async (messages, preferModel) => {
 
 const slim = (s, n) => String(s || '').slice(0, n);
 
-// ================= 🏛️ DEWAN PROFESOR =================
-// 🩺 Versi tahan banting: log error + retry 1x kalau kena rate limit
+const callLLM = async (provider, model, messages, opts = {}) => {
+  const URLS = {
+    groq: 'https://api.groq.com/openai/v1/chat/completions',
+    openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+    gemini: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
+  };
+  const KEYS = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', gemini: 'GEMINI_API_KEY' };
+  const key = process.env[KEYS[provider]];
+  if (!key) throw new Error('Key belum diset: ' + KEYS[provider]);
+  const r = await axios.post(URLS[provider], {
+    model, messages, temperature: 0.4, max_tokens: opts.max_tokens || 600
+  }, {
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    timeout: opts.timeout || 5000
+  });
+  const msg = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message;
+  const content = (msg && (msg.content || msg.reasoning)) || '';
+  if (!content) console.error(`LLM EMPTY [${provider}/${model}] raw=${JSON.stringify(r.data).slice(0, 300)}`);
+  return content;
+};
+
 const callLLMSafe = async (m, messages, opts = {}) => {
   try {
     return await callLLM(m.provider, m.model, messages, opts);
   } catch (e) {
     const st = e.response && e.response.status;
     const code = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
-    console.error(`COUNCIL ${m.id} FAIL [${m.provider}/${m.model}] status=${st} code=${code} :: ${e.message}`);
+    console.error(`COUNCIL ${m.id} FAIL [${m.provider}/${m.model}] status=${st} code=${code} :: ${String(e.message).slice(0, 200)}`);
     if (st === 429 || code === 'rate_limit_exceeded') {
       await new Promise(r => setTimeout(r, 1200));
       try { return await callLLM(m.provider, m.model, messages, opts); }
-      catch (e2) { console.error(`COUNCIL ${m.id} RETRY FAIL :: ${e2.message}`); return null; }
+      catch (e2) { console.error(`COUNCIL ${m.id} RETRY FAIL :: ${String(e2.message).slice(0, 200)}`); return null; }
     }
     return null;
   }
