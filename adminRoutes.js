@@ -356,13 +356,42 @@ router.get('/finance/export', requireAuth, requireOwner, async (req, res) => {
 
 // ================= AUDIT [OWNER] =================
 router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
-  const limit = 30;
-  let ref = db.collection('audit_logs').orderBy('at', 'desc').limit(limit);
-  if (req.query.cursor) ref = ref.startAfter(String(req.query.cursor));
-  const snap = await ref.get();
-  const logs = snap.docs.map(x => ({ id: x.id, ...x.data() }));
-  const last = snap.docs[snap.docs.length - 1];
-  res.json({ logs, nextCursor: last ? last.data().at : null });
+  try {
+    const limit = 100;
+    const { cursor, from, to } = req.query;
+    let ref = db.collection('audit_logs');
+    // 📅 filter rentang tanggal (server-side, field 'at' format ISO → aman string compare)
+    if (from) ref = ref.where('at', '>=', `${String(from)}T00:00:00Z`);
+    if (to) ref = ref.where('at', '<=', `${String(to)}T23:59:59Z`);
+    ref = ref.orderBy('at', 'desc').limit(limit);
+    if (cursor) ref = ref.startAfter(String(cursor));
+    const snap = await ref.get();
+    const logs = snap.docs.map(x => ({ id: x.id, ...x.data() }));
+    const last = snap.docs[snap.docs.length - 1];
+    res.json({ logs, nextCursor: last ? last.data().at : null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🗑 PURGE: hapus entri LEBIH TUA dari N hari (retensi, min 7 hari)
+router.post('/audit-logs/purge', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const days = parseInt(req.body.days) || 90;
+    if (days < 7) return res.status(400).json({ error: 'Demi keamanan, minimal retensi 7 hari.' });
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    let deleted = 0;
+    while (true) {
+      const snap = await db.collection('audit_logs').where('at', '<', cutoff).limit(400).get();
+      if (snap.empty) break;
+      const b = db.batch();
+      snap.docs.forEach(d => b.delete(d.ref));
+      await b.commit();
+      deleted += snap.size;
+      if (snap.size < 400) break;
+    }
+    await logAudit(req.admin.sub, 'PURGE_AUDIT', null, { days, deleted });
+    await notifyOps(`🗑 <b>Audit purge</b> oleh ${req.admin.sub}: ${deleted} entri > ${days} hari dihapus`, { safe: `🗑 Audit purge: ${deleted} entri lama` });
+    res.json({ status: 'OK', deleted });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ================= TEAM FEED & CHAT =================
