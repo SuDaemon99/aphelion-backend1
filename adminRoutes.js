@@ -47,14 +47,14 @@ const sendTG = async (chatId, text, options = {}) => {
   try {
     const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
     
-    // ===== 💾 TRACKING PESAN GRUP (PATCH BARU) =====
+    // ===== 💾 TRACKING PESAN GRUP =====
     if (String(chatId) === String(VIP_GROUP_ID) || String(chatId) === String(PUBLIC_GROUP_ID)) {
       const mid = r.data.result.message_id;
       db.collection('bot_messages').add({
         chatId: String(chatId),
         messageId: mid,
         at: new Date().toISOString()
-      }).catch(() => {}); // Biarkan berjalan di background
+      }).catch(() => {});
     }
     // ===============================================
 
@@ -155,7 +155,6 @@ router.get('/auth/me', requireAuth, async (req, res) => {
   res.json({ username: req.admin.sub, role: req.admin.role, avatar: d.exists ? (d.data().avatar || null) : null });
 });
 
-// 🎭 ganti avatar sendiri (sesuai set role)
 router.post('/auth/avatar', requireAuth, async (req, res) => {
   const avatar = String(req.body.avatar || '');
   const set = req.admin.role === 'owner' ? OWNER_AVATARS : ADMIN_AVATARS;
@@ -360,7 +359,6 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
     const limit = 100;
     const { cursor, from, to } = req.query;
     let ref = db.collection('audit_logs');
-    // 📅 filter rentang tanggal (server-side, field 'at' format ISO → aman string compare)
     if (from) ref = ref.where('at', '>=', `${String(from)}T00:00:00Z`);
     if (to) ref = ref.where('at', '<=', `${String(to)}T23:59:59Z`);
     ref = ref.orderBy('at', 'desc').limit(limit);
@@ -372,7 +370,6 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🗑 PURGE: hapus entri LEBIH TUA dari N hari (retensi, min 7 hari)
 router.post('/audit-logs/purge', requireAuth, requireOwner, async (req, res) => {
   try {
     const days = parseInt(req.body.days) || 90;
@@ -416,7 +413,6 @@ router.post('/feed/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// 💬 chat list + pinned terbaru
 router.get('/team/chat', requireAuth, async (req, res) => {
   const limit = 50;
   let ref = db.collection('team_chat').orderBy('at', 'desc').limit(limit);
@@ -430,7 +426,6 @@ router.get('/team/chat', requireAuth, async (req, res) => {
   res.json({ logs, nextCursor: last ? last.data().at : null, pinned });
 });
 
-// 💬 kirim chat (bawa avatar + replyTo)
 router.post('/team/chat', requireAuth, async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Text wajib' });
@@ -448,11 +443,9 @@ router.post('/team/chat', requireAuth, async (req, res) => {
       text: String(req.body.replyTo.text || '').slice(0, 80)
     };
   }
-    await db.collection('team_chat').add(doc);
+  await db.collection('team_chat').add(doc);
   
-  // 🔔 FCM: push chat baru ke semua HP admin (kecuali pengirim sendiri)
   const snap = await db.collection('fcm_tokens').get();
-  const myToken = req.body.fcmToken || ''; // opsional, biar gak push ke diri sendiri
   const tokens = snap.docs
     .filter(d => d.id !== req.admin.sub)
     .map(d => d.data().token)
@@ -465,7 +458,6 @@ router.post('/team/chat', requireAuth, async (req, res) => {
       });
     } catch (e) { console.error('Push chat gagal:', e.message); }
   }
-  
   res.json({ status: 'OK' });
 });
 
@@ -474,7 +466,6 @@ router.post('/team/chat/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// ✅ centang dibaca: map username → lastChatRead
 router.get('/team/reads', requireAuth, async (req, res) => {
   try {
     const accs = await db.collection('admin_accounts').get();
@@ -487,7 +478,6 @@ router.get('/team/reads', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🎯 reaksi toggle
 router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
   try {
     const emoji = String(req.body.emoji || '');
@@ -507,7 +497,6 @@ router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 📌 pin / unpin (owner)
 router.post('/team/chat/:id/pin', requireAuth, requireOwner, async (req, res) => {
   try {
     const ref = db.collection('team_chat').doc(req.params.id);
@@ -519,7 +508,6 @@ router.post('/team/chat/:id/pin', requireAuth, requireOwner, async (req, res) =>
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🗑 hapus (sendiri atau owner)
 router.post('/team/chat/:id/delete', requireAuth, async (req, res) => {
   try {
     const ref = db.collection('team_chat').doc(req.params.id);
@@ -602,7 +590,6 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
   const duration = String(req.body.duration || 'belum dipastikan');
   
-  // 1. Update DB + Audit (cepat)
   await db.collection('settings').doc('app').set({ 
     maintenance: enabled, 
     updatedAt: new Date().toISOString(), 
@@ -610,10 +597,8 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
 
-  // 🔥 FIX DELAY: Balas client DULU (instant 50ms), UI langsung update
   res.json({ status: 'OK', maintenance: enabled });
 
-  // 2. Background tasks (fire-and-forget, nggak nge-block client)
   setImmediate(async () => {
     try {
       const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
@@ -623,9 +608,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
         type: 'maint' 
       });
       await pushMaint(enabled, duration, req.admin.sub);
-    } catch (e) {
-      console.error('Background maintenance task failed:', e.message);
-    }
+    } catch (e) { console.error('Background maintenance task failed:', e.message); }
   });
 });
 
@@ -713,10 +696,7 @@ router.post('/admins/:username/reset-password', requireAuth, requireOwner, async
     if (t.data().role === 'owner') return res.status(403).json({ error: 'Owner mengganti password lewat menu Ganti Password' });
     const epoch = (t.data().epoch || 0) + 1;
     await db.collection('admin_accounts').doc(req.params.username).update({
-      passHash: await bcrypt.hash(newPassword, 10),
-      epoch,
-      failCount: 0,
-      lockedUntil: null
+      passHash: await bcrypt.hash(newPassword, 10), epoch, failCount: 0, lockedUntil: null
     });
     await logAudit(req.admin.sub, 'ADMIN_RESET_PASS', req.params.username);
     await notifyOps(`🔑 <b>Password direset</b>: ${req.params.username} oleh ${req.admin.sub} (sesi lama diputus)`, { safe: `🔑 Reset pass: ${req.params.username}`, critical: true });
@@ -762,7 +742,6 @@ router.post('/arcade/score', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// ================= ARCADE RAID (boss mingguan bersama) =================
 const weekKey = () => {
   const d = new Date();
   const jan1 = new Date(d.getFullYear(), 0, 1);
@@ -833,31 +812,23 @@ const pushAll = async (title, body, type) => {
   } catch (e) { console.error('Push gagal:', e.message); }
 };
 
-// push otomatis: maintenance & raid tumbang
 const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on ? 'ON' : 'OFF'} (${dur}) oleh ${by}`, 'maint');
 const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${by}! Squad 🏅`, 'critical');
+const pushAllAdmins = pushAll; // alias for arcade raid call
 
-// ================= CLEAN PESAN BOT [OWNER] (PATCH BARU) =================
+// ================= CLEAN PESAN BOT [OWNER] =================
 router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   const target = req.body.target === 'public' ? 'public' : 'vip';
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
-  if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Vercel.` });
+  if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset.` });
 
   try {
-    // 1) Tarik history ID pesan dari Firestore (Maks scan 1000)
-    const snap = await db.collection('bot_messages')
-      .where('chatId', '==', String(gid))
-      .limit(1000)
-      .get();
-
-    if (snap.empty) {
-      return res.json({ status: 'OK', deleted: 0, failed: 0, note: 'Data riwayat kosong.' });
-    }
+    const snap = await db.collection('bot_messages').where('chatId', '==', String(gid)).limit(1000).get();
+    if (snap.empty) return res.json({ status: 'OK', deleted: 0, failed: 0, note: 'Data kosong.' });
 
     const ids = snap.docs.map(d => d.data().messageId);
     const docRefs = snap.docs.map(d => d.ref);
 
-    // 2) Hapus massal di Telegram
     let deleted = 0, failed = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
@@ -865,7 +836,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
         await axios.post(`${TELEGRAM_API}/deleteMessages`, { chat_id: gid, message_ids: batch });
         deleted += batch.length;
       } catch (e) {
-        // Fallback: hapus satuan jika bulk gagal
         for (const mid of batch) {
           try { 
             await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); 
@@ -875,7 +845,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
       }
     }
 
-    // 3) Bersihkan dari Firestore (Chunk per 400 dokumen)
     for (let i = 0; i < docRefs.length; i += 400) {
       const batchDB = db.batch();
       docRefs.slice(i, i + 400).forEach(ref => batchDB.delete(ref));
@@ -884,95 +853,62 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
 
     await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted, failed });
     await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} dihapus${failed ? `, ${failed} gagal` : ''}`, { safe: `🧹 Clean ${target}: ${deleted} dihapus` });
-    
     res.json({ status: 'OK', deleted, failed });
-  } catch (e) {
-    console.error('CLEAN ERROR', e.message);
-    return res.status(500).json({ error: e.message });
-  }
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ================= CLEAR ALL CHAT [OWNER ONLY] =================
 router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
   try {
-    // 1) Hitung total pesan (untuk log)
     const countSnap = await db.collection('team_chat').count().get();
     const total = countSnap.data().count || 0;
-    
-    if (total === 0) {
-      return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
-    }
+    if (total === 0) return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
 
-    // 2) Hapus semua dokumen dalam chunks 400 (Firestore batch limit = 500)
     let deleted = 0;
-    const BATCH_SIZE = 400;
-    
     while (true) {
-      const snap = await db.collection('team_chat').limit(BATCH_SIZE).get();
+      const snap = await db.collection('team_chat').limit(400).get();
       if (snap.empty) break;
-      
       const batch = db.batch();
       snap.docs.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
       deleted += snap.size;
-      
-      if (snap.size < BATCH_SIZE) break;
+      if (snap.size < 400) break;
     }
 
-    // 3) Reset lastChatRead semua admin (biar "unread" bersih juga)
     const metaSnap = await db.collection('team_meta').get();
     if (!metaSnap.empty) {
       const resetBatch = db.batch();
-      metaSnap.docs.forEach(doc => {
-        resetBatch.update(doc.ref, { lastChatRead: '1970-01-01T00:00:00Z' });
-      });
+      metaSnap.docs.forEach(doc => resetBatch.update(doc.ref, { lastChatRead: '1970-01-01T00:00:00Z' }));
       await resetBatch.commit();
     }
 
     await logAudit(req.admin.sub, 'CLEAR_ALL_CHAT', null, { deleted });
-    await notifyOps(`🧹 <b>Chat Tim Dibersihkan</b> oleh ${req.admin.sub}: ${deleted} pesan dihapus permanen`, { 
-      safe: `🧹 Chat tim dibersihkan oleh ${req.admin.sub}`, 
-      type: 'critical' 
-    });
-
+    await notifyOps(`🧹 <b>Chat Tim Dibersihkan</b> oleh ${req.admin.sub}`, { safe: `🧹 Chat tim dibersihkan oleh ${req.admin.sub}`, type: 'critical' });
     res.json({ status: 'OK', deleted });
-  } catch (e) {
-    console.error('CLEAR CHAT ERROR:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= CLEAR FEED / AKTIVITAS [OWNER] =================
 router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
   try {
     const countSnap = await db.collection('ops_feed').count().get();
-    const total = countSnap.data().count || 0;
-    if (total === 0) return res.json({ status: 'OK', deleted: 0, note: 'Feed sudah kosong' });
+    if ((countSnap.data().count || 0) === 0) return res.json({ status: 'OK', deleted: 0, note: 'Feed kosong' });
 
-    // Hapus chunks 400 (aman dari Firestore batch limit 500)
     let deleted = 0;
-    const BATCH = 400;
     while (true) {
-      const snap = await db.collection('ops_feed').limit(BATCH).get();
+      const snap = await db.collection('ops_feed').limit(400).get();
       if (snap.empty) break;
       const batch = db.batch();
       snap.docs.forEach(d => batch.delete(d.ref));
       await batch.commit();
       deleted += snap.size;
-      if (snap.size < BATCH) break;
+      if (snap.size < 400) break;
     }
 
     await logAudit(req.admin.sub, 'CLEAR_FEED', null, { deleted });
-    // Tulis 1 entri baru biar layar nggak kosong & tim tau feed di-reset
-    await notifyOps(`🧹 <b>Riwayat Aktivitas dibersihkan</b> oleh ${req.admin.sub} (${deleted} entri dihapus)`, { safe: `🧹 Aktivitas dibersihkan oleh ${req.admin.sub}` });
+    await notifyOps(`🧹 <b>Riwayat Aktivitas dibersihkan</b> oleh ${req.admin.sub}`, { safe: `🧹 Aktivitas dibersihkan oleh ${req.admin.sub}` });
     res.json({ status: 'OK', deleted });
-  } catch (e) {
-    console.error('CLEAR FEED ERROR:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= 🤖 APHELION AI (DEEP DIVE + TOOLS) =================
 // ================= 🤖 APHELION AI (DEEP DIVE + DEWAN) =================
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 
@@ -989,15 +925,15 @@ const maskUser = (u) => ({
 });
 
 const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
-- Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
+- Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab.
 - Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
 - DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages).
-- Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook (bukan polling).
+- Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook.
 - Pembayaran: Midtrans Snap (halaman aphelion-pay) + webhook /api/payment-webhook → settlement = user ACTIVE + invite VIP.
-- Cron: scheduler eksternal memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
+- Cron: scheduler eksternal memanggil GET /api/cron/check-expired.
 - App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID.
 - Arcade: shooter internal admin (leaderboard + raid boss mingguan 100K HP).
-- Bisnis: langganan VIP (harga & planDays di settings), grup Telegram VIP + publik.`;
+- Bisnis: langganan VIP, grup Telegram VIP + publik.`;
 
 const aiSystemPrompt = (admin) => `Kamu APHELION AI, chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
 ATURAN:
@@ -1006,8 +942,7 @@ ATURAN:
 3. Data tidak ada → katakan jujur.
 4. Token/HWID/email lengkap/password/API key sudah di-mask sistem — jangan coba membukanya.
 5. Non-owner DILARANG menerima finance/audit (tools menolak otomatis).
-6. Pertanyaan umum di luar sistem → jawab bebas & helpful.
-7. Rekomendasi teknis WAJIB konsisten dengan MANUAL stack.
+6. Rekomendasi teknis WAJIB konsisten dengan MANUAL stack.
 ` + AI_MANUAL;
 
 const AI_TOOLS = [
@@ -1131,8 +1066,6 @@ const callGroq = async (messages, preferModel) => {
   throw lastErr;
 };
 
-const slim = (s, n) => String(s || '').slice(0, n);
-
 const callLLM = async (provider, model, messages, opts = {}) => {
   const URLS = {
     groq: 'https://api.groq.com/openai/v1/chat/completions',
@@ -1149,39 +1082,47 @@ const callLLM = async (provider, model, messages, opts = {}) => {
     timeout: opts.timeout || 5000
   });
   const msg = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message;
-  const content = (msg && (msg.content || msg.reasoning)) || '';
-  if (!content) console.error(`LLM EMPTY [${provider}/${model}] raw=${JSON.stringify(r.data).slice(0, 300)}`);
-  return content;
+  return (msg && (msg.content || msg.reasoning)) || '';
 };
 
 const callLLMSafe = async (m, messages, opts = {}) => {
-  try {
-    return await callLLM(m.provider, m.model, messages, opts);
-  } catch (e) {
-    const st = e.response && e.response.status;
-    const code = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
-    console.error(`COUNCIL ${m.id} FAIL [${m.provider}/${m.model}] status=${st} code=${code} :: ${String(e.message).slice(0, 200)}`);
+  try { return await callLLM(m.provider, m.model, messages, opts); } 
+  catch (e) {
+    const st = e.response?.status;
+    const code = e.response?.data?.error?.code;
+    console.error(`COUNCIL ${m.id} FAIL [${m.provider}/${m.model}] :: ${String(e.message).slice(0, 100)}`);
     if (st === 429 || code === 'rate_limit_exceeded') {
       await new Promise(r => setTimeout(r, 1200));
-      try { return await callLLM(m.provider, m.model, messages, opts); }
-      catch (e2) { console.error(`COUNCIL ${m.id} RETRY FAIL :: ${String(e2.message).slice(0, 200)}`); return null; }
+      try { return await callLLM(m.provider, m.model, messages, opts); } catch (e2) { return null; }
     }
     return null;
   }
 };
 
 const COUNCIL = [
-  { id: 'eng', label: '🧑‍💻 TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: fokus webhook, cron, HWID, arsitektur, keamanan teknis.' },
-  { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: fokus angka, tren, forensik transaksi, churn, akuisisi.' },
-  { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: cari inkonsistensi, celah logika, asumsi tanpa bukti.' },
-    { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-chat-v3-0324:free', persona: 'Deep Reasoner: rantai sebab-akibat, korelasi temporal, root-cause.' }
+  { id: 'eng', label: '🧑‍💻 TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: log webhook, cron, HWID, keamanan serverless.' },
+  { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: angka omzet, retensi user, anomali transaksi.' },
+  { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: mendeteksi pelanggaran SOP, celah akses, log admin.' },
+  { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-chat-v3-0324:free', persona: 'Deep Reasoner: menyambung titik sebab-akibat antar data.' }
 ];
+
 const JUDGE_CHAIN = [
   { provider: 'gemini', model: 'gemini-2.5-pro' },
   { provider: 'gemini', model: 'gemini-2.5-flash' },
   { provider: 'groq', model: 'openai/gpt-oss-120b' }
 ];
+
 const councilCooldown = {};
+
+// Helper eksekusi berurutan untuk mencegah Rate Limit API bertabrakan
+const runWithDelay = async (tasks, delay = 300) => {
+  const results = [];
+  for (let i = 0; i < tasks.length; i++) {
+    results.push(await tasks[i]());
+    if (i < tasks.length - 1) await new Promise(r => setTimeout(r, delay));
+  }
+  return results;
+};
 
 const buildDeepSnapshot = async (role) => {
   const [health, users, chat, arcade] = await Promise.all([
@@ -1199,34 +1140,45 @@ const buildDeepSnapshot = async (role) => {
   return snap;
 };
 
+// ================= LOGIKA DEWAN YANG SUDAH DI-UPGRADE =================
 const councilRounds = async (q, snapStr) => {
-  const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nSNAPSHOT LIVE:\n${snapStr}\nATURAN: maks 220 kata, WAJIB kutip evidence dari snapshot, akhiri dengan "CONFIDENCE: <0-100>".`;
+  const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nATURAN MUTLAK:\n1. Jadilah SANGAT SKEPTIS. Jangan mudah setuju.\n2. Fokus HANYA pada metrik/data yang relevan dengan spesialisasimu.\n3. WAJIB kutip angka/fakta spesifik dari SNAPSHOT di bawah.\n4. Akhiri dengan "CONFIDENCE: <0-100>".\n\nSNAPSHOT LIVE:\n${snapStr}`;
 
-  // ROUND 1
-  const r1 = await Promise.all(COUNCIL.map(m =>
-      console.log('COUNCIL R1 =>', r1.map(x => `${x.id}:${x.opini ? x.opini.length + 'ch' : 'DEAD'}`).join(' | '));
-    callLLMSafe(m, [
+  // ROUND 1: Independen
+  const tasksR1 = COUNCIL.map(m => async () => {
+    return callLLMSafe(m, [
       { role: 'system', content: baseFor(m) },
       { role: 'user', content: q }
-    ], { timeout: 4000, max_tokens: 450 }).then(t => ({ ...m, opini: t }))
-  ));
+    ], { timeout: 8000, max_tokens: 450 }).then(t => ({ ...m, opini: t }));
+  });
+  
+  const r1 = await runWithDelay(tasksR1, 300);
   const alive = r1.filter(x => x.opini);
-  if (alive.length < 2) return null;   // 👈 nggak kuorum → route yang ambil alih
+  if (alive.length < 2) return null;
 
-  // ROUND 2 (DISKUSI)
-  const others = alive.map(x => `${x.label}: ${x.opini}`).join('\n---\n');
-  const r2 = await Promise.all(alive.map(m =>
-    callLLMSafe(m, [
-      { role: 'system', content: baseFor(m) + '\nROUND 2 (DISKUSI): Baca opini rekan di bawah. KRITIK yang tidak didukung data, PERKUAT yang valid, dan REVISI posisimu bila perlu. Maks 200 kata.' },
+  // ROUND 2: Diskusi/Debat Berdarah
+  const others = alive.map(x => `[OPINI ${x.label}]:\n${x.opini}`).join('\n\n');
+  const tasksR2 = alive.map(m => async () => {
+    const debatePrompt = `ROUND 2 (DEBAT & REVISI CROSS-EXAMINATION).
+Tugasmu:
+1. BACA opini rekan-rekanmu di bawah ini.
+2. CARI KESALAHAN LOGIKA, asumsi sesat, atau data snapshot yang mereka abaikan.
+3. Jika opinimu di Round 1 ternyata salah/kurang tepat, REVISI posisimu berdasar data mereka.
+4. Jika opinimu yang benar, SERANG balik argumen mereka menggunakan fakta dari snapshot.
+Format jawaban: [KRITIK UNTUK REKAN] lalu [POSISI FINALKU]. Maks 250 kata.`;
+
+    return callLLMSafe(m, [
+      { role: 'system', content: baseFor(m) + '\n\n' + debatePrompt },
       { role: 'user', content: q },
       { role: 'assistant', content: m.opini },
-      { role: 'user', content: 'OPINI REKAN KAMU:\n' + others }
-    ], { timeout: 4000, max_tokens: 450 }).then(t => ({ ...m, final: t || m.opini }))
-  ));
-  return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DISKUSI:\n${x.final}`).join('\n=====\n');
+      { role: 'user', content: 'OPINI REKAN DEWAN LAINNYA UNTUK KAMU KRITIK:\n' + others }
+    ], { timeout: 8000, max_tokens: 450 }).then(t => ({ ...m, final: t || m.opini }));
+  });
+
+  const r2 = await runWithDelay(tasksR2, 300);
+  return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DEBAT:\n${x.final}`).join('\n=====\n');
 };
 
-// ===== ROUTE /ai/ask (3 MODE: FAST / DEEP / COUNCIL) =====
 router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   try {
     const q = String(req.body.q || '').trim();
@@ -1234,7 +1186,7 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
     if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
 
-        if (mode === 'council') {
+    if (mode === 'council') {
       const now = Date.now();
       const last = councilCooldown[req.admin.sub] || 0;
       if (now - last < 20000) return res.status(429).json({ error: `🏛️ Dewan istirahat dulu. Tunggu ${Math.ceil((20000 - (now - last)) / 1000)} dtk lagi.` });
@@ -1244,7 +1196,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
       const snapStr = JSON.stringify(snapshot);
       const debate = await councilRounds(q, snapStr);
 
-      // 🛟 DEGRADASI MULUS: dewan nggak kuorum → jawab solo mode Deep (user tetep dapet jawaban!)
       if (!debate) {
         const messages = [
           { role: 'system', content: aiSystemPrompt(req.admin) + '\n(Catatan: dewan tidak kuorum — jawab solo secara mendalam.)' },
@@ -1267,13 +1218,14 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
           solo = msg.content || solo;
           break;
         }
-        return res.json({ answer: '🛟 *(Dewan nggak kuorum — jawaban solo mode Deep)*\n\n' + solo });
+        return res.json({ answer: '🛟 *(Dewan gagal kuorum — beralih ke analisis Solo-Deep)*\n\n' + solo });
       }
 
       const ref = await db.collection('ai_council').add({ q, debate, snap: snapStr, at: new Date().toISOString() });
       return res.json({ councilId: ref.id });
     }
 
+    // FAST / DEEP Mode...
     const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
     const history = histDoc.exists ? (histDoc.data().history || []) : [];
 
@@ -1304,18 +1256,16 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
       break;
     }
 
-    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: slim(answer, 800) }].slice(-4);
+    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: (answer || '').slice(0, 800) }].slice(-4);
     await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
     res.json({ answer });
   } catch (e) {
-    const gcode = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
+    const gcode = e.response?.data?.error?.code;
     if (gcode === 'rate_limit_exceeded') return res.status(429).json({ error: '⏳ AI lagi antre. Coba 15 detik lagi ya.' });
-    console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
-    res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
+    res.status(500).json({ error: 'AI error: ' + (e.response?.data?.error?.message || e.message) });
   }
 });
 
-// ===== ROUTE /ai/verdict (Ketua Sidang menyimpulkan) =====
 router.post('/ai/verdict', requireAuth, async (req, res) => {
   try {
     const id = String(req.body.id || '');
@@ -1323,18 +1273,27 @@ router.post('/ai/verdict', requireAuth, async (req, res) => {
     if (!d.exists) return res.status(404).json({ error: 'Sidang tidak ditemukan.' });
     const { q, debate, snap } = d.data();
 
-    const judgeSys = `Kamu KETUA SIDANG, profesor senior paling berpengalaman. Tugasmu:
-1. VERIFIKASI setiap klaim analis ke SNAPSHOT (buang halusinasi).
-2. REKONSILIASI konflik antar analis.
-3. Tulis jawaban final level profesor + rekomendasi konkret.
-FORMAT WAJIB:
-## ✅ JAWABAN FINAL
-<jawaban komprehensif>
+    // HAKIM MENGGUNAKAN CHAIN OF THOUGHT (Diinstruksikan berpikir sebelum output)
+    const judgeSys = `Kamu KETUA SIDANG, profesor senior paling berpengalaman. Tugasmu merangkum debat 4 spesialis menjadi 1 kesimpulan final yang sangat akurat.
+
+PROSES KERJAMU WAJIB SEPERTI INI:
+1. Gunakan tag <thinking> untuk menganalisis isi debat agen. Siapa agen yang datanya paling valid berdasarkan snapshot? Siapa yang berhalusinasi?
+2. Setelah merenung, tutup dengan </thinking> dan keluarkan format final secara persis.
+
+FORMAT FINAL WAJIB (keluarkan setelah thinking):
+## ✅ KESIMPULAN & SOLUSI
+<Jawaban final yang komprehensif, langsung ke akar masalah, dan beri solusi konkret yang bisa dieksekusi>
+
 TINGKAT KEPERCAYAAN: <0-100>%
-## 📜 CATATAN SIDANG
-<per analis: poin utama + status DITERIMA/DITOLAK + alasan singkat>
-## ⚖️ KONFLIK TERSELESAIKAN
-<daftar konflik & pemenangnya, atau "Tidak ada">
+
+## 📜 ANALISIS SIDANG
+- <Nama Agen 1>: <Poin dia - DITERIMA/DITOLAK - Alasan>
+- <Nama Agen 2>: <Poin dia - DITERIMA/DITOLAK - Alasan>
+- ...
+
+## ⚖️ RESOLUSI KONFLIK
+<Jelaskan argumen mana yang menang dalam debat tersebut dan mengapa>
+
 ${AI_MANUAL}`;
 
     let finalText = null;
@@ -1342,11 +1301,17 @@ ${AI_MANUAL}`;
       try {
         finalText = await callLLM(j.provider, j.model, [
           { role: 'system', content: judgeSys + '\nSNAPSHOT:\n' + snap },
-          { role: 'user', content: `PERTANYAAN:\n${q}\n\nTRANSKRIP SIDANG (Round 1+2):\n${debate}` }
-        ], { timeout: 8000, max_tokens: 1200 });
-        if (finalText) break;
-      } catch (e) { /* coba hakim berikutnya */ }
+          { role: 'user', content: `PERTANYAAN:\n${q}\n\nTRANSKRIP SIDANG DEBAT (Round 1 & 2):\n${debate}` }
+        ], { timeout: 12000, max_tokens: 1500 });
+        
+        // Buang bagian <thinking> agar tidak muncul di layar user (jika model membocorkannya)
+        if (finalText) {
+            finalText = finalText.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').trim();
+            break;
+        }
+      } catch (e) { /* Lanjut ke model hakim cadangan */ }
     }
+    
     await db.collection('ai_council').doc(id).delete().catch(() => {});
     if (!finalText) return res.status(500).json({ error: '⚖️ Semua hakim sedang antre. Coba lagi ±15 dtk.' });
     res.json({ answer: finalText });
@@ -1354,4 +1319,5 @@ ${AI_MANUAL}`;
     res.status(500).json({ error: e.message });
   }
 });
+
 module.exports = router;
