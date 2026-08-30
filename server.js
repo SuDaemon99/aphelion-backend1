@@ -61,6 +61,18 @@ const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '
 const sendTelegramMessage = async (chatId, text, options = {}) => {
   try {
     const response = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
+    
+    // ===== 💾 TRACKING PESAN GRUP (PATCH BARU) =====
+    if (String(chatId) === String(VIP_GROUP_ID) || String(chatId) === String(PUBLIC_GROUP_ID)) {
+      const mid = response.data.result.message_id;
+      db.collection('bot_messages').add({
+        chatId: String(chatId),
+        messageId: mid,
+        at: new Date().toISOString()
+      }).catch(() => {}); // Biarkan di background agar tidak memperlambat bot
+    }
+    // ===============================================
+
     return response.data;
   } catch (error) {
     if (options.parse_mode) {
@@ -271,7 +283,7 @@ app.post('/api/payment-webhook', async (req, res) => {
           if (chatInfo.exists) username = chatInfo.data().username || null;
         } catch (e) { /* abaikan */ }
 
-                const existingUser = await db.collection('users').doc(uid).get();
+        const existingUser = await db.collection('users').doc(uid).get();
         const isNewUser = !existingUser.exists;
         
         await db.collection('users').doc(uid).set({
