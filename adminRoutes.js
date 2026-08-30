@@ -1214,17 +1214,43 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
     if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
 
-    if (mode === 'council') {
+        if (mode === 'council') {
       const now = Date.now();
       const last = councilCooldown[req.admin.sub] || 0;
       if (now - last < 20000) return res.status(429).json({ error: `🏛️ Dewan istirahat dulu. Tunggu ${Math.ceil((20000 - (now - last)) / 1000)} dtk lagi.` });
       councilCooldown[req.admin.sub] = now;
 
       const snapshot = await buildDeepSnapshot(req.admin.role);
-      const debate = await councilRounds(q, JSON.stringify(snapshot));
-      const ref = await db.collection('ai_council').add({
-        q, debate, snap: JSON.stringify(snapshot), at: new Date().toISOString()
-      });
+      const snapStr = JSON.stringify(snapshot);
+      const debate = await councilRounds(q, snapStr);
+
+      // 🛟 DEGRADASI MULUS: dewan nggak kuorum → jawab solo mode Deep (user tetep dapet jawaban!)
+      if (!debate) {
+        const messages = [
+          { role: 'system', content: aiSystemPrompt(req.admin) + '\n(Catatan: dewan tidak kuorum — jawab solo secara mendalam.)' },
+          { role: 'user', content: q }
+        ];
+        let solo = '(tanpa jawaban)';
+        for (let round = 0; round < 3; round++) {
+          const data = await callGroq(messages, 'openai/gpt-oss-120b');
+          const msg = data.choices[0].message;
+          if (msg.tool_calls && msg.tool_calls.length) {
+            messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
+            for (const tc of msg.tool_calls.slice(0, 3)) {
+              let out;
+              try { out = await execTool(tc.function.name, JSON.parse(tc.function.arguments || '{}'), req.admin.role); }
+              catch (e) { out = { error: e.message }; }
+              messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
+            }
+            continue;
+          }
+          solo = msg.content || solo;
+          break;
+        }
+        return res.json({ answer: '🛟 *(Dewan nggak kuorum — jawaban solo mode Deep)*\n\n' + solo });
+      }
+
+      const ref = await db.collection('ai_council').add({ q, debate, snap: snapStr, at: new Date().toISOString() });
       return res.json({ councilId: ref.id });
     }
 
