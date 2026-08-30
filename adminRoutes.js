@@ -1174,7 +1174,7 @@ const COUNCIL = [
   { id: 'eng', label: '🧑‍💻 TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: fokus webhook, cron, HWID, arsitektur, keamanan teknis.' },
   { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: fokus angka, tren, forensik transaksi, churn, akuisisi.' },
   { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: cari inkonsistensi, celah logika, asumsi tanpa bukti.' },
-  { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1-0528:free', persona: 'Deep Reasoner: rantai sebab-akibat, korelasi temporal, root-cause.' }
+    { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-chat-v3-0324:free', persona: 'Deep Reasoner: rantai sebab-akibat, korelasi temporal, root-cause.' }
 ];
 const JUDGE_CHAIN = [
   { provider: 'gemini', model: 'gemini-2.5-pro' },
@@ -1204,6 +1204,7 @@ const councilRounds = async (q, snapStr) => {
 
   // ROUND 1
   const r1 = await Promise.all(COUNCIL.map(m =>
+      console.log('COUNCIL R1 =>', r1.map(x => `${x.id}:${x.opini ? x.opini.length + 'ch' : 'DEAD'}`).join(' | '));
     callLLMSafe(m, [
       { role: 'system', content: baseFor(m) },
       { role: 'user', content: q }
