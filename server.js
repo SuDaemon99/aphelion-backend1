@@ -52,6 +52,7 @@ const verifyLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
+const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || '-1003951848425';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
