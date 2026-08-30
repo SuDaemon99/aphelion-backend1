@@ -566,6 +566,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
   await broadcastAll(msg);
   await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' });
+  await pushAllAdmins('🛠 Maintenance', `Maintenance ${enabled ? 'ON' : 'OFF'} (${duration}) oleh ${req.admin.sub}`, 'maint');
   res.json({ status: 'OK', maintenance: enabled });
 });
 
