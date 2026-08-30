@@ -863,4 +863,54 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
+// ================= CLEAR ALL CHAT [OWNER ONLY] =================
+router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
+  try {
+    // 1) Hitung total pesan (untuk log)
+    const countSnap = await db.collection('team_chat').count().get();
+    const total = countSnap.data().count || 0;
+    
+    if (total === 0) {
+      return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
+    }
+
+    // 2) Hapus semua dokumen dalam chunks 400 (Firestore batch limit = 500)
+    let deleted = 0;
+    const BATCH_SIZE = 400;
+    
+    while (true) {
+      const snap = await db.collection('team_chat').limit(BATCH_SIZE).get();
+      if (snap.empty) break;
+      
+      const batch = db.batch();
+      snap.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      deleted += snap.size;
+      
+      if (snap.size < BATCH_SIZE) break;
+    }
+
+    // 3) Reset lastChatRead semua admin (biar "unread" bersih juga)
+    const metaSnap = await db.collection('team_meta').get();
+    if (!metaSnap.empty) {
+      const resetBatch = db.batch();
+      metaSnap.docs.forEach(doc => {
+        resetBatch.update(doc.ref, { lastChatRead: '1970-01-01T00:00:00Z' });
+      });
+      await resetBatch.commit();
+    }
+
+    await logAudit(req.admin.sub, 'CLEAR_ALL_CHAT', null, { deleted });
+    await notifyOps(`🧹 <b>Chat Tim Dibersihkan</b> oleh ${req.admin.sub}: ${deleted} pesan dihapus permanen`, { 
+      safe: `🧹 Chat tim dibersihkan oleh ${req.admin.sub}`, 
+      type: 'critical' 
+    });
+
+    res.json({ status: 'OK', deleted });
+  } catch (e) {
+    console.error('CLEAR CHAT ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
