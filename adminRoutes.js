@@ -972,56 +972,141 @@ router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
-// ================= 🤖 APHELION AI =================
+// ================= 🤖 APHELION AI (DEEP DIVE + TOOLS) =================
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
-const AI_MAX = 50; // kuota/user/hari
+const AI_MAX = 50;
 
-const aiSystemPrompt = (admin) => `Kamu adalah APHELION AI, chief-of-staff digital untuk ekosistem bisnis "Aphelion" (langganan VIP via bot Telegram + pembayaran Midtrans + app Android mod ber-HWID + panel admin).
-Kamu sedang berbicara dengan ${admin.sub} (role: ${admin.role}).
-ATURAN WAJIB:
-1. Jawab dalam Bahasa Indonesia santai-profesional.
-2. Untuk pertanyaan tentang sistem/bisnis, JAWAB HANYA berdasar SNAPSHOT LIVE di bawah. Kalau data tidak ada, katakan "data tidak tersedia di snapshot".
-3. Jangan pernah menyebut token, password, API key, atau rahasia apapun.
-4. Jika role pengguna BUKAN owner dan ia bertanya finance/audit, tolak dengan sopan.
-5. Untuk pertanyaan umum di luar sistem (ide, copywriting, terjemahan, pengetahuan), jawab bebas dan helpful.
-6. Ringkas, terstruktur, beri SOLUSI konkret bila ada masalah.`;
+const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
 
-const buildSnapshot = async (role) => {
-  const out = {};
-  const setDoc = await db.collection('settings').doc('app').get();
-  const s = setDoc.exists ? setDoc.data() : {};
-  out.settings = {
-    maintenance: s.maintenance === true, price: s.price || null, planDays: s.planDays || null,
-    lastCronRun: s.lastCronRun || null, lastTelegramPing: s.lastTelegramPing || null, lastPaymentPing: s.lastPaymentPing || null
-  };
-  const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
-  const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
-  const plus3 = new Date(Date.now() + 3 * 86400000);
-  const expSnap = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', plus3).orderBy('expiredAt', 'asc').limit(10).get();
-  out.users = {
-    active, expired, banned,
-    expiringSoon: expSnap.docs.map(d => ({ uid: d.id, username: d.data().username || null, expiredAt: d.data().expiredAt && d.data().expiredAt.toDate ? d.data().expiredAt.toDate().toISOString() : null }))
-  };
-  if (role === 'owner') {
-    const dk = new Date().toISOString().slice(0, 10);
-    const f = await db.collection('finance_daily').doc(dk).get();
-    const t = await db.collection('finance_total').doc('all').get();
-    const tx = await db.collection('transactions').orderBy('paidAt', 'desc').limit(5).get();
-    const au = await db.collection('audit_logs').orderBy('at', 'desc').limit(10).get();
-    out.finance = {
-      today: f.exists ? { gross: f.data().gross || 0, count: f.data().count || 0 } : { gross: 0, count: 0 },
-      total: t.exists ? { gross: t.data().gross || 0, count: t.data().count || 0 } : { gross: 0, count: 0 },
-      lastTx: tx.docs.map(d => ({ orderId: d.data().orderId, uid: d.data().uid, amount: d.data().amount, channel: d.data().channel, paidAt: d.data().paidAt }))
-    };
-    out.auditRecent = au.docs.map(d => ({ admin: d.data().admin, action: d.data().action, target: d.data().target, at: d.data().at }));
+// 🚧 GARIS MERAH: serializer mask — AI TIDAK PERNAH melihat kunci
+const maskUser = (u) => ({
+  uid: u.uid || u.id || null,
+  username: u.username || null,
+  email: u.email ? (String(u.email).split('@')[0].slice(0, 2) + '***@' + (String(u.email).split('@')[1] || '')) : null,
+  status: u.status || null,
+  expiredAt: iso(u.expiredAt),
+  createdAt: u.createdAt || null,
+  hwidBound: !!u.deviceId
+});
+
+const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
+- Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
+- Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
+- DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages).
+- Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook (bukan polling).
+- Pembayaran: Midtrans Snap (halaman aphelion-pay) + webhook /api/payment-webhook → settlement = user ACTIVE + invite VIP.
+- Cron: scheduler eksternal memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
+- App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID.
+- Arcade: shooter internal admin (leaderboard + raid boss mingguan 100K HP).
+- Bisnis: langganan VIP (harga & planDays di settings), grup Telegram VIP + publik.`;
+
+const aiSystemPrompt = (admin) => `Kamu APHELION AI, chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
+ATURAN:
+1. Bahasa Indonesia santai-profesional, ringkas, terstruktur, beri SOLUSI konkret.
+2. Gunakan TOOLS untuk mendalami data sebelum menjawab soal sistem. Jangan menebak.
+3. Data tidak ada → katakan jujur.
+4. Token/HWID/email lengkap/password/API key sudah di-mask sistem — jangan coba membukanya.
+5. Non-owner DILARANG menerima finance/audit (tools menolak otomatis).
+6. Pertanyaan umum di luar sistem → jawab bebas & helpful.
+7. Rekomendasi teknis WAJIB konsisten dengan MANUAL stack.
+` + AI_MANUAL;
+
+// ---------- TOOLS ----------
+const AI_TOOLS = [
+  { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem: maintenance, ping Telegram/payment, cron, harga, planDays.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'search_user', description: 'Cari user by UID/username (data ter-mask).', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } },
+  { type: 'function', function: { name: 'user_timeline', description: 'Profil ter-mask + riwayat transaksi satu user.', parameters: { type: 'object', properties: { uid: { type: 'string' } }, required: ['uid'] } } },
+  { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet per hari N hari terakhir + total keseluruhan.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'transactions_last', description: '[OWNER] N transaksi terakhir (max 20).', parameters: { type: 'object', properties: { limit: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'audit_search', description: '[OWNER] Cari audit log by admin/aksi/rentang hari.', parameters: { type: 'object', properties: { admin: { type: 'string' }, action: { type: 'string' }, days: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim (digest).', parameters: { type: 'object', properties: { n: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'templates_list', description: 'Semua template pesan bot (review/rewrite).', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'arcade_status', description: 'Raid boss mingguan + top 5 leaderboard.', parameters: { type: 'object', properties: {} } } }
+];
+
+const execTool = async (name, args, role) => {
+  const deny = { error: 'AKSES DITOLAK: data ini khusus owner.' };
+  switch (name) {
+    case 'system_health': {
+      const d = (await db.collection('settings').doc('app').get());
+      const s = d.exists ? d.data() : {};
+      return { maintenance: s.maintenance === true, price: s.price || null, planDays: s.planDays || null, lastCronRun: s.lastCronRun || null, lastTelegramPing: s.lastTelegramPing || null, lastPaymentPing: s.lastPaymentPing || null };
+    }
+    case 'users_overview': {
+      const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
+      const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
+      const newWeek = (await db.collection('users').where('createdAt', '>=', new Date(Date.now() - 7 * 86400000).toISOString()).count().get()).data().count;
+      const exp = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', new Date(Date.now() + 3 * 86400000)).orderBy('expiredAt', 'asc').limit(10).get();
+      return { active, expired, banned, newLast7Days: newWeek, expiringIn3Days: exp.docs.map(x => ({ uid: x.id, username: x.data().username || null, expiredAt: iso(x.data().expiredAt) })) };
+    }
+    case 'search_user': {
+      const qq = String(args.q || '').trim().toLowerCase();
+      if (!qq) return { error: 'param q wajib' };
+      if (/^\d{5,15}$/.test(qq)) {
+        const d = await db.collection('users').doc(qq).get();
+        if (d.exists) return maskUser({ id: d.id, ...d.data() });
+      }
+      const s = await db.collection('users').where('username', '==', qq).limit(1).get();
+      return s.empty ? { error: 'User tidak ditemukan' } : maskUser({ id: s.docs[0].id, ...s.docs[0].data() });
+    }
+    case 'user_timeline': {
+      const uid = String(args.uid || '');
+      const d = await db.collection('users').doc(uid).get();
+      if (!d.exists) return { error: 'User tidak ditemukan' };
+      const tx = await db.collection('transactions').where('uid', '==', uid).orderBy('paidAt', 'desc').limit(10).get();
+      return { user: maskUser({ id: d.id, ...d.data() }), transactions: tx.docs.map(x => ({ orderId: x.data().orderId, amount: x.data().amount, channel: x.data().channel, status: x.data().status, paidAt: x.data().paidAt })) };
+    }
+    case 'finance_range': {
+      if (role !== 'owner') return deny;
+      const days = Math.min(parseInt(args.days) || 7, 30);
+      const daily = [];
+      for (let i = 0; i < days; i++) {
+        const dk = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+        const f = await db.collection('finance_daily').doc(dk).get();
+        daily.push({ date: dk, gross: f.exists ? (f.data().gross || 0) : 0, count: f.exists ? (f.data().count || 0) : 0 });
+      }
+      const t = await db.collection('finance_total').doc('all').get();
+      return { daily, total: t.exists ? { gross: t.data().gross || 0, count: t.data().count || 0 } : { gross: 0, count: 0 } };
+    }
+    case 'transactions_last': {
+      if (role !== 'owner') return deny;
+      const lim = Math.min(parseInt(args.limit) || 10, 20);
+      const s = await db.collection('transactions').orderBy('paidAt', 'desc').limit(lim).get();
+      return s.docs.map(x => ({ orderId: x.data().orderId, uid: x.data().uid, amount: x.data().amount, channel: x.data().channel, status: x.data().status, paidAt: x.data().paidAt }));
+    }
+    case 'audit_search': {
+      if (role !== 'owner') return deny;
+      const days = Math.min(parseInt(args.days) || 7, 90);
+      let ref = db.collection('audit_logs').where('at', '>=', new Date(Date.now() - days * 86400000).toISOString());
+      if (args.admin) ref = ref.where('admin', '==', String(args.admin));
+      if (args.action) ref = ref.where('action', '==', String(args.action));
+      const s = await ref.orderBy('at', 'desc').limit(30).get();
+      return s.docs.map(x => ({ admin: x.data().admin, action: x.data().action, target: x.data().target, at: x.data().at }));
+    }
+    case 'team_chat_last': {
+      const n = Math.min(parseInt(args.n) || 15, 30);
+      const s = await db.collection('team_chat').orderBy('at', 'desc').limit(n).get();
+      return s.docs.map(x => `${x.data().sender}: ${x.data().deleted ? '(dihapus)' : x.data().text}`);
+    }
+    case 'templates_list': {
+      const snap = await db.collection('templates').get();
+      const custom = {};
+      snap.docs.forEach(d => { custom[d.id] = d.data().text; });
+      return Object.keys(DEFAULT_TPL).map(k => ({ key: k, custom: !!custom[k], text: custom[k] || DEFAULT_TPL[k] }));
+    }
+    case 'arcade_status': {
+      const wk = weekKey();
+      const r = await db.collection('arcade_raid').doc(wk).get();
+      const lb = await db.collection('arcade_scores').where('at', '>=', new Date(Date.now() - 7 * 86400000).toISOString()).orderBy('at', 'desc').limit(200).get();
+      const best = {};
+      lb.docs.forEach(d => { const s = d.data(); if (!best[s.username] || s.score > best[s.username].score) best[s.username] = s.score; });
+      const top = Object.entries(best).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([u, sc]) => ({ username: u, score: sc }));
+      return { week: wk, raid: r.exists ? { hpMax: r.data().hpMax, hpLeft: r.data().hpLeft, killedBy: r.data().killedBy } : null, top5: top };
+    }
+    default:
+      return { error: 'Tool tidak dikenal: ' + name };
   }
-  const feed = await db.collection('ops_feed').orderBy('at', 'desc').limit(10).get();
-  out.opsRecent = feed.docs.map(d => d.data().safe || d.data().full);
-  const chat = await db.collection('team_chat').orderBy('at', 'desc').limit(10).get();
-  out.teamChatRecent = chat.docs.map(d => `${d.data().sender}: ${d.data().text}`);
-  const accs = await db.collection('admin_accounts').get();
-  out.admins = accs.docs.map(d => ({ username: d.data().username, role: d.data().role, active: d.data().active, lastLoginAt: d.data().lastLoginAt }));
-  return out;
 };
 
 router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
@@ -1038,27 +1123,45 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (used >= AI_MAX) return res.status(429).json({ error: 'Kuota harian habis (50/hari). Reset besok.' });
     await qRef.set({ count: used + 1, date: dk }, { merge: true });
 
-    const snapshot = await buildSnapshot(req.admin.role);
     const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
     const history = histDoc.exists ? (histDoc.data().history || []) : [];
 
     const messages = [
-      { role: 'system', content: aiSystemPrompt(req.admin) + '\n\nSNAPSHOT LIVE SISTEM:\n' + JSON.stringify(snapshot) },
+      { role: 'system', content: aiSystemPrompt(req.admin) },
       ...history,
       { role: 'user', content: q }
     ];
 
-    const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-      model: process.env.AI_MODEL || 'qwen/qwen3-32b',
-      messages,
-      temperature: 0.4,
-      max_tokens: 1024
-    }, {
-      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 8000
-    });
+    let answer = '(tanpa jawaban)';
+    for (let round = 0; round < 3; round++) {
+      const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+        model: process.env.AI_MODEL || 'qwen/qwen3.8-27b',
+        messages,
+        tools: AI_TOOLS,
+        tool_choice: 'auto',
+        temperature: 0.4,
+        max_tokens: 1024
+      }, {
+        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 6000
+      });
 
-    const answer = (r.data.choices && r.data.choices[0] && r.data.choices[0].message.content) || '(tanpa jawaban)';
+      const msg = r.data.choices[0].message;
+      if (msg.tool_calls && msg.tool_calls.length) {
+        messages.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
+        for (const tc of msg.tool_calls.slice(0, 3)) {
+          let out;
+          try {
+            const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+            out = await execTool(tc.function.name, args, req.admin.role);
+          } catch (e) { out = { error: e.message }; }
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(out) });
+        }
+        continue;
+      }
+      answer = msg.content || answer;
+      break;
+    }
 
     const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: answer }].slice(-6);
     await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
