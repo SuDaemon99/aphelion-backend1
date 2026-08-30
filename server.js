@@ -27,7 +27,7 @@ if (getApps().length === 0) {
 
 const db = getFirestore();
 const app = express();
-app.set('trust proxy', true); 
+app.set('trust proxy', 1);
 
 let messaging = null;
 try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
