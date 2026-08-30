@@ -270,10 +270,24 @@ app.post('/api/payment-webhook', async (req, res) => {
           if (chatInfo.exists) username = chatInfo.data().username || null;
         } catch (e) { /* abaikan */ }
 
-        const existingUser = await db.collection('users').doc(uid).get();
+                const existingUser = await db.collection('users').doc(uid).get();
+        const isNewUser = !existingUser.exists;
+        
         await db.collection('users').doc(uid).set({
-                  // 🔔 FCM: push user baru (hanya kalau ini PERTAMA KALI user ini dibuat)
-        if (!existingUser.exists) {
+          uid: uid,
+          username: username,
+          email: userEmail || 'tidak_ada_email',
+          token: tokenMod,
+          deviceId: null,
+          expiredAt: expiredDate,
+          status: 'ACTIVE',
+          remindedH3: false,
+          remindedH1: false,
+          createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
+        });
+
+        // 🔔 FCM: push user baru (hanya kalau ini PERTAMA KALI user ini dibuat)
+        if (isNewUser) {
           try {
             const snapT = await db.collection('fcm_tokens').get();
             const tokens = snapT.docs.map(d => d.data().token).filter(Boolean);
@@ -289,17 +303,6 @@ app.post('/api/payment-webhook', async (req, res) => {
             }
           } catch (e) { console.error('Push user baru gagal:', e.message); }
         }
-          uid: uid,
-          username: username,
-          email: userEmail || 'tidak_ada_email',
-          token: tokenMod,
-          deviceId: null,
-          expiredAt: expiredDate,
-          status: 'ACTIVE',
-          remindedH3: false,
-          remindedH1: false,
-          createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
-        });
 
         try {
           const amount = parseInt(notification.gross_amount) || 0;
