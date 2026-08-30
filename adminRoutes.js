@@ -1,9 +1,37 @@
-const express = require('express');const rateLimit = require('express-rate-limit');const bcrypt = require('bcryptjs');const jwt = require('jsonwebtoken');const axios = require('axios');const { getFirestore } = require('firebase-admin/firestore');const { notifyOps, runReminders } = require('./ops');const { getTpl, DEFAULT_TPL, VARS } = require('./templates');const db = getFirestore();const router = express.Router();const JWT_SECRET = process.env.JWT_SECRET;const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);// 🎭 avatar eksklusif per roleconst OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];const ADMIN_AVATARS = ['admin_1', 'admin_2', 'admin_3', 'admin_4', 'admin_5', 'admin_6'];const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');// ---------- HELPERS ----------const logAudit = async (admin, action, target = null, meta = {}) => {
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+const { getFirestore } = require('firebase-admin/firestore');
+const { notifyOps, runReminders } = require('./ops');
+const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
+
+const db = getFirestore();
+const router = express.Router();
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
+const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
+const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
+
+// 🎭 avatar eksklusif per role
+const OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];
+const ADMIN_AVATARS = ['admin_1', 'admin_2', 'admin_3', 'admin_4', 'admin_5', 'admin_6'];
+const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];
+
+const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// ---------- HELPERS ----------
+const logAudit = async (admin, action, target = null, meta = {}) => {
   try {
     const exp = new Date(); exp.setDate(exp.getDate() + 180);
     await db.collection('audit_logs').add({ admin: admin || 'system', action, target, meta, at: new Date().toISOString(), exp });
   } catch (e) { console.error('Audit log gagal:', e.message); }
-};const serializeUser = (id, u) => ({
+};
+
+const serializeUser = (id, u) => ({
   id,
   uid: u.uid || null,
   username: u.username || null,
@@ -13,7 +41,9 @@ const express = require('express');const rateLimit = require('express-rate-limit
   status: u.status || null,
   expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
   createdAt: u.createdAt || null
-});const sendTG = async (chatId, text, options = {}) => {
+});
+
+const sendTG = async (chatId, text, options = {}) => {
   try {
     const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
     
@@ -35,11 +65,15 @@ const express = require('express');const rateLimit = require('express-rate-limit
     }
     throw error;
   }
-};const broadcastAll = async (text) => {
+};
+
+const broadcastAll = async (text) => {
   for (const gid of ALL_GROUPS) {
     try { await sendTG(gid, text, { parse_mode: 'HTML' }); } catch (e) { console.error('Broadcast gagal:', e.message); }
   }
-};const liveHumans = async (gid) => {
+};
+
+const liveHumans = async (gid) => {
   try {
     const [c, a] = await Promise.all([
       axios.post(`${TELEGRAM_API}/getChatMemberCount`, { chat_id: gid }),
@@ -47,10 +81,15 @@ const express = require('express');const rateLimit = require('express-rate-limit
     ]);
     return Math.max((c.data.result || 0) - (a.data.result || []).length, 0);
   } catch (e) { return 0; }
-};const kickFromGroup = async (userId) => {
+};
+
+const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/banChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
-};// ---------- MIDDLEWARE RBAC ----------const requireAuth = async (req, res, next) => {
+};
+
+// ---------- MIDDLEWARE RBAC ----------
+const requireAuth = async (req, res, next) => {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -69,10 +108,16 @@ const express = require('express');const rateLimit = require('express-rate-limit
     req.admin = payload;
     next();
   } catch (e) { return res.status(500).json({ error: e.message }); }
-};const requireOwner = (req, res, next) => {
+};
+
+const requireOwner = (req, res, next) => {
   if (!req.admin || req.admin.role !== 'owner') return res.status(403).json({ error: 'Khusus owner' });
   next();
-};const loginLimiter = rateLimit({ windowMs: 60 * 1000, max: 5 });// ================= AUTH =================
+};
+
+const loginLimiter = rateLimit({ windowMs: 60 * 1000, max: 5 });
+
+// ================= AUTH =================
 router.post('/auth/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body || {};
@@ -124,7 +169,9 @@ router.post('/auth/change-password', requireAuth, async (req, res) => {
     await logAudit(req.admin.sub, 'CHANGE_PASSWORD');
     res.json({ status: 'OK' });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});// ================= DASHBOARD & STATS =================
+});
+
+// ================= DASHBOARD & STATS =================
 router.get('/dashboard/stats', requireAuth, async (req, res) => {
   try {
     const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
@@ -150,20 +197,36 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
     }
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
-});// ================= USERS API (Dipangkas logic standarnya agar muat, biarkan sisa file API kamu utuh) =================// >>> JIKA ADA ROUTE LAIN SEPERTI /users, /finance, /team/chat, BIARKAN SAJA PERSIS SEPERTI KODE KAMU SEBELUMNYA <<<// ================= 🤖 APHELION AI (DEEP DIVE + DEWAN) =================const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
+});
+
+// ================= USERS API (Dipangkas logic standarnya agar muat, biarkan sisa file API kamu utuh) =================
+// >>> JIKA ADA ROUTE LAIN SEPERTI /users, /finance, /team/chat, BIARKAN SAJA PERSIS SEPERTI KODE KAMU SEBELUMNYA <<<
+
+// ================= 🤖 APHELION AI (DEEP DIVE + DEWAN) =================
+const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+
+const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
+
+const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
 - Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker.
 - Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
 - DB: Google Firestore.
 - Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK.
 - Pembayaran: Midtrans Snap + webhook /api/payment-webhook.
-- Cron: scheduler eksternal memanggil GET /api/cron/check-expired.`;const aiSystemPrompt = (admin) => `Kamu APHELION AI, chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
-ATURAN: 1. Beri SOLUSI konkret. 2. Gunakan TOOLS untuk data valid. 3. Jangan menebak. \n${AI_MANUAL}`;const AI_TOOLS = [
+- Cron: scheduler eksternal memanggil GET /api/cron/check-expired.`;
+
+const aiSystemPrompt = (admin) => `Kamu APHELION AI, chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
+ATURAN: 1. Beri SOLUSI konkret. 2. Gunakan TOOLS untuk data valid. 3. Jangan menebak. \n${AI_MANUAL}`;
+
+const AI_TOOLS = [
   { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'users_overview', description: 'Statistik user.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim.', parameters: { type: 'object', properties: { n: { type: 'integer' } } } } },
   { type: 'function', function: { name: 'arcade_status', description: 'Raid boss & leaderboard.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet N hari.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } }
-];const execTool = async (name, args, role) => {
+];
+
+const execTool = async (name, args, role) => {
   // (Fungsi eksekusi tool persis seperti kode sebelumnya, disederhanakan untuk template di sini)
   try {
       if (name === 'system_health') {
@@ -180,13 +243,17 @@ ATURAN: 1. Beri SOLUSI konkret. 2. Gunakan TOOLS untuk data valid. 3. Jangan men
       }
       return { error: 'Tool data ter-bypass' };
   } catch (e) { return { error: e.message }; }
-};const buildDeepSnapshot = async (role) => {
+};
+
+const buildDeepSnapshot = async (role) => {
   const [health, users] = await Promise.all([
     execTool('system_health', {}, role),
     execTool('users_overview', {}, role)
   ]);
   return { system_health: health, users };
-};const callLLM = async (provider, model, messages, opts = {}) => {
+};
+
+const callLLM = async (provider, model, messages, opts = {}) => {
   const URLS = {
     groq: 'https://api.groq.com/openai/v1/chat/completions',
     openrouter: 'https://openrouter.ai/api/v1/chat/completions',
@@ -209,29 +276,42 @@ ATURAN: 1. Beri SOLUSI konkret. 2. Gunakan TOOLS untuk data valid. 3. Jangan men
     console.error(`LLM Error ${provider}:`, e.message);
     return null; // Return null jika timeout/429
   }
-};// 🔥 KUNCI SOLUSI TIMEOUT: Eksekusi Beriringan (Paralel dengan Stagger)// Ini tidak akan memblokir NodeJS seperti fungsi sebelumnya.const runConcurrentStaggered = (tasks, staggerMs = 250) => {
+};
+
+// 🔥 KUNCI SOLUSI TIMEOUT: Eksekusi Beriringan (Paralel dengan Stagger)
+// Ini tidak akan memblokir NodeJS seperti fungsi sebelumnya.
+const runConcurrentStaggered = (tasks, staggerMs = 250) => {
   return Promise.all(
     tasks.map((task, i) => 
       new Promise(resolve => setTimeout(resolve, i * staggerMs)).then(() => task())
     )
   );
-};const COUNCIL = [
+};
+
+const COUNCIL = [
   { id: 'eng', label: '🧑‍💻 TEKNIS', provider: 'groq', model: 'qwen/qwen3.8-27b', persona: 'System Engineer senior: log webhook, arsitektur, keamanan.' },
   { id: 'data', label: '📊 DATA', provider: 'groq', model: 'openai/gpt-oss-120b', persona: 'Data Analyst: angka omzet, churn user, anomali statistik.' },
   { id: 'audit', label: '🔭 AUDITOR', provider: 'gemini', model: 'gemini-2.5-flash', persona: 'Auditor skeptis: mendeteksi halusinasi data, pelanggaran sistem.' },
   { id: 'logic', label: '🔬 REASONER', provider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'deepseek/deepseek-chat-v3-0324:free', persona: 'Deep Reasoner: menyambung titik sebab-akibat.' }
-];const JUDGE_CHAIN = [
+];
+
+const JUDGE_CHAIN = [
   { provider: 'gemini', model: 'gemini-2.5-pro' },
   { provider: 'gemini', model: 'gemini-2.5-flash' },
   { provider: 'groq', model: 'openai/gpt-oss-120b' }
-];const councilCooldown = {};const councilRounds = async (q, snapStr) => {
+];
+
+const councilCooldown = {};
+
+const councilRounds = async (q, snapStr) => {
   const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\n
 ATURAN MUTLAK:
 1. SANGAT SKEPTIS. Fokus ke metrikmu.
 2. WAJIB kutip angka dari SNAPSHOT.
 3. Jangan pernah mengarang data.
 
-SNAPSHOT LIVE:${snapStr}`;
+SNAPSHOT LIVE:
+${snapStr}`;
 
   // 🏁 ROUND 1 (Berjalan Paralel)
   const tasksR1 = COUNCIL.map(m => async () => {
@@ -327,7 +407,8 @@ TINGKAT KEPERCAYAAN: <0-100>%
 - <Agen 2>: <DITERIMA/DITOLAK - Alasan>
 
 ## ⚖️ RESOLUSI KONFLIK
-<Siapa yang menang dalam debat tersebut dan alasannya>${AI_MANUAL}`;
+<Siapa yang menang dalam debat tersebut dan alasannya>
+${AI_MANUAL}`;
 
     let finalText = null;
     for (const j of JUDGE_CHAIN) {
@@ -351,4 +432,6 @@ TINGKAT KEPERCAYAAN: <0-100>%
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});module.exports = router;
+});
+
+module.exports = router;
