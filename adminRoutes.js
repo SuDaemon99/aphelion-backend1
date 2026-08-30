@@ -1134,22 +1134,21 @@ const callGroq = async (messages, preferModel) => {
 const slim = (s, n) => String(s || '').slice(0, n);
 
 // ================= 🏛️ DEWAN PROFESOR =================
-const callLLM = async (provider, model, messages, opts = {}) => {
-  const URLS = {
-    groq: 'https://api.groq.com/openai/v1/chat/completions',
-    openrouter: 'https://openrouter.ai/api/v1/chat/completions',
-    gemini: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
-  };
-  const KEYS = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', gemini: 'GEMINI_API_KEY' };
-  const key = process.env[KEYS[provider]];
-  if (!key) throw new Error('Key belum diset: ' + KEYS[provider]);
-  const r = await axios.post(URLS[provider], {
-    model, messages, temperature: 0.4, max_tokens: opts.max_tokens || 600
-  }, {
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    timeout: opts.timeout || 5000
-  });
-  return (r.data.choices && r.data.choices[0] && (r.data.choices[0].message.content || '')) || '';
+// 🩺 Versi tahan banting: log error + retry 1x kalau kena rate limit
+const callLLMSafe = async (m, messages, opts = {}) => {
+  try {
+    return await callLLM(m.provider, m.model, messages, opts);
+  } catch (e) {
+    const st = e.response && e.response.status;
+    const code = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
+    console.error(`COUNCIL ${m.id} FAIL [${m.provider}/${m.model}] status=${st} code=${code} :: ${e.message}`);
+    if (st === 429 || code === 'rate_limit_exceeded') {
+      await new Promise(r => setTimeout(r, 1200));
+      try { return await callLLM(m.provider, m.model, messages, opts); }
+      catch (e2) { console.error(`COUNCIL ${m.id} RETRY FAIL :: ${e2.message}`); return null; }
+    }
+    return null;
+  }
 };
 
 const COUNCIL = [
@@ -1183,22 +1182,26 @@ const buildDeepSnapshot = async (role) => {
 
 const councilRounds = async (q, snapStr) => {
   const baseFor = (m) => `Kamu ${m.label}, ${m.persona}\n${AI_MANUAL}\nSNAPSHOT LIVE:\n${snapStr}\nATURAN: maks 220 kata, WAJIB kutip evidence dari snapshot, akhiri dengan "CONFIDENCE: <0-100>".`;
+
+  // ROUND 1
   const r1 = await Promise.all(COUNCIL.map(m =>
-    callLLM(m.provider, m.model, [
+    callLLMSafe(m, [
       { role: 'system', content: baseFor(m) },
       { role: 'user', content: q }
-    ]).then(t => ({ ...m, opini: t })).catch(() => ({ ...m, opini: null }))
+    ], { timeout: 4000, max_tokens: 450 }).then(t => ({ ...m, opini: t }))
   ));
   const alive = r1.filter(x => x.opini);
-  if (alive.length < 2) throw new Error('Analis aktif < 2. Cek GEMINI_API_KEY & OPENROUTER_API_KEY di env Vercel.');
+  if (alive.length < 2) return null;   // 👈 nggak kuorum → route yang ambil alih
+
+  // ROUND 2 (DISKUSI)
   const others = alive.map(x => `${x.label}: ${x.opini}`).join('\n---\n');
   const r2 = await Promise.all(alive.map(m =>
-    callLLM(m.provider, m.model, [
+    callLLMSafe(m, [
       { role: 'system', content: baseFor(m) + '\nROUND 2 (DISKUSI): Baca opini rekan di bawah. KRITIK yang tidak didukung data, PERKUAT yang valid, dan REVISI posisimu bila perlu. Maks 200 kata.' },
       { role: 'user', content: q },
       { role: 'assistant', content: m.opini },
       { role: 'user', content: 'OPINI REKAN KAMU:\n' + others }
-    ]).then(t => ({ ...m, final: t })).catch(() => ({ ...m, final: m.opini }))
+    ], { timeout: 4000, max_tokens: 450 }).then(t => ({ ...m, final: t || m.opini }))
   ));
   return r2.map(x => `${x.label}\n— OPINI AWAL:\n${x.opini}\n— POSISI SETELAH DISKUSI:\n${x.final}`).join('\n=====\n');
 };
