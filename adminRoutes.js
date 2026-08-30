@@ -972,4 +972,102 @@ router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
+// ================= 🤖 APHELION AI =================
+const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+const AI_MAX = 50; // kuota/user/hari
+
+const aiSystemPrompt = (admin) => `Kamu adalah APHELION AI, chief-of-staff digital untuk ekosistem bisnis "Aphelion" (langganan VIP via bot Telegram + pembayaran Midtrans + app Android mod ber-HWID + panel admin).
+Kamu sedang berbicara dengan ${admin.sub} (role: ${admin.role}).
+ATURAN WAJIB:
+1. Jawab dalam Bahasa Indonesia santai-profesional.
+2. Untuk pertanyaan tentang sistem/bisnis, JAWAB HANYA berdasar SNAPSHOT LIVE di bawah. Kalau data tidak ada, katakan "data tidak tersedia di snapshot".
+3. Jangan pernah menyebut token, password, API key, atau rahasia apapun.
+4. Jika role pengguna BUKAN owner dan ia bertanya finance/audit, tolak dengan sopan.
+5. Untuk pertanyaan umum di luar sistem (ide, copywriting, terjemahan, pengetahuan), jawab bebas dan helpful.
+6. Ringkas, terstruktur, beri SOLUSI konkret bila ada masalah.`;
+
+const buildSnapshot = async (role) => {
+  const out = {};
+  const setDoc = await db.collection('settings').doc('app').get();
+  const s = setDoc.exists ? setDoc.data() : {};
+  out.settings = {
+    maintenance: s.maintenance === true, price: s.price || null, planDays: s.planDays || null,
+    lastCronRun: s.lastCronRun || null, lastTelegramPing: s.lastTelegramPing || null, lastPaymentPing: s.lastPaymentPing || null
+  };
+  const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
+  const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
+  const plus3 = new Date(Date.now() + 3 * 86400000);
+  const expSnap = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', plus3).orderBy('expiredAt', 'asc').limit(10).get();
+  out.users = {
+    active, expired, banned,
+    expiringSoon: expSnap.docs.map(d => ({ uid: d.id, username: d.data().username || null, expiredAt: d.data().expiredAt && d.data().expiredAt.toDate ? d.data().expiredAt.toDate().toISOString() : null }))
+  };
+  if (role === 'owner') {
+    const dk = new Date().toISOString().slice(0, 10);
+    const f = await db.collection('finance_daily').doc(dk).get();
+    const t = await db.collection('finance_total').doc('all').get();
+    const tx = await db.collection('transactions').orderBy('paidAt', 'desc').limit(5).get();
+    const au = await db.collection('audit_logs').orderBy('at', 'desc').limit(10).get();
+    out.finance = {
+      today: f.exists ? { gross: f.data().gross || 0, count: f.data().count || 0 } : { gross: 0, count: 0 },
+      total: t.exists ? { gross: t.data().gross || 0, count: t.data().count || 0 } : { gross: 0, count: 0 },
+      lastTx: tx.docs.map(d => ({ orderId: d.data().orderId, uid: d.data().uid, amount: d.data().amount, channel: d.data().channel, paidAt: d.data().paidAt }))
+    };
+    out.auditRecent = au.docs.map(d => ({ admin: d.data().admin, action: d.data().action, target: d.data().target, at: d.data().at }));
+  }
+  const feed = await db.collection('ops_feed').orderBy('at', 'desc').limit(10).get();
+  out.opsRecent = feed.docs.map(d => d.data().safe || d.data().full);
+  const chat = await db.collection('team_chat').orderBy('at', 'desc').limit(10).get();
+  out.teamChatRecent = chat.docs.map(d => `${d.data().sender}: ${d.data().text}`);
+  const accs = await db.collection('admin_accounts').get();
+  out.admins = accs.docs.map(d => ({ username: d.data().username, role: d.data().role, active: d.data().active, lastLoginAt: d.data().lastLoginAt }));
+  return out;
+};
+
+router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
+  try {
+    const q = String(req.body.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
+    if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
+
+    // kuota harian
+    const dk = new Date().toISOString().slice(0, 10);
+    const qRef = db.collection('ai_quota').doc(`${req.admin.sub}_${dk}`);
+    const qDoc = await qRef.get();
+    const used = qDoc.exists ? (qDoc.data().count || 0) : 0;
+    if (used >= AI_MAX) return res.status(429).json({ error: 'Kuota harian habis (50/hari). Reset besok.' });
+    await qRef.set({ count: used + 1, date: dk }, { merge: true });
+
+    const snapshot = await buildSnapshot(req.admin.role);
+    const histDoc = await db.collection('ai_chats').doc(req.admin.sub).get();
+    const history = histDoc.exists ? (histDoc.data().history || []) : [];
+
+    const messages = [
+      { role: 'system', content: aiSystemPrompt(req.admin) + '\n\nSNAPSHOT LIVE SISTEM:\n' + JSON.stringify(snapshot) },
+      ...history,
+      { role: 'user', content: q }
+    ];
+
+    const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+      model: process.env.AI_MODEL || 'qwen/qwen3-32b',
+      messages,
+      temperature: 0.4,
+      max_tokens: 1024
+    }, {
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 8000
+    });
+
+    const answer = (r.data.choices && r.data.choices[0] && r.data.choices[0].message.content) || '(tanpa jawaban)';
+
+    const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: answer }].slice(-6);
+    await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
+
+    res.json({ answer, quotaLeft: AI_MAX - used - 1 });
+  } catch (e) {
+    console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
+    res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
+  }
+});
+
 module.exports = router;
