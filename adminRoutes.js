@@ -1109,6 +1109,32 @@ const execTool = async (name, args, role) => {
   }
 };
 
+// 🚦 Fallback model: tiap model punya kantong TPM sendiri
+const AI_MODELS = [process.env.AI_MODEL || 'qwen/qwen3.8-27b', 'qwen/qwen3.6-27b', 'openai/gpt-oss-20b'];
+
+const callGroq = async (messages) => {
+  let lastErr = null;
+  for (const model of AI_MODELS) {
+    try {
+      const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+        model, messages, tools: AI_TOOLS, tool_choice: 'auto', temperature: 0.4, max_tokens: 800
+      }, {
+        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 6000
+      });
+      return r.data;
+    } catch (e) {
+      const code = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
+      lastErr = e;
+      if (code === 'rate_limit_exceeded') continue; // 👉 lompat ke model lain (kuota segar)
+      throw e;
+    }
+  }
+  throw lastErr;
+};
+
+const slim = (s, n) => String(s || '').slice(0, n);
+
 router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   try {
     const q = String(req.body.q || '').trim();
