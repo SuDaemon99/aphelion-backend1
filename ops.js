@@ -26,6 +26,15 @@ const notifyOps = async (full, opts = {}) => {
   }
 };
 
+// 🔍 DIPINDAH DARI adminRoutes.js biar server.js & bot webhook bisa pakai
+const logAudit = async (admin, action, target = null, meta = {}) => {
+  try {
+    const db = getFirestore();
+    const exp = new Date(); exp.setDate(exp.getDate() + 180);
+    await db.collection('audit_logs').add({ admin: admin || 'system', action, target, meta, at: new Date().toISOString(), exp });
+  } catch (e) { console.error('Audit log gagal:', e.message); }
+};
+
 const runReminders = async () => {
   const db = getFirestore();
   const now = new Date();
@@ -38,23 +47,18 @@ const runReminders = async () => {
   let sent = 0;
   for (const doc of snap.docs) {
     const u = doc.data();
+    const chatDoc = await db.collection('telegram_chats').doc(doc.id).get();
+    if (!chatDoc.exists && (u.source === 'manual' || u.source === 'license')) continue; // user lisensi tanpa chat bot → skip reminder
     const daysLeft = Math.ceil((u.expiredAt.toDate() - now) / 86400000);
     const dateStr = u.expiredAt.toDate().toLocaleString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
-    const chatDoc = await db.collection('telegram_chats').doc(doc.id).get();
     const chatId = chatDoc.exists ? chatDoc.data().chatId : doc.id;
     try {
       if (daysLeft === 3 && !u.remindedH3) {
-        await axios.post(`${TELEGRAM_API}/sendMessage`, {
-          chat_id: chatId, parse_mode: 'HTML',
-          text: await getTpl('reminder_h3', { tanggal: dateStr })
-        });
+        await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, parse_mode: 'HTML', text: await getTpl('reminder_h3', { tanggal: dateStr }) });
         await db.collection('users').doc(doc.id).update({ remindedH3: true });
         sent++;
       } else if (daysLeft === 1 && !u.remindedH1) {
-        await axios.post(`${TELEGRAM_API}/sendMessage`, {
-          chat_id: chatId, parse_mode: 'HTML',
-          text: await getTpl('reminder_h1', { tanggal: dateStr })
-        });
+        await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, parse_mode: 'HTML', text: await getTpl('reminder_h1', { tanggal: dateStr }) });
         await db.collection('users').doc(doc.id).update({ remindedH1: true });
         sent++;
       }
@@ -63,4 +67,4 @@ const runReminders = async () => {
   return sent;
 };
 
-module.exports = { notifyOps, runReminders };
+module.exports = { notifyOps, runReminders, logAudit };
