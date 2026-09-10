@@ -552,6 +552,7 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     if (req.admin.role === 'owner' && types.includes('pay')) sound = 'pay';
     else if (types.includes('critical')) sound = 'critical';
     else if (types.includes('maint')) sound = 'maint';
+    else if (types.includes('login')) sound = 'login';
     res.json({ chat, feed: feedSnap.size, sound });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
