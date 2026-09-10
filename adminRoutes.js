@@ -4,7 +4,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
-const { notifyOps, runReminders } = require('./ops');
+const { notifyOps, runReminders, logAudit } = require('./ops');
+const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
 
 const db = getFirestore();
@@ -24,21 +25,21 @@ const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // ---------- HELPERS ----------
-const logAudit = async (admin, action, target = null, meta = {}) => {
-  try {
-    const exp = new Date(); exp.setDate(exp.getDate() + 180);
-    await db.collection('audit_logs').add({ admin: admin || 'system', action, target, meta, at: new Date().toISOString(), exp });
-  } catch (e) { console.error('Audit log gagal:', e.message); }
-};
-
 const serializeUser = (id, u) => ({
   id,
   uid: u.uid || null,
   username: u.username || null,
   email: u.email || null,
-  token: u.token || null,
+  token: u.tokenMasked || maskToken(u.token),
   deviceId: u.deviceId || null,
+  deviceInfo: u.deviceInfo || null,
   status: u.status || null,
+  packageName: u.packageName || null,
+  durationDays: u.durationDays || null,
+  source: u.source || 'payment',
+  createdBy: u.createdBy || null,
+  activatedAt: u.activatedAt || null,
+  lastLoginAt: u.lastLoginAt || null,
   expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
   createdAt: u.createdAt || null
 });
@@ -182,6 +183,7 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
   try {
     const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
     const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
+    const pending = (await db.collection('users').where('status', '==', 'PENDING').count().get()).data().count;
     const now = new Date(); const sod = new Date(now); sod.setHours(0, 0, 0, 0);
     const newToday = (await db.collection('users').where('createdAt', '>=', sod.toISOString()).count().get()).data().count;
     const plus3 = new Date(now.getTime() + 3 * 86400000);
@@ -190,7 +192,7 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
     const settings = setDoc.exists ? setDoc.data() : {};
 
     const out = {
-      users: { active, expired, banned, newToday, expiringIn3Days: expiring },
+      users: { active, expired, banned, pending, newToday, expiringIn3Days: expiring },
       bot: { maintenance: settings.maintenance === true, lastCronRun: settings.lastCronRun || null },
       community: {
         vipHumans: await liveHumans(VIP_GROUP_ID),
@@ -303,8 +305,11 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
     const u = d.data();
-    const chatDoc = await db.collection('telegram_chats').doc(req.params.uid).get();
-    const chatId = chatDoc.exists ? chatDoc.data().chatId : req.params.uid;
+    const chatDoc0 = await db.collection('telegram_chats').doc(req.params.uid).get();
+    if (!chatDoc0.exists && (u.source === 'manual' || u.source === 'bot' || u.source === 'license')) {
+      return res.status(400).json({ error: 'User belum pernah chat ke bot. Owner bisa pakai Reveal Token lalu japri manual.' });
+    }
+    const chatId = chatDoc0.exists ? chatDoc0.data().chatId : req.params.uid;
     const invite = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: VIP_GROUP_ID, member_limit: 1 });
     await sendTG(chatId, await getTpl('resend_dm', { token: u.token }), {
       parse_mode: 'HTML',
@@ -992,11 +997,12 @@ const maskUser = (u) => ({
 const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
 - Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
 - Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
-- DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages).
+- DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages, packages).
 - Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook (bukan polling).
 - Pembayaran: Midtrans Snap (halaman aphelion-pay) + webhook /api/payment-webhook → settlement = user ACTIVE + invite VIP.
+- Lisensi manual: generate token PENDING (status PENDING, durasi belum jalan) → user aktivasi di app produksi → status ACTIVE, expired mulai dihitung.
 - Cron: scheduler eksternal memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
-- App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID.
+- App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID + username Telegram + package name.
 - Arcade: shooter internal admin (leaderboard + raid boss mingguan 100K HP).
 - Bisnis: langganan VIP (harga & planDays di settings), grup Telegram VIP + publik.`;
 
@@ -1014,7 +1020,7 @@ ATURAN:
 // ---------- TOOLS ----------
 const AI_TOOLS = [
   { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem: maintenance, ping Telegram/payment, cron, harga, planDays.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned/pending, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'search_user', description: 'Cari user by UID/username (data ter-mask).', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } },
   { type: 'function', function: { name: 'user_timeline', description: 'Profil ter-mask + riwayat transaksi satu user.', parameters: { type: 'object', properties: { uid: { type: 'string' } }, required: ['uid'] } } },
   { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet per hari N hari terakhir + total keseluruhan.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } },
@@ -1035,10 +1041,10 @@ const execTool = async (name, args, role) => {
     }
     case 'users_overview': {
       const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
-      const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
+      const [active, expired, banned, pending] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED'), cnt('PENDING')]);
       const newWeek = (await db.collection('users').where('createdAt', '>=', new Date(Date.now() - 7 * 86400000).toISOString()).count().get()).data().count;
       const exp = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', new Date(Date.now() + 3 * 86400000)).orderBy('expiredAt', 'asc').limit(10).get();
-      return { active, expired, banned, newLast7Days: newWeek, expiringIn3Days: exp.docs.map(x => ({ uid: x.id, username: x.data().username || null, expiredAt: iso(x.data().expiredAt) })) };
+      return { active, expired, banned, pending, newLast7Days: newWeek, expiringIn3Days: exp.docs.map(x => ({ uid: x.id, username: x.data().username || null, expiredAt: iso(x.data().expiredAt) })) };
     }
     case 'search_user': {
       const qq = String(args.q || '').trim().toLowerCase();
@@ -1171,6 +1177,111 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
     res.status(500).json({ error: 'AI error: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) });
   }
+});
+
+// ================= PACKAGES (baca/tambah/edit: semua admin • hapus: owner) =================
+router.get('/packages', requireAuth, async (req, res) => {
+  const snap = await db.collection('packages').orderBy('createdAt', 'asc').get();
+  res.json({ packages: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+});
+
+router.post('/packages', requireAuth, async (req, res) => {
+  const packageName = String(req.body.packageName || '').trim();
+  const appName = String(req.body.appName || '').trim() || packageName;
+  if (!/^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$/.test(packageName)) {
+    return res.status(400).json({ error: 'Format package tidak valid (contoh: com.deimos.phantom)' });
+  }
+  const ex = await db.collection('packages').where('packageName', '==', packageName).limit(1).get();
+  if (!ex.empty) return res.status(409).json({ error: 'Package sudah terdaftar' });
+  const ref = await db.collection('packages').add({ packageName, appName, active: true, createdAt: new Date().toISOString(), createdBy: req.admin.sub });
+  await logAudit(req.admin.sub, 'PACKAGE_ADD', packageName);
+  await notifyOps(`📱 <b>App baru</b>: ${packageName} ditambah oleh ${req.admin.sub}`, { safe: `📱 App baru: ${packageName}` });
+  res.json({ status: 'CREATED', id: ref.id });
+});
+
+router.put('/packages/:id', requireAuth, async (req, res) => {
+  const d = await db.collection('packages').doc(req.params.id).get();
+  if (!d.exists) return res.status(404).json({ error: 'Package tidak ditemukan' });
+  const patch = {};
+  if (req.body.appName !== undefined) patch.appName = String(req.body.appName).trim();
+  if (req.body.active !== undefined) patch.active = req.body.active === true;
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'Tidak ada yang diupdate' });
+  patch.updatedAt = new Date().toISOString();
+  patch.updatedBy = req.admin.sub;
+  await d.ref.update(patch);
+  await logAudit(req.admin.sub, 'PACKAGE_UPDATE', d.data().packageName, patch);
+  res.json({ status: 'OK' });
+});
+
+router.delete('/packages/:id', requireAuth, requireOwner, async (req, res) => {
+  const d = await db.collection('packages').doc(req.params.id).get();
+  if (!d.exists) return res.status(404).json({ error: 'Package tidak ditemukan' });
+  const pkg = d.data().packageName;
+  const busy = await db.collection('users').where('packageName', '==', pkg).where('status', 'in', ['ACTIVE', 'PENDING']).count().get();
+  if (busy.data().count > 0) return res.status(409).json({ error: `Masih ada ${busy.data().count} token ACTIVE/PENDING di package ini.` });
+  await d.ref.delete();
+  await logAudit(req.admin.sub, 'PACKAGE_DELETE', pkg);
+  await notifyOps(`🗑 <b>App dihapus</b>: ${pkg} oleh ${req.admin.sub}`, { safe: `🗑 App dihapus: ${pkg}`, critical: true });
+  res.json({ status: 'OK' });
+});
+
+// ================= GENERATE TOKEN LISNSI (owner + admin, 1 request = 1 token) =================
+const genLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
+  const packageName = String(req.body.packageName || '').trim();
+  const days = parseInt(req.body.durationDays) || 30;
+  if (days < 1 || days > 3650) return res.status(400).json({ error: 'Durasi wajar: 1–3650 hari' });
+  const pkg = await db.collection('packages').where('packageName', '==', packageName).where('active', '==', true).limit(1).get();
+  if (pkg.empty) return res.status(400).json({ error: 'Package tidak terdaftar / nonaktif' });
+  const { id, code, masked } = await createPendingLicense(db, { packageName, durationDays: days, createdBy: req.admin.sub, source: 'manual' });
+  await logAudit(req.admin.sub, 'TOKEN_GENERATE', id, { package: packageName, days });
+  await notifyOps(`🎫 <b>Token dibuat</b> oleh ${req.admin.sub}\n${masked} • ${packageName} • ${days} hari`, { safe: `🎫 Token dibuat oleh ${req.admin.sub} • ${packageName} • ${days}h` });
+  res.json({ status: 'CREATED', id, code, masked, packageName, durationDays: days });
+});
+
+// ================= EDIT DURASI (koreksi salah set: set tanggal exact atau +/- hari) =================
+router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
+  const d = await db.collection('users').doc(req.params.uid).get();
+  if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+  const u = d.data();
+  const oldExp = u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null;
+  let newExp;
+  if (req.body.mode === 'set') {
+    const t = Date.parse(req.body.date);
+    if (isNaN(t)) return res.status(400).json({ error: 'Tanggal tidak valid' });
+    newExp = new Date(t);
+  } else {
+    const days = parseInt(req.body.days);
+    if (!days || days < -3650 || days > 3650) return res.status(400).json({ error: 'Isi jumlah hari (boleh minus)' });
+    const base = (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate && u.expiredAt.toDate() > new Date()) ? u.expiredAt.toDate() : new Date();
+    newExp = new Date(base.getTime() + days * 86400000);
+  }
+  const patch = { expiredAt: newExp, remindedH3: false, remindedH1: false };
+  if (u.status === 'EXPIRED' && newExp > new Date()) patch.status = 'ACTIVE';
+  if (u.status === 'ACTIVE' && newExp < new Date()) patch.status = 'EXPIRED';
+  await d.ref.update(patch);
+  await logAudit(req.admin.sub, 'DURATION_EDIT', req.params.uid, { from: oldExp, to: newExp.toISOString(), mode: req.body.mode || 'add' });
+  await notifyOps(`⏳ <b>Durasi diedit</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code>: ${oldExp || '-'} → ${newExp.toISOString()}`, { safe: `⏳ Durasi ${req.params.uid} diedit oleh ${req.admin.sub}` });
+  res.json({ status: 'OK', expiredAt: newExp.toISOString() });
+});
+
+// ================= REVOKE (cabut lisensi) =================
+router.post('/users/:uid/revoke', requireAuth, async (req, res) => {
+  const d = await db.collection('users').doc(req.params.uid).get();
+  if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+  await d.ref.update({ status: 'REVOKED' });
+  await logAudit(req.admin.sub, 'REVOKE', req.params.uid, { reason: req.body.reason || 'Dicabut manual' });
+  await notifyOps(`⛔ <b>Lisensi dicabut</b> oleh ${req.admin.sub}: UID ${req.params.uid}`, { safe: `⛔ Revoke UID ${req.params.uid} oleh ${req.admin.sub}`, critical: true });
+  res.json({ status: 'REVOKED' });
+});
+
+// ================= REVEAL TOKEN FULL (OWNER SAJA, diaudit + alarm) =================
+router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, res) => {
+  const d = await db.collection('users').doc(req.params.uid).get();
+  if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+  await logAudit(req.admin.sub, 'TOKEN_REVEAL', req.params.uid);
+  await notifyOps(`👁 <b>Token dibuka</b> oleh ${req.admin.sub}: UID ${req.params.uid}`, { safe: `👁 Token reveal oleh ${req.admin.sub}`, critical: true });
+  res.json({ token: d.data().token || null });
 });
 
 module.exports = router;
