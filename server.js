@@ -6,7 +6,8 @@ const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
-const { notifyOps, runReminders } = require('./ops');
+const { notifyOps, runReminders, logAudit } = require('./ops');
+const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
@@ -175,6 +176,53 @@ app.post('/api/telegram-webhook', async (req, res) => {
           await sendTelegramMessage(msg.chat.id, pesan, { parse_mode: 'HTML', disable_web_page_preview: true });
         }
       }
+
+      // =====  COMMAND ADMIN VIA TELEGRAM (whitelist owner + admin) =====
+      const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
+        (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
+
+      if (isBotAdmin && text.startsWith('/gentoken')) {
+        const parts = text.split(/\s+/);
+        const pkg = parts[1];
+        const days = parseInt(parts[2]) || 30;
+        if (!pkg) {
+          await sendTelegramMessage(msg.chat.id, 'Format: /gentoken <packageName> <hari>\nContoh: /gentoken com.deimos.phantom 30');
+        } else {
+          const pkgDoc = await db.collection('packages').where('packageName', '==', pkg).where('active', '==', true).limit(1).get();
+          if (pkgDoc.empty) {
+            await sendTelegramMessage(msg.chat.id, `❌ Package ${pkg} belum terdaftar / nonaktif. Tambahkan dulu dari Admin Panel.`);
+          } else {
+            const { code, masked } = await createPendingLicense(db, { packageName: pkg, durationDays: days, createdBy: `bot:${msg.from.username || uid}`, source: 'bot' });
+            await logAudit(`bot:${msg.from.username || uid}`, 'TOKEN_GENERATE', pkg, { days, via: 'telegram' });
+            await notifyOps(`🎫 <b>Token dibuat via BOT</b> oleh ${msg.from.username || uid}\n${masked} • ${pkg} • ${days} hari`, { safe: `🎫 Token via bot oleh ${msg.from.username || uid} • ${pkg}` });
+            await sendTelegramMessage(msg.chat.id, `🎫 <b>TOKEN BARU</b>\nApp: <code>${pkg}</code>\nDurasi: ${days} hari (mulai saat login pertama)\nKode:\n<code>${code}</code>\nStatus: BELUM DIPAKAI\n⚠️ Simpan, kode tak ditampilkan ulang.`, { parse_mode: 'HTML' });
+          }
+        }
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      if (isBotAdmin && text.startsWith('/resetdevice')) {
+        const target = String(text.split(/\s+/)[1] || '').replace(/^@/, '').toLowerCase();
+        if (!target) {
+          await sendTelegramMessage(msg.chat.id, 'Format: /resetdevice <username_telegram|uid>');
+        } else {
+          let found = null;
+          const byName = await db.collection('users').where('username', '==', target).limit(1).get();
+          if (!byName.empty) found = byName.docs[0];
+          else { const byId = await db.collection('users').doc(target).get(); if (byId.exists) found = byId; }
+          if (!found) {
+            await sendTelegramMessage(msg.chat.id, `❌ User @${target} tidak ditemukan.`);
+          } else {
+            await db.collection('users').doc(found.id).update({ deviceId: null });
+            await logAudit(`bot:${msg.from.username || uid}`, 'RESET_HWID', found.id, { via: 'telegram' });
+            await notifyOps(`🔄 <b>Reset device</b> @${target} via BOT oleh ${msg.from.username || uid}`, { safe: `🔄 Reset device @${target} via bot` });
+            await pushAllAdmins('🔄 RESET DEVICE', `@${target} direset via bot oleh ${msg.from.username || uid}`, 'critical');
+            await sendTelegramMessage(msg.chat.id, `✅ Device @${target} dilepas. Login berikutnya akan mengikat HP baru otomatis.`);
+          }
+        }
+        return res.status(200).json({ status: 'ok' });
+      }
+      // ===== akhir command admin =====
     }
 
     if (update.message && update.message.new_chat_members) {
@@ -377,49 +425,111 @@ app.post('/api/payment-webhook', async (req, res) => {
   }
 });
 
-// D. Verifikasi Token & Binding HWID (+ RATE LIMIT anti brute-force)
-app.post('/api/mod/verify', verifyLimiter, async (req, res) => {
-  try {
-    const { token, deviceId } = req.body;
+// D. LOGIN / VERIFIKASI APP PRODUKSI v2
+// Aturan: 1 user • 1 aplikasi • 1 device • durasi dari login pertama • username TG terkunci
+const modLoginLimiter = rateLimit({ windowMs: 60 * 1000, max: 20 });
 
-    if (!token || !deviceId) {
-      return res.status(400).json({ error: 'Token dan Device ID wajib dikirim dari App!' });
-    }
+const handleModLogin = async (req, res) => {
+  try {
+    const { token, deviceId, telegramUsername, packageName, deviceInfo } = req.body || {};
+    if (!token || !deviceId) return res.status(400).json({ error: 'Token dan Device ID wajib dikirim dari App!' });
+
+    const tg = telegramUsername ? String(telegramUsername).trim().replace(/^@/, '').toLowerCase() : null;
+    const pkg = packageName ? String(packageName).trim() : null;
 
     const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
-    if (snapUsers.empty) {
-      return res.status(404).json({ status: 'NOT_FOUND', message: 'Token tidak terdaftar!' });
-    }
+    if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND', message: 'Token tidak terdaftar!' });
 
     const doc = snapUsers.docs[0];
     const uid = doc.id;
-    const userData = doc.data();
+    const u = doc.data();
+    const now = new Date();
+    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || null;
+    const devLabel = deviceInfo || deviceId;
 
-    if (userData.status === 'BANNED') {
-      return res.status(403).json({ status: 'BANNED', message: 'Akun Anda diblokir.' });
+    // 1) BAN / REVOKED
+    if (u.status === 'BANNED') return res.status(403).json({ status: 'BANNED', message: 'Akun Anda diblokir.' });
+    if (u.status === 'REVOKED') return res.status(403).json({ status: 'REVOKED', message: 'Lisensi ini telah dicabut oleh admin.' });
+
+    // 2) PACKAGE LOCK (1 user 1 app)
+    if (pkg && u.packageName && u.packageName !== pkg) {
+      await logAudit('system', 'LOGIN_REJECT_PACKAGE', uid, { reqPkg: pkg, tokenPkg: u.packageName, deviceId });
+      return res.status(403).json({ status: 'PACKAGE_MISMATCH', message: `Lisensi ini hanya berlaku untuk ${u.packageName}.` });
     }
 
-    const now = new Date();
-    const expDate = userData.expiredAt.toDate();
-    if (now > expDate) {
+    // 3) PENDING → AKTIVASI (durasi MULAI SEKARANG, bind TG + device + package)
+    if (u.status === 'PENDING') {
+      if (!tg) return res.status(400).json({ status: 'BAD_REQUEST', message: 'Username Telegram wajib untuk aktivasi lisensi.' });
+      if (!pkg) return res.status(400).json({ status: 'BAD_REQUEST', message: 'Package name wajib dikirim dari App.' });
+      const days = parseInt(u.durationDays) || 30;
+      const exp = new Date(now.getTime() + days * 86400000);
+      await db.collection('users').doc(uid).update({
+        status: 'ACTIVE',
+        username: tg,
+        deviceId,
+        deviceInfo: deviceInfo || null,
+        activatedAt: now.toISOString(),
+        expiredAt: exp,
+        lastLoginAt: now.toISOString(),
+        lastLoginIp: ip,
+        remindedH3: false,
+        remindedH1: false
+      });
+      await logAudit('system', 'USER_LOGIN', uid, { first: true, telegram: `@${tg}`, package: pkg, device: devLabel });
+      await notifyOps(`🔔 <b>AKTIVASI BARU</b>\n@${tg} aktif di ${pkg}\nDevice: ${devLabel}`, { safe: `🔔 Aktivasi: @${tg} • ${pkg} • ${devLabel}`, type: 'login' });
+      await pushAllAdmins('🔔 LOGIN BARU!', `@${tg} aktif di ${pkg} • Device: ${devLabel}`, 'login');
+      return res.status(200).json({ status: 'ACTIVE', firstLogin: true, message: 'Aktivasi berhasil!', expiredAt: exp.toISOString() });
+    }
+
+    // 4) EXPIRED
+    if (u.status === 'EXPIRED' || (u.expiredAt && u.expiredAt.toDate && u.expiredAt.toDate() < now)) {
+      if (u.status !== 'EXPIRED') await db.collection('users').doc(uid).update({ status: 'EXPIRED' });
       return res.status(403).json({ status: 'EXPIRED', message: 'Masa aktif akses Anda sudah habis!' });
     }
 
-    if (!userData.deviceId) {
-      await db.collection('users').doc(uid).update({ deviceId: deviceId });
-      console.log(`[HWID BOUND] Token dikunci ke Device ID: ${deviceId}`);
-    } else if (userData.deviceId !== deviceId) {
-      console.log(`[HWID MISMATCH] Upaya pemakaian token di perangkat lain: ${uid}`);
+    // 5) TELEGRAM USERNAME LOCK (anti jual-beli akun)
+    if (tg) {
+      const bound = u.username ? String(u.username).replace(/^@/, '').toLowerCase() : null;
+      if (bound && bound !== tg) {
+        await logAudit('system', 'LOGIN_REJECT_TG', uid, { reqTg: tg, boundTg: bound, deviceId });
+        return res.status(403).json({ status: 'TG_MISMATCH', message: `Akun ini terdaftar atas @${u.username}. Hubungi admin jika ini akun Anda.` });
+      }
+      if (!bound) await db.collection('users').doc(uid).update({ username: tg });
+    }
+
+    // 6) HWID LOCK (1 device)
+    if (!u.deviceId) {
+      await db.collection('users').doc(uid).update({ deviceId, deviceInfo: deviceInfo || null });
+    } else if (u.deviceId !== deviceId) {
+      await logAudit('system', 'LOGIN_REJECT_HWID', uid, { deviceId, bound: u.deviceId });
       await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code> mencoba pakai token di perangkat lain!`, { critical: true });
       await pushAllAdmins('🚨 HWID MISMATCH!', `UID ${uid} mencoba pakai token di perangkat lain`, 'critical');
       return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Akses Ditolak! Token ini sudah terikat di perangkat lain.' });
     }
 
-    res.status(200).json({ status: 'ACTIVE', message: 'Otentikasi Berhasil!', expiredAt: expDate });
+    // 7) LOLOS → login ulang biasa (lazy-bind package utk user payment lama)
+    const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
+    if (pkg && !u.packageName) patchOk.packageName = pkg;
+    await db.collection('users').doc(uid).update(patchOk);
+
+    await logAudit('system', 'USER_LOGIN', uid, { first: false, telegram: u.username ? `@${u.username}` : null, package: pkg || u.packageName || null, device: devLabel });
+    await notifyOps(`🔔 <b>LOGIN</b>\n@${u.username || uid} masuk di ${pkg || u.packageName || '-'}\nDevice: ${devLabel}`, { safe: `🔔 Login: @${u.username || uid} • ${pkg || u.packageName || '-'}`, type: 'login' });
+    await pushAllAdmins('🔔 LOGIN', `@${u.username || uid} aktif di ${pkg || u.packageName || 'app'} • Device: ${devLabel}`, 'login');
+
+    res.status(200).json({
+      status: 'ACTIVE',
+      firstLogin: false,
+      message: 'Otentikasi Berhasil!',
+      expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null
+    });
   } catch (error) {
+    console.error('MOD LOGIN ERROR:', error.message);
     res.status(500).json({ error: error.message });
   }
-});
+};
+
+app.post('/api/mod/verify', modLoginLimiter, handleModLogin);  // path LAMA tetap hidup (mod versi lama aman)
+app.post('/api/mod/login', modLoginLimiter, handleModLogin);   // path BARU utk app produksi Java
 
 // E. Cron (expiry sweep + reminders + WATCHDOG + OPS alert)
 app.get('/api/cron/check-expired', async (req, res) => {
