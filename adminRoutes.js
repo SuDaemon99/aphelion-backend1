@@ -713,6 +713,155 @@ router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ================= 📍 LOCATION TRACKING (Owner + Admin bisa LIHAT) =================
+
+// Helper: baca settings tracking
+const getTrackSettings = async () => {
+  const d = await db.collection('settings').doc('app').get();
+  const s = d.exists ? d.data() : {};
+  return {
+    trackEnabled: s.trackEnabled === true,
+    pingInterval: parseInt(s.pingInterval) || 30,
+    retentionDays: parseInt(s.retentionDays) || 7
+  };
+};
+
+// Serialize location doc untuk panel (tanpa expose sensitive internal flags)
+const serializeLocation = (d) => {
+  if (!d.exists) return null;
+  const data = d.data();
+  return {
+    uid: d.id,
+    username: data.username || null,
+    packageName: data.packageName || null,
+    lat: data.lat, lng: data.lng,
+    accuracy: data.accuracy,
+    speed: data.speed,
+    bearing: data.bearing,
+    battery: data.battery,
+    netType: data.netType,
+    appState: data.appState,
+    consent: data.consent === true,
+    paused: data.paused === true,
+    ts: data.ts || null
+  };
+};
+
+// GET /locations — semua lokasi user terbaru (owner + admin)
+router.get('/locations', requireAuth, async (req, res) => {
+  try {
+    const snap = await db.collection('user_locations').limit(500).get();
+    const locations = snap.docs.map(serializeLocation).filter(Boolean);
+    const now = Date.now();
+    const enriched = locations.map(loc => {
+      const ageMin = loc.ts ? Math.floor((now - new Date(loc.ts).getTime()) / 60000) : null;
+      let freshness = 'stale';
+      if (ageMin !== null) {
+        if (ageMin < 1) freshness = 'live';
+        else if (ageMin < 10) freshness = 'recent';
+        else if (ageMin < 60) freshness = 'old';
+      }
+      return { ...loc, ageMin, freshness };
+    });
+    res.json({ locations: enriched, total: enriched.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /locations/stats — ringkasan (owner + admin)
+router.get('/locations/stats', requireAuth, async (req, res) => {
+  try {
+    const snap = await db.collection('user_locations').limit(500).get();
+    const now = Date.now();
+    let live = 0, moving = 0, idle = 0, paused = 0, noConsent = 0;
+    for (const d of snap.docs) {
+      const data = d.data();
+      if (data.paused) { paused++; continue; }
+      if (!data.consent) { noConsent++; continue; }
+      const ageMin = data.ts ? (now - new Date(data.ts).getTime()) / 60000 : null;
+      if (ageMin !== null && ageMin < 10) {
+        live++;
+        const speed = typeof data.speed === 'number' ? data.speed : 0;
+        if (speed > 5) moving++;
+        else idle++;
+      }
+    }
+    res.json({ total: snap.size, live, moving, idle, paused, noConsent });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /locations/:uid — detail 1 user + AUDIT (owner + admin)
+router.get('/locations/:uid', requireAuth, async (req, res) => {
+  try {
+    const d = await db.collection('user_locations').doc(req.params.uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
+    // 🔒 AUDIT: setiap kali admin buka lokasi user
+    await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: d.data().username });
+    res.json(serializeLocation(d));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /locations/:uid/trail — jejak titik N jam terakhir (owner + admin)
+router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
+  try {
+    const hours = Math.min(parseInt(req.query.hours) || 24, 168); // max 7 hari
+    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+    const snap = await db.collection('location_history').doc(req.params.uid).collection('points')
+      .where('ts', '>=', since).orderBy('ts', 'asc').limit(2000).get();
+    const points = snap.docs.map(d => {
+      const data = d.data();
+      return { lat: data.lat, lng: data.lng, accuracy: data.accuracy, speed: data.speed, bearing: data.bearing, ts: data.ts };
+    });
+    res.json({ uid: req.params.uid, hours, count: points.length, points });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /locations/:uid/stop — matikan tracking per user (owner + admin)
+router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    // Set paused=true di doc lokasi + hapus dari jejak terbaru biar admin lihat "admin stop"
+    await db.collection('user_locations').doc(uid).set({
+      paused: true, stoppedBy: req.admin.sub, stoppedAt: new Date().toISOString()
+    }, { merge: true });
+    await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
+    await notifyOps(
+      `🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`,
+      { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' }
+    );
+    res.json({ status: 'STOPPED' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /locations/settings — baca setting tracking (owner + admin)
+router.get('/locations/settings', requireAuth, async (req, res) => {
+  try {
+    const settings = await getTrackSettings();
+    res.json(settings);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /locations/settings — update master switch (OWNER ONLY)
+router.post('/locations/settings', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const { trackEnabled, pingInterval, retentionDays } = req.body || {};
+    const patch = {
+      trackEnabled: trackEnabled === true,
+      pingInterval: Math.max(10, Math.min(300, parseInt(pingInterval) || 30)),
+      retentionDays: Math.max(1, Math.min(90, parseInt(retentionDays) || 7)),
+      updatedAt: new Date().toISOString(), updatedBy: req.admin.sub
+    };
+    await db.collection('settings').doc('app').set(patch, { merge: true });
+    await logAudit(req.admin.sub, 'TRACKING_SETTINGS', null, patch);
+    await notifyOps(
+      `📍 <b>Tracking Settings</b> diubah ${req.admin.sub}\n${patch.trackEnabled ? 'ON' : 'OFF'} • ${patch.pingInterval}s • retensi ${patch.retentionDays}d`,
+      { safe: `📍 Tracking settings diubah ${req.admin.sub}`, type: 'system' }
+    );
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ================= END LOCATION TRACKING =================
+
 // ================= SETTINGS [OWNER] =================
 router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
   const { price, planDays } = req.body || {};
