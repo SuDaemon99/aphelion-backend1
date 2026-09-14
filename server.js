@@ -114,7 +114,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Vercel!' });
 });
 
-// ===== 🎁 HANDLER CLAIM TRIAL (dipakai /start trial, /trial, callback) =====
+// ===== 🎁 HANDLER CLAIM TRIAL =====
 const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   try {
     const result = await trial.claimTrial(db, {
@@ -148,6 +148,94 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
+// ===== 📍 LOCATION PING (dari app produksi, auth via token lisensi) =====
+const pingLimiter = rateLimit({ windowMs: 20 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
+
+app.post('/api/user/ping', pingLimiter, async (req, res) => {
+  try {
+    const { token, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
+    if (!token || !deviceId) return res.status(400).json({ error: 'Token & deviceId wajib' });
+    if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return res.status(400).json({ error: 'Koordinat di luar batas' });
+
+    // 1. Cek master switch
+    const settingsDoc = await db.collection('settings').doc('app').get();
+    const settings = settingsDoc.exists ? settingsDoc.data() : {};
+    if (settings.trackEnabled !== true) return res.status(403).json({ status: 'TRACKING_DISABLED' });
+
+    // 2. Validasi token + deviceId
+    const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
+    if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
+    const userDoc = snapUsers.docs[0];
+    const u = userDoc.data();
+    const uid = userDoc.id;
+
+    if (u.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
+    if (u.deviceId && u.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
+
+    // 3. Cek consent + paused (dari sisi user)
+    if (consent !== true) {
+      // User menolak tracking — jangan simpan, tapi balas OK
+      return res.status(200).json({ status: 'NO_CONSENT' });
+    }
+    if (paused === true) {
+      // Update doc tapi tandai paused (admin lihat "dijeda user")
+      await db.collection('user_locations').doc(uid).set({
+        uid, username: u.username || null,
+        packageName: u.packageName || null,
+        paused: true, consent: true,
+        ts: new Date().toISOString()
+      }, { merge: true });
+      return res.status(200).json({ status: 'PAUSED' });
+    }
+
+    // 4. Simpan lokasi terbaru (overwrite)
+    const now = new Date();
+    const point = {
+      uid, username: u.username || null,
+      packageName: u.packageName || null,
+      lat, lng,
+      accuracy: typeof accuracy === 'number' ? accuracy : null,
+      speed: typeof speed === 'number' ? speed : null,
+      bearing: typeof bearing === 'number' ? bearing : null,
+      battery: typeof battery === 'number' ? battery : null,
+      netType: netType || null,
+      appState: appState || 'foreground',
+      consent: true, paused: false,
+      ts: now.toISOString()
+    };
+
+    await db.collection('user_locations').doc(uid).set(point, { merge: true });
+
+    // 5. Append ke jejak (sub-collection)
+    const retentionDays = parseInt(settings.retentionDays) || 7;
+    try {
+      await db.collection('location_history').doc(uid).collection('points').add({
+        lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing,
+        ts: now.toISOString()
+      });
+
+      // 6. Cap: kalau > 500 point, hapus yang paling lama (best-effort)
+      const oldSnap = await db.collection('location_history').doc(uid).collection('points')
+        .orderBy('ts', 'asc').limit(50).get();
+      const totalSnap = await db.collection('location_history').doc(uid).collection('points').count().get();
+      const total = totalSnap.data().count || 0;
+      if (total > 500 && !oldSnap.empty) {
+        const batch = db.batch();
+        oldSnap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+      }
+    } catch (e) {
+      console.error('Trail write error:', e.message);
+    }
+
+    res.status(200).json({ status: 'OK', ts: now.toISOString() });
+  } catch (e) {
+    console.error('PING ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // A. Webhook Telegram
 app.post('/api/telegram-webhook', async (req, res) => {
   if (req.headers['x-telegram-bot-api-secret-token'] !== process.env.TELEGRAM_SECRET_TOKEN) {
@@ -159,17 +247,14 @@ app.post('/api/telegram-webhook', async (req, res) => {
   try {
     const update = req.body;
 
-    // ===== CALLBACK QUERY: tombol inline 🎁 COBA TRIAL =====
     if (update.callback_query) {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
       if (cb.data === 'trial_claim') {
         await answerCallbackQuery(cb.id, 'Memproses permintaan trial...');
         await db.collection('telegram_chats').doc(uid).set({
-          chatId: cb.message.chat.id,
-          username: cb.from.username || null,
-          firstName: cb.from.first_name || null,
-          updatedAt: new Date().toISOString()
+          chatId: cb.message.chat.id, username: cb.from.username || null,
+          firstName: cb.from.first_name || null, updatedAt: new Date().toISOString()
         }, { merge: true });
         await handleTrialClaim(uid, cb.from.username, cb.message.chat.id, cb.from.first_name);
       }
@@ -181,7 +266,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
       const uid = String(msg.from.id);
       const text = msg.text;
 
-      // /start trial → langsung claim (deep link dari app)
       if (text.startsWith('/start trial') || text === '/start trial') {
         if (msg.chat.type === 'private') {
           await db.collection('telegram_chats').doc(uid).set({
@@ -193,7 +277,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      // /trial command → claim
       if (text === '/trial' || text.startsWith('/trial ')) {
         if (msg.chat.type === 'private') {
           await db.collection('telegram_chats').doc(uid).set({
@@ -243,7 +326,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
             trialDays: trialSet.days
           });
 
-          // Inline button: BAYAR + 🎁 COBA TRIAL
           const markup = {
             inline_keyboard: [
               [{ text: '💳 BAYAR VIP', url: payLink }],
@@ -252,14 +334,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
           };
 
           await sendTelegramMessage(msg.chat.id, pesan, {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-            reply_markup: markup
+            parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
           });
         }
       }
 
-      // ===== COMMAND ADMIN VIA TELEGRAM =====
       const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
 
@@ -314,15 +393,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
         if (!member.is_bot) {
           const trialSet = await trial.getTrialSettings(db);
           const pesan = await getTpl(isVip ? 'welcome_vip' : 'welcome_public', {
-            nama: escapeHtml(member.first_name),
-            uid: member.id,
-            trialDays: trialSet.days
+            nama: escapeHtml(member.first_name), uid: member.id, trialDays: trialSet.days
           });
           const opts = { parse_mode: 'HTML' };
           if (!isVip) {
-            opts.reply_markup = {
-              inline_keyboard: [[{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]]
-            };
+            opts.reply_markup = { inline_keyboard: [[{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]] };
           }
           await sendTelegramMessage(chatId, pesan, opts);
         }
@@ -396,7 +471,6 @@ app.post('/api/payment-webhook', async (req, res) => {
         const existingUser = await db.collection('users').doc(uid).get();
         const isNewUser = !existingUser.exists;
 
-        // Payment = upgrade ke VIP (overwrite trial claim kalau ada)
         await db.collection('users').doc(uid).set({
           uid, username, email: userEmail || 'tidak_ada_email',
           token: tokenMod, deviceId: existingUser.exists ? existingUser.data().deviceId : null,
@@ -407,7 +481,6 @@ app.post('/api/payment-webhook', async (req, res) => {
           createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
         });
 
-        // Hapus claim trial kalau user ini dulu pernah claim (biar histori rapi)
         try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) { /* ignore */ }
 
         if (isNewUser) {
@@ -490,7 +563,6 @@ const handleModLogin = async (req, res) => {
       if (!tg) return res.status(400).json({ status: 'BAD_REQUEST', message: 'Username Telegram wajib.' });
       if (!pkg) return res.status(400).json({ status: 'BAD_REQUEST', message: 'Package name wajib.' });
 
-      // 🎁 TRIAL: cek registri device GLOBAL sebelum aktivasi
       if (u.source === 'trial') {
         const deviceUsed = await trial.checkTrialDevice(db, deviceId);
         if (deviceUsed) {
@@ -509,7 +581,6 @@ const handleModLogin = async (req, res) => {
         remindedH3: false, remindedH1: false
       });
 
-      // 🎁 TRIAL: catat device di registri global + update claim
       if (u.source === 'trial') {
         await trial.markTrialActivated(db, uid, deviceId);
         await logAudit('system', 'TRIAL_ACTIVATE', uid, { telegram: `@${tg}`, package: pkg, device: devLabel });
@@ -596,11 +667,9 @@ app.get('/api/cron/check-expired', async (req, res) => {
       const chatDoc = await db.collection('telegram_chats').doc(uid).get();
       const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
       try {
-        // 🎁 TRIAL expired: DM + tetap di publik (corong konversi)
         if (u.tier === 'trial' || u.source === 'trial') {
           await sendTelegramMessage(chatId, await getTpl('trial_expired', { nama: u.username || 'Teman' }), { parse_mode: 'HTML' });
         } else {
-          // VIP expired: kick + DM
           try { await kickFromGroup(uid); } catch (e) {}
           await sendTelegramMessage(chatId, await getTpl('expired_dm'), { parse_mode: 'HTML' });
         }
@@ -608,6 +677,31 @@ app.get('/api/cron/check-expired', async (req, res) => {
     }
     let reminded = 0;
     try { reminded = await runReminders(); } catch (e) { console.error('Reminders gagal:', e.message); }
+
+    // 📍 PURGE jejak lokasi lama sesuai retentionDays
+    try {
+      const setDoc = await db.collection('settings').doc('app').get();
+      const retentionDays = parseInt(setDoc.exists ? setDoc.data().retentionDays : 7) || 7;
+      const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
+      // Sapu semua user (limit 200 per cron biar gak berat)
+      const userSnap = await db.collection('user_locations').limit(200).get();
+      let purged = 0;
+      for (const udoc of userSnap.docs) {
+        const uid = udoc.id;
+        const oldPoints = await db.collection('location_history').doc(uid).collection('points')
+          .where('ts', '<', cutoff).limit(200).get();
+        if (!oldPoints.empty) {
+          const batch = db.batch();
+          oldPoints.docs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          purged += oldPoints.size;
+        }
+      }
+      if (purged > 0) {
+        console.log(`📍 Purged ${purged} location points > ${retentionDays}d`);
+      }
+    } catch (e) { console.error('Location purge error:', e.message); }
+
     const setW = await db.collection('settings').doc('app').get();
     const st = setW.exists ? setW.data() : {};
     if (st.maintenance !== true && st.lastTelegramPing) {
