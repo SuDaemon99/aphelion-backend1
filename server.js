@@ -531,6 +531,26 @@ const handleModLogin = async (req, res) => {
 app.post('/api/mod/verify', modLoginLimiter, handleModLogin);  // path LAMA tetap hidup (mod versi lama aman)
 app.post('/api/mod/login', modLoginLimiter, handleModLogin);   // path BARU utk app produksi Java
 
+// D2. SILENT STATUS CHECK — re-validasi client tanpa audit & tanpa push
+const checkLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
+app.post('/api/mod/check', checkLimiter, async (req, res) => {
+  try {
+    const { token, deviceId, packageName } = req.body || {};
+    if (!token) return res.status(400).json({ error: 'Token wajib' });
+    const snap = await db.collection('users').where('token', '==', String(token)).limit(1).get();
+    if (snap.empty) return res.json({ status: 'NOT_FOUND' });
+    const u = snap.docs[0].data();
+    const now = new Date();
+    let status = u.status || 'EXPIRED';
+    if (status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate && u.expiredAt.toDate() < now) status = 'EXPIRED';
+    if (status === 'ACTIVE') {
+      if (packageName && u.packageName && u.packageName !== packageName) status = 'PACKAGE_MISMATCH';
+      else if (deviceId && u.deviceId && u.deviceId !== deviceId) status = 'HWID_MISMATCH';
+    }
+    res.json({ status, expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // E. Cron (expiry sweep + reminders + WATCHDOG + OPS alert)
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
