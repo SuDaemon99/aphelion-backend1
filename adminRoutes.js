@@ -366,7 +366,6 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
     const limit = 100;
     const { cursor, from, to } = req.query;
     let ref = db.collection('audit_logs');
-    // 📅 filter rentang tanggal (server-side, field 'at' format ISO → aman string compare)
     if (from) ref = ref.where('at', '>=', `${String(from)}T00:00:00Z`);
     if (to) ref = ref.where('at', '<=', `${String(to)}T23:59:59Z`);
     ref = ref.orderBy('at', 'desc').limit(limit);
@@ -378,7 +377,6 @@ router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🗑 PURGE: hapus entri LEBIH TUA dari N hari (retensi, min 7 hari)
 router.post('/audit-logs/purge', requireAuth, requireOwner, async (req, res) => {
   try {
     const days = parseInt(req.body.days) || 90;
@@ -422,7 +420,6 @@ router.post('/feed/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// 💬 chat list + pinned terbaru
 router.get('/team/chat', requireAuth, async (req, res) => {
   const limit = 50;
   let ref = db.collection('team_chat').orderBy('at', 'desc').limit(limit);
@@ -436,7 +433,6 @@ router.get('/team/chat', requireAuth, async (req, res) => {
   res.json({ logs, nextCursor: last ? last.data().at : null, pinned });
 });
 
-// 💬 kirim chat (bawa avatar + replyTo)
 router.post('/team/chat', requireAuth, async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Text wajib' });
@@ -454,11 +450,9 @@ router.post('/team/chat', requireAuth, async (req, res) => {
       text: String(req.body.replyTo.text || '').slice(0, 80)
     };
   }
-    await db.collection('team_chat').add(doc);
+  await db.collection('team_chat').add(doc);
   
-  // 🔔 FCM: push chat baru ke semua HP admin (kecuali pengirim sendiri)
   const snap = await db.collection('fcm_tokens').get();
-  const myToken = req.body.fcmToken || ''; // opsional, biar gak push ke diri sendiri
   const tokens = snap.docs
     .filter(d => d.id !== req.admin.sub)
     .map(d => d.data().token)
@@ -471,7 +465,6 @@ router.post('/team/chat', requireAuth, async (req, res) => {
       });
     } catch (e) { console.error('Push chat gagal:', e.message); }
   }
-  
   res.json({ status: 'OK' });
 });
 
@@ -480,7 +473,6 @@ router.post('/team/chat/seen', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// ✅ centang dibaca: map username → lastChatRead
 router.get('/team/reads', requireAuth, async (req, res) => {
   try {
     const accs = await db.collection('admin_accounts').get();
@@ -493,7 +485,6 @@ router.get('/team/reads', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🎯 reaksi toggle
 router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
   try {
     const emoji = String(req.body.emoji || '');
@@ -513,7 +504,6 @@ router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 📌 pin / unpin (owner)
 router.post('/team/chat/:id/pin', requireAuth, requireOwner, async (req, res) => {
   try {
     const ref = db.collection('team_chat').doc(req.params.id);
@@ -525,7 +515,6 @@ router.post('/team/chat/:id/pin', requireAuth, requireOwner, async (req, res) =>
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🗑 hapus (sendiri atau owner)
 router.post('/team/chat/:id/delete', requireAuth, async (req, res) => {
   try {
     const ref = db.collection('team_chat').doc(req.params.id);
@@ -609,7 +598,6 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const enabled = req.body.enabled === true;
   const duration = String(req.body.duration || 'belum dipastikan');
   
-  // 1. Update DB + Audit (cepat)
   await db.collection('settings').doc('app').set({ 
     maintenance: enabled, 
     updatedAt: new Date().toISOString(), 
@@ -617,10 +605,8 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
 
-  // 🔥 FIX DELAY: Balas client DULU (instant 50ms), UI langsung update
   res.json({ status: 'OK', maintenance: enabled });
 
-  // 2. Background tasks (fire-and-forget, nggak nge-block client)
   setImmediate(async () => {
     try {
       const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
@@ -630,9 +616,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
         type: 'maint' 
       });
       await pushMaint(enabled, duration, req.admin.sub);
-    } catch (e) {
-      console.error('Background maintenance task failed:', e.message);
-    }
+    } catch (e) { console.error('Background maintenance task failed:', e.message); }
   });
 });
 
@@ -698,7 +682,6 @@ router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
       updatedBy: req.admin.sub
     };
     if (pkg) {
-      // validasi package ada & aktif
       const p = await db.collection('packages').where('packageName', '==', String(pkg)).where('active', '==', true).limit(1).get();
       if (p.empty) return res.status(400).json({ error: `Package ${pkg} tidak terdaftar / nonaktif.` });
       patch.trialPackage = String(pkg);
@@ -713,9 +696,8 @@ router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= 📍 LOCATION TRACKING (Owner + Admin bisa LIHAT) =================
+// ================= 📍 LOCATION TRACKING =================
 
-// Helper: baca settings tracking
 const getTrackSettings = async () => {
   const d = await db.collection('settings').doc('app').get();
   const s = d.exists ? d.data() : {};
@@ -726,7 +708,6 @@ const getTrackSettings = async () => {
   };
 };
 
-// Serialize location doc untuk panel (tanpa expose sensitive internal flags)
 const serializeLocation = (d) => {
   if (!d.exists) return null;
   const data = d.data();
@@ -747,7 +728,6 @@ const serializeLocation = (d) => {
   };
 };
 
-// 1. GET /locations — semua lokasi user terbaru (owner + admin)
 router.get('/locations', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
@@ -767,8 +747,6 @@ router.get('/locations', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. GET /locations/stats — ringkasan (owner + admin)
-// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.get('/locations/stats', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
@@ -790,8 +768,6 @@ router.get('/locations/stats', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. GET /locations/settings — baca setting tracking (owner + admin)
-// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.get('/locations/settings', requireAuth, async (req, res) => {
   try {
     const settings = await getTrackSettings();
@@ -799,14 +775,13 @@ router.get('/locations/settings', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. POST /locations/settings — update master switch (OWNER ONLY)
-// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.post('/locations/settings', requireAuth, requireOwner, async (req, res) => {
   try {
     const { trackEnabled, pingInterval, retentionDays } = req.body || {};
     const patch = {
       trackEnabled: trackEnabled === true,
-      pingInterval: Math.max(10, Math.min(300, parseInt(pingInterval) || 30)),
+      // 🔥 PATCH: Turunkan batas minimal interval ping ke 2 detik agar bisa TRUE LIVE
+      pingInterval: Math.max(2, Math.min(300, parseInt(pingInterval) || 30)),
       retentionDays: Math.max(1, Math.min(90, parseInt(retentionDays) || 7)),
       updatedAt: new Date().toISOString(), updatedBy: req.admin.sub
     };
@@ -820,22 +795,18 @@ router.post('/locations/settings', requireAuth, requireOwner, async (req, res) =
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 5. GET /locations/:uid — detail 1 user + AUDIT (owner + admin)
-// 👇 ROUTE DINAMIS (PAKAI PARAMETER) TARUH PALING BAWAH DARI GRUP INI
 router.get('/locations/:uid', requireAuth, async (req, res) => {
   try {
     const d = await db.collection('user_locations').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
-    // 🔒 AUDIT: setiap kali admin buka lokasi user
     await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: d.data().username });
     res.json(serializeLocation(d));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 6. GET /locations/:uid/trail — jejak titik N jam terakhir (owner + admin)
 router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
   try {
-    const hours = Math.min(parseInt(req.query.hours) || 24, 168); // max 7 hari
+    const hours = Math.min(parseInt(req.query.hours) || 24, 168);
     const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
     const snap = await db.collection('location_history').doc(req.params.uid).collection('points')
       .where('ts', '>=', since).orderBy('ts', 'asc').limit(2000).get();
@@ -847,7 +818,6 @@ router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 7. POST /locations/:uid/stop — matikan tracking per user (owner + admin)
 router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
   try {
     const uid = req.params.uid;
@@ -862,8 +832,6 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
     res.json({ status: 'STOPPED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// ================= END LOCATION TRACKING =================
 
 // ================= ADMIN ACCOUNTS [OWNER] =================
 router.get('/admins', requireAuth, requireOwner, async (req, res) => {
@@ -944,7 +912,6 @@ router.post('/arcade/score', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// ================= ARCADE RAID (boss mingguan bersama) =================
 const weekKey = () => {
   const d = new Date();
   const jan1 = new Date(d.getFullYear(), 0, 1);
@@ -990,7 +957,6 @@ router.post('/arcade/raid/damage', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= FCM PUSH =================
 let messaging = null;
 try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
 
@@ -1015,18 +981,15 @@ const pushAll = async (title, body, type) => {
   } catch (e) { console.error('Push gagal:', e.message); }
 };
 
-// push otomatis: maintenance & raid tumbang
 const pushMaint = (on, dur, by) => pushAll('🛠 Maintenance', `Maintenance ${on ? 'ON' : 'OFF'} (${dur}) oleh ${by}`, 'maint');
 const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumbangkan oleh ${by}! Squad 🏅`, 'critical');
 
-// ================= CLEAN PESAN BOT [OWNER] (PATCH BARU) =================
 router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   const target = req.body.target === 'public' ? 'public' : 'vip';
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
   if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Vercel.` });
 
   try {
-    // 1) Tarik history ID pesan dari Firestore (Maks scan 1000)
     const snap = await db.collection('bot_messages')
       .where('chatId', '==', String(gid))
       .limit(1000)
@@ -1039,7 +1002,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
     const ids = snap.docs.map(d => d.data().messageId);
     const docRefs = snap.docs.map(d => d.ref);
 
-    // 2) Hapus massal di Telegram
     let deleted = 0, failed = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
@@ -1047,7 +1009,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
         await axios.post(`${TELEGRAM_API}/deleteMessages`, { chat_id: gid, message_ids: batch });
         deleted += batch.length;
       } catch (e) {
-        // Fallback: hapus satuan jika bulk gagal
         for (const mid of batch) {
           try { 
             await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); 
@@ -1057,7 +1018,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
       }
     }
 
-    // 3) Bersihkan dari Firestore (Chunk per 400 dokumen)
     for (let i = 0; i < docRefs.length; i += 400) {
       const batchDB = db.batch();
       docRefs.slice(i, i + 400).forEach(ref => batchDB.delete(ref));
@@ -1074,10 +1034,8 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
-// ================= CLEAR ALL CHAT [OWNER ONLY] =================
 router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
   try {
-    // 1) Hitung total pesan (untuk log)
     const countSnap = await db.collection('team_chat').count().get();
     const total = countSnap.data().count || 0;
     
@@ -1085,7 +1043,6 @@ router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
       return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
     }
 
-    // 2) Hapus semua dokumen dalam chunks 400 (Firestore batch limit = 500)
     let deleted = 0;
     const BATCH_SIZE = 400;
     
@@ -1101,7 +1058,6 @@ router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
       if (snap.size < BATCH_SIZE) break;
     }
 
-    // 3) Reset lastChatRead semua admin (biar "unread" bersih juga)
     const metaSnap = await db.collection('team_meta').get();
     if (!metaSnap.empty) {
       const resetBatch = db.batch();
@@ -1124,14 +1080,12 @@ router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
-// ================= CLEAR FEED / AKTIVITAS [OWNER] =================
 router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
   try {
     const countSnap = await db.collection('ops_feed').count().get();
     const total = countSnap.data().count || 0;
     if (total === 0) return res.json({ status: 'OK', deleted: 0, note: 'Feed sudah kosong' });
 
-    // Hapus chunks 400 (aman dari Firestore batch limit 500)
     let deleted = 0;
     const BATCH = 400;
     while (true) {
@@ -1145,7 +1099,6 @@ router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
     }
 
     await logAudit(req.admin.sub, 'CLEAR_FEED', null, { deleted });
-    // Tulis 1 entri baru biar layar nggak kosong & tim tau feed di-reset
     await notifyOps(`🧹 <b>Riwayat Aktivitas dibersihkan</b> oleh ${req.admin.sub} (${deleted} entri dihapus)`, { safe: `🧹 Aktivitas dibersihkan oleh ${req.admin.sub}` });
     res.json({ status: 'OK', deleted });
   } catch (e) {
@@ -1154,13 +1107,11 @@ router.post('/feed/clear', requireAuth, requireOwner, async (req, res) => {
   }
 });
 
-// ================= 🤖 APHELION AI (DEEP DIVE + TOOLS) =================
 const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 const AI_MAX = 50;
 
 const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
 
-// 🚧 GARIS MERAH: serializer mask — AI TIDAK PERNAH melihat kunci
 const maskUser = (u) => ({
   uid: u.uid || u.id || null,
   username: u.username || null,
@@ -1194,7 +1145,6 @@ ATURAN:
 7. Rekomendasi teknis WAJIB konsisten dengan MANUAL stack.
 ` + AI_MANUAL;
 
-// ---------- TOOLS ----------
 const AI_TOOLS = [
   { type: 'function', function: { name: 'system_health', description: 'Kesehatan sistem: maintenance, ping Telegram/payment, cron, harga, planDays.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned/pending, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
@@ -1298,7 +1248,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
     if (q.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
 
-    // kuota harian
     const dk = new Date().toISOString().slice(0, 10);
     const qRef = db.collection('ai_quota').doc(`${req.admin.sub}_${dk}`);
     const qDoc = await qRef.get();
@@ -1356,7 +1305,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
   }
 });
 
-// ================= PACKAGES (baca/tambah/edit: semua admin • hapus: owner) =================
 router.get('/packages', requireAuth, async (req, res) => {
   const snap = await db.collection('packages').orderBy('createdAt', 'asc').get();
   res.json({ packages: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
@@ -1402,7 +1350,6 @@ router.delete('/packages/:id', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// ================= GENERATE TOKEN LISNSI (owner + admin, 1 request = 1 token) =================
 const genLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
   const packageName = String(req.body.packageName || '').trim();
@@ -1416,7 +1363,6 @@ router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
   res.json({ status: 'CREATED', id, code, masked, packageName, durationDays: days });
 });
 
-// ================= EDIT DURASI (koreksi salah set: set tanggal exact atau +/- hari) =================
 router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
@@ -1442,7 +1388,6 @@ router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
   res.json({ status: 'OK', expiredAt: newExp.toISOString() });
 });
 
-// ================= REVOKE (cabut lisensi) =================
 router.post('/users/:uid/revoke', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
@@ -1452,7 +1397,6 @@ router.post('/users/:uid/revoke', requireAuth, async (req, res) => {
   res.json({ status: 'REVOKED' });
 });
 
-// ================= REVEAL TOKEN FULL (OWNER SAJA, diaudit + alarm) =================
 router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
