@@ -6,6 +6,7 @@ const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
+const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
@@ -30,6 +31,12 @@ if (getApps().length === 0) {
 const db = getFirestore();
 const app = express();
 app.set('trust proxy', 1);
+
+// 🔥 INISIALISASI REDIS
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 let messaging = null;
 try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
@@ -148,8 +155,7 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
-// ===== 📍 LOCATION PING (dari app produksi, auth via token lisensi) =====
-// 🔥 PATCH: Turunkan batas limit ping ke 2 detik biar bener-bener LIVE
+// ===== 📍 LOCATION PING (HYBRID: REDIS + FIRESTORE) =====
 const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
 
 app.post('/api/user/ping', pingLimiter, async (req, res) => {
@@ -157,7 +163,6 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
     const { token, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
     if (!token || !deviceId) return res.status(400).json({ error: 'Token & deviceId wajib' });
     if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return res.status(400).json({ error: 'Koordinat di luar batas' });
 
     // 1. Cek master switch
     const settingsDoc = await db.collection('settings').doc('app').get();
@@ -174,61 +179,60 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
     if (u.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
     if (u.deviceId && u.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
 
-    // 3. Cek consent + paused (dari sisi user)
-    if (consent !== true) {
-      // User menolak tracking — jangan simpan, tapi balas OK
-      return res.status(200).json({ status: 'NO_CONSENT' });
-    }
+    if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
+    
     if (paused === true) {
-      // Update doc tapi tandai paused (admin lihat "dijeda user")
-      await db.collection('user_locations').doc(uid).set({
-        uid, username: u.username || null,
-        packageName: u.packageName || null,
-        paused: true, consent: true,
-        ts: new Date().toISOString()
-      }, { merge: true });
+      const pData = {
+        uid, username: u.username || null, packageName: u.packageName || null,
+        paused: true, consent: true, ts: new Date().toISOString()
+      };
+      await db.collection('user_locations').doc(uid).set(pData, { merge: true });
+      try { await redis.set(`loc:${uid}`, JSON.stringify(pData), { ex: 60 }); } catch(e){}
       return res.status(200).json({ status: 'PAUSED' });
     }
 
-    // 4. Simpan lokasi terbaru (overwrite)
+    // 4. Simpan lokasi ke REDIS & FIRESTORE
     const now = new Date();
     const point = {
-      uid, username: u.username || null,
-      packageName: u.packageName || null,
-      lat, lng,
-      accuracy: typeof accuracy === 'number' ? accuracy : null,
+      uid, username: u.username || null, packageName: u.packageName || null,
+      lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
       speed: typeof speed === 'number' ? speed : null,
       bearing: typeof bearing === 'number' ? bearing : null,
       battery: typeof battery === 'number' ? battery : null,
-      netType: netType || null,
-      appState: appState || 'foreground',
-      consent: true, paused: false,
-      ts: now.toISOString()
+      netType: netType || null, appState: appState || 'foreground',
+      consent: true, paused: false, ts: now.toISOString()
     };
 
-    await db.collection('user_locations').doc(uid).set(point, { merge: true });
+    // 🔥 TULIS KE REDIS (True Live Tracking - 0 Quota Firestore)
+    try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
+    catch(redisErr) { console.error("Redis Error:", redisErr.message); }
 
-    // 5. Append ke jejak (sub-collection)
-    const retentionDays = parseInt(settings.retentionDays) || 7;
+    // 🔥 TULIS KE FIRESTORE (Hanya 5 Menit Sekali per User)
     try {
-      await db.collection('location_history').doc(uid).collection('points').add({
-        lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing,
-        ts: now.toISOString()
-      });
-
-      // 6. Cap: kalau > 500 point, hapus yang paling lama (best-effort)
-      const oldSnap = await db.collection('location_history').doc(uid).collection('points')
-        .orderBy('ts', 'asc').limit(50).get();
-      const totalSnap = await db.collection('location_history').doc(uid).collection('points').count().get();
-      const total = totalSnap.data().count || 0;
-      if (total > 500 && !oldSnap.empty) {
-        const batch = db.batch();
-        oldSnap.docs.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-      }
-    } catch (e) {
-      console.error('Trail write error:', e.message);
-    }
+        const lastDbWrite = await redis.get(`last_db_write:${uid}`);
+        if (!lastDbWrite) {
+          // Update lokasi terakhir di Firestore (Jaga-jaga kalau Redis expired)
+          await db.collection('user_locations').doc(uid).set(point, { merge: true });
+          
+          // Tambah titik jejak (trail)
+          await db.collection('location_history').doc(uid).collection('points').add({
+            lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
+          });
+          
+          // Cap Firestore trail limit (tetap di dalam blok 5 menit biar hemat)
+          const totalSnap = await db.collection('location_history').doc(uid).collection('points').count().get();
+          if ((totalSnap.data().count || 0) > 500) {
+            const oldSnap = await db.collection('location_history').doc(uid).collection('points').orderBy('ts', 'asc').limit(50).get();
+            if (!oldSnap.empty) {
+              const batch = db.batch();
+              oldSnap.docs.forEach(d => batch.delete(d.ref));
+              await batch.commit();
+            }
+          }
+          // Kunci selama 5 menit (300 detik)
+          await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
+        }
+    } catch (dbErr) { console.error("DB Trail Error:", dbErr.message); }
 
     res.status(200).json({ status: 'OK', ts: now.toISOString() });
   } catch (e) {
@@ -684,7 +688,6 @@ app.get('/api/cron/check-expired', async (req, res) => {
       const setDoc = await db.collection('settings').doc('app').get();
       const retentionDays = parseInt(setDoc.exists ? setDoc.data().retentionDays : 7) || 7;
       const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
-      // Sapu semua user (limit 200 per cron biar gak berat)
       const userSnap = await db.collection('user_locations').limit(200).get();
       let purged = 0;
       for (const udoc of userSnap.docs) {
@@ -698,9 +701,7 @@ app.get('/api/cron/check-expired', async (req, res) => {
           purged += oldPoints.size;
         }
       }
-      if (purged > 0) {
-        console.log(`📍 Purged ${purged} location points > ${retentionDays}d`);
-      }
+      if (purged > 0) console.log(`📍 Purged ${purged} location points > ${retentionDays}d`);
     } catch (e) { console.error('Location purge error:', e.message); }
 
     const setW = await db.collection('settings').doc('app').get();
