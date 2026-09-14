@@ -7,6 +7,7 @@ const { getFirestore } = require('firebase-admin/firestore');
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
+const trial = require('./trial');
 
 const db = getFirestore();
 const router = express.Router();
@@ -662,6 +663,54 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
   await logAudit(req.admin.sub, 'CRON_RUN', null, { expired: n, reminded });
   await notifyOps(`⏰ <b>Cron manual</b> oleh ${req.admin.sub}: ${n} expired • ${reminded} reminder`, { safe: `⏰ Cron oleh ${req.admin.sub}: ${n} expired • ${reminded} reminder` });
   res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
+});
+
+// ================= 🎁 TRIAL CONTROL [OWNER] =================
+router.get('/trial/stats', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const settings = await trial.getTrialSettings(db);
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const counterDoc = await db.collection('trial_counters').doc(todayKey).get();
+    const todayClaims = counterDoc.exists ? (counterDoc.data().count || 0) : 0;
+    const activeSnap = await db.collection('trial_claims').where('status', '==', 'ACTIVE').count().get();
+    const activeTrials = activeSnap.data().count || 0;
+    const pendingSnap = await db.collection('users').where('source', '==', 'trial').where('status', '==', 'PENDING').count().get();
+    const pendingTrials = pendingSnap.data().count || 0;
+    res.json({
+      ...settings,
+      todayClaims,
+      activeTrials,
+      pendingTrials
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const { enabled, days, dailyCap, package: pkg, pushNotify, requirePublicMember } = req.body || {};
+    const patch = {
+      trialEnabled: enabled === true,
+      trialDays: Math.max(1, Math.min(365, parseInt(days) || 7)),
+      trialDailyCap: Math.max(1, Math.min(1000, parseInt(dailyCap) || 20)),
+      trialPushNotify: pushNotify === true,
+      trialRequirePublic: requirePublicMember !== false,
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.admin.sub
+    };
+    if (pkg) {
+      // validasi package ada & aktif
+      const p = await db.collection('packages').where('packageName', '==', String(pkg)).where('active', '==', true).limit(1).get();
+      if (p.empty) return res.status(400).json({ error: `Package ${pkg} tidak terdaftar / nonaktif.` });
+      patch.trialPackage = String(pkg);
+    }
+    await db.collection('settings').doc('app').set(patch, { merge: true });
+    await logAudit(req.admin.sub, 'TRIAL_SETTINGS', null, patch);
+    await notifyOps(
+      `🎁 <b>Trial Settings</b> diubah ${req.admin.sub}\n${patch.trialEnabled ? 'ON' : 'OFF'} • ${patch.trialDays}d • cap ${patch.trialDailyCap}/hari`,
+      { safe: `🎁 Trial settings diubah ${req.admin.sub}`, type: 'system' }
+    );
+    res.json({ status: 'OK' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ================= SETTINGS [OWNER] =================
