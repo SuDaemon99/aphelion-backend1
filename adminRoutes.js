@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
+const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
@@ -12,54 +13,40 @@ const trial = require('./trial');
 const db = getFirestore();
 const router = express.Router();
 
+// 🔥 INISIALISASI REDIS ADMIN
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
 const JWT_SECRET = process.env.JWT_SECRET;
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
 const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
 
-// 🎭 avatar eksklusif per role
 const OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];
 const ADMIN_AVATARS = ['admin_1', 'admin_2', 'admin_3', 'admin_4', 'admin_5', 'admin_6'];
 const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];
 
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// ---------- HELPERS ----------
 const serializeUser = (id, u) => ({
-  id,
-  uid: u.uid || null,
-  username: u.username || null,
-  email: u.email || null,
-  token: u.tokenMasked || maskToken(u.token),
-  deviceId: u.deviceId || null,
-  deviceInfo: u.deviceInfo || null,
-  status: u.status || null,
-  packageName: u.packageName || null,
-  durationDays: u.durationDays || null,
-  source: u.source || 'payment',
-  createdBy: u.createdBy || null,
-  activatedAt: u.activatedAt || null,
-  lastLoginAt: u.lastLoginAt || null,
-  expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
+  id, uid: u.uid || null, username: u.username || null, email: u.email || null,
+  token: u.tokenMasked || maskToken(u.token), deviceId: u.deviceId || null, deviceInfo: u.deviceInfo || null,
+  status: u.status || null, packageName: u.packageName || null, durationDays: u.durationDays || null,
+  source: u.source || 'payment', createdBy: u.createdBy || null, activatedAt: u.activatedAt || null,
+  lastLoginAt: u.lastLoginAt || null, expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
   createdAt: u.createdAt || null
 });
 
 const sendTG = async (chatId, text, options = {}) => {
   try {
     const r = await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, text, ...options });
-    
-    // ===== 💾 TRACKING PESAN GRUP (PATCH BARU) =====
     if (String(chatId) === String(VIP_GROUP_ID) || String(chatId) === String(PUBLIC_GROUP_ID)) {
       const mid = r.data.result.message_id;
-      db.collection('bot_messages').add({
-        chatId: String(chatId),
-        messageId: mid,
-        at: new Date().toISOString()
-      }).catch(() => {}); // Biarkan berjalan di background
+      db.collection('bot_messages').add({ chatId: String(chatId), messageId: mid, at: new Date().toISOString() }).catch(() => {}); 
     }
-    // ===============================================
-
     return r.data;
   } catch (error) {
     if (options.parse_mode) {
@@ -93,7 +80,6 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
-// ---------- MIDDLEWARE RBAC ----------
 const requireAuth = async (req, res, next) => {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -103,13 +89,8 @@ const requireAuth = async (req, res, next) => {
   catch (e) { return res.status(401).json({ error: 'Token invalid/kadaluarsa' }); }
   try {
     const doc = await db.collection('admin_accounts').doc(payload.sub).get();
-    if (!doc.exists || doc.data().active !== true) {
-      return res.status(401).json({ error: 'Akun nonaktif. Sesi berakhir.' });
-    }
-    const epoch = doc.data().epoch || 0;
-    if ((payload.ep || 0) !== epoch) {
-      return res.status(401).json({ error: 'Sesi berakhir. Login ulang.' });
-    }
+    if (!doc.exists || doc.data().active !== true) return res.status(401).json({ error: 'Akun nonaktif. Sesi berakhir.' });
+    if ((payload.ep || 0) !== (doc.data().epoch || 0)) return res.status(401).json({ error: 'Sesi berakhir. Login ulang.' });
     req.admin = payload;
     next();
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -122,7 +103,6 @@ const requireOwner = (req, res, next) => {
 
 const loginLimiter = rateLimit({ windowMs: 60 * 1000, max: 5 });
 
-// ================= AUTH =================
 router.post('/auth/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body || {};
@@ -144,8 +124,7 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Kredensial salah' });
     }
     await db.collection('admin_accounts').doc(uname).update({ failCount: 0, lockedUntil: null, lastLoginAt: new Date().toISOString() });
-    const epoch = acc.epoch || 0;
-    const token = jwt.sign({ sub: uname, role: acc.role, ep: epoch }, JWT_SECRET, { expiresIn: '12h' });
+    const token = jwt.sign({ sub: uname, role: acc.role, ep: acc.epoch || 0 }, JWT_SECRET, { expiresIn: '12h' });
     await logAudit(uname, 'LOGIN');
     await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`, { safe: `🔐 Login: ${uname}` });
     res.json({ token, role: acc.role, username: uname });
@@ -157,7 +136,6 @@ router.get('/auth/me', requireAuth, async (req, res) => {
   res.json({ username: req.admin.sub, role: req.admin.role, avatar: d.exists ? (d.data().avatar || null) : null });
 });
 
-// 🎭 ganti avatar sendiri (sesuai set role)
 router.post('/auth/avatar', requireAuth, async (req, res) => {
   const avatar = String(req.body.avatar || '');
   const set = req.admin.role === 'owner' ? OWNER_AVATARS : ADMIN_AVATARS;
@@ -179,7 +157,6 @@ router.post('/auth/change-password', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= DASHBOARD =================
 router.get('/dashboard/stats', requireAuth, async (req, res) => {
   try {
     const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
@@ -213,7 +190,6 @@ router.get('/dashboard/stats', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= USERS =================
 router.get('/users', requireAuth, async (req, res) => {
   try {
     const { status, q, cursor } = req.query;
@@ -321,7 +297,6 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= FINANCE [OWNER] =================
 router.get('/finance/summary', requireAuth, requireOwner, async (req, res) => {
   try {
     const range = req.query.range || '7d';
@@ -360,7 +335,6 @@ router.get('/finance/export', requireAuth, requireOwner, async (req, res) => {
   res.send(csv);
 });
 
-// ================= AUDIT [OWNER] =================
 router.get('/audit-logs', requireAuth, requireOwner, async (req, res) => {
   try {
     const limit = 100;
@@ -398,7 +372,6 @@ router.post('/audit-logs/purge', requireAuth, requireOwner, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= TEAM FEED & CHAT =================
 router.get('/feed', requireAuth, async (req, res) => {
   try {
     const limit = 30;
@@ -547,17 +520,13 @@ router.get('/team/unread', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= TEMPLATES PESAN BOT [OWNER] =================
 router.get('/templates', requireAuth, requireOwner, async (req, res) => {
   try {
     const snap = await db.collection('templates').get();
     const custom = {};
     snap.docs.forEach(d => { custom[d.id] = d.data().text; });
     const list = Object.keys(DEFAULT_TPL).map(key => ({
-      key,
-      vars: VARS[key] || [],
-      custom: !!custom[key],
-      text: custom[key] || DEFAULT_TPL[key]
+      key, vars: VARS[key] || [], custom: !!custom[key], text: custom[key] || DEFAULT_TPL[key]
     }));
     res.json({ templates: list });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -588,7 +557,6 @@ router.delete('/templates/:key', requireAuth, requireOwner, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= BOT CONTROL [OWNER] =================
 router.get('/bot/health', requireAuth, requireOwner, async (req, res) => {
   const s = await db.collection('settings').doc('app').get();
   res.json({ ...(s.exists ? s.data() : {}), memberCount: await liveHumans(VIP_GROUP_ID) });
@@ -599,9 +567,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
   const duration = String(req.body.duration || 'belum dipastikan');
   
   await db.collection('settings').doc('app').set({ 
-    maintenance: enabled, 
-    updatedAt: new Date().toISOString(), 
-    updatedBy: req.admin.sub 
+    maintenance: enabled, updatedAt: new Date().toISOString(), updatedBy: req.admin.sub 
   }, { merge: true });
   await logAudit(req.admin.sub, 'MAINTENANCE', null, { enabled, duration });
 
@@ -612,8 +578,7 @@ router.post('/bot/maintenance', requireAuth, requireOwner, async (req, res) => {
       const msg = await getTpl(enabled ? 'maintenance_on' : 'maintenance_off', { durasi: duration });
       await broadcastAll(msg);
       await notifyOps(`🛠 <b>Maintenance ${enabled ? 'ON' : 'OFF'}</b> oleh ${req.admin.sub} (${duration})`, { 
-        safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, 
-        type: 'maint' 
+        safe: `🛠 Maintenance ${enabled ? 'ON' : 'OFF'} oleh ${req.admin.sub}`, type: 'maint' 
       });
       await pushMaint(enabled, duration, req.admin.sub);
     } catch (e) { console.error('Background maintenance task failed:', e.message); }
@@ -649,7 +614,6 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
   res.json({ status: 'CRON_SUCCESS', user_expired: n, reminders_sent: reminded });
 });
 
-// ================= 🎁 TRIAL CONTROL [OWNER] =================
 router.get('/trial/stats', requireAuth, requireOwner, async (req, res) => {
   try {
     const settings = await trial.getTrialSettings(db);
@@ -660,12 +624,7 @@ router.get('/trial/stats', requireAuth, requireOwner, async (req, res) => {
     const activeTrials = activeSnap.data().count || 0;
     const pendingSnap = await db.collection('users').where('source', '==', 'trial').where('status', '==', 'PENDING').count().get();
     const pendingTrials = pendingSnap.data().count || 0;
-    res.json({
-      ...settings,
-      todayClaims,
-      activeTrials,
-      pendingTrials
-    });
+    res.json({ ...settings, todayClaims, activeTrials, pendingTrials });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -678,8 +637,7 @@ router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
       trialDailyCap: Math.max(1, Math.min(1000, parseInt(dailyCap) || 20)),
       trialPushNotify: pushNotify === true,
       trialRequirePublic: requirePublicMember !== false,
-      updatedAt: new Date().toISOString(),
-      updatedBy: req.admin.sub
+      updatedAt: new Date().toISOString(), updatedBy: req.admin.sub
     };
     if (pkg) {
       const p = await db.collection('packages').where('packageName', '==', String(pkg)).where('active', '==', true).limit(1).get();
@@ -688,16 +646,12 @@ router.post('/trial/settings', requireAuth, requireOwner, async (req, res) => {
     }
     await db.collection('settings').doc('app').set(patch, { merge: true });
     await logAudit(req.admin.sub, 'TRIAL_SETTINGS', null, patch);
-    await notifyOps(
-      `🎁 <b>Trial Settings</b> diubah ${req.admin.sub}\n${patch.trialEnabled ? 'ON' : 'OFF'} • ${patch.trialDays}d • cap ${patch.trialDailyCap}/hari`,
-      { safe: `🎁 Trial settings diubah ${req.admin.sub}`, type: 'system' }
-    );
+    await notifyOps(`🎁 <b>Trial Settings</b> diubah ${req.admin.sub}\n${patch.trialEnabled ? 'ON' : 'OFF'} • ${patch.trialDays}d • cap ${patch.trialDailyCap}/hari`, { safe: `🎁 Trial settings diubah ${req.admin.sub}`, type: 'system' });
     res.json({ status: 'OK' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= 📍 LOCATION TRACKING =================
-
+// ================= 📍 LOCATION TRACKING (HYBRID: REDIS + FIRESTORE) =================
 const getTrackSettings = async () => {
   const d = await db.collection('settings').doc('app').get();
   const s = d.exists ? d.data() : {};
@@ -712,34 +666,51 @@ const serializeLocation = (d) => {
   if (!d.exists) return null;
   const data = d.data();
   return {
-    uid: d.id,
-    username: data.username || null,
-    packageName: data.packageName || null,
-    lat: data.lat, lng: data.lng,
-    accuracy: data.accuracy,
-    speed: data.speed,
-    bearing: data.bearing,
-    battery: data.battery,
-    netType: data.netType,
-    appState: data.appState,
-    consent: data.consent === true,
-    paused: data.paused === true,
+    uid: d.id, username: data.username || null, packageName: data.packageName || null,
+    lat: data.lat, lng: data.lng, accuracy: data.accuracy, speed: data.speed,
+    bearing: data.bearing, battery: data.battery, netType: data.netType,
+    appState: data.appState, consent: data.consent === true, paused: data.paused === true,
     ts: data.ts || null
   };
 };
 
+// 🔥 TAMPILKAN LOKASI (GABUNGAN DATA OFFLINE DARI DB & DATA LIVE DARI REDIS)
 router.get('/locations', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
-    const locations = snap.docs.map(serializeLocation).filter(Boolean);
+    const dbLocations = snap.docs.map(serializeLocation).filter(Boolean);
+    
+    let liveLocations = [];
+    try {
+        const keys = await redis.keys('loc:*');
+        if (keys && keys.length > 0) {
+          const rawData = await redis.mget(...keys);
+          liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
+        }
+    } catch (redisErr) { console.error("Redis Read Error:", redisErr.message); }
+
+    // Merge: Data dari Redis otomatis nimpa data dari Firestore biar lebih akurat
+    const redisMap = {};
+    liveLocations.forEach(l => { redisMap[l.uid] = l; });
+    
+    const merged = dbLocations.map(dbLoc => {
+        return redisMap[dbLoc.uid] ? { ...dbLoc, ...redisMap[dbLoc.uid] } : dbLoc;
+    });
+    
+    // User baru yang ada di Redis tapi belum masuk Firestore (karena belum 5 menit)
+    const dbUids = new Set(dbLocations.map(d => d.uid));
+    liveLocations.forEach(l => {
+        if (!dbUids.has(l.uid)) merged.push(l);
+    });
+
     const now = Date.now();
-    const enriched = locations.map(loc => {
+    const enriched = merged.map(loc => {
       const ageMin = loc.ts ? Math.floor((now - new Date(loc.ts).getTime()) / 60000) : null;
       let freshness = 'stale';
       if (ageMin !== null) {
         if (ageMin < 1) freshness = 'live';
         else if (ageMin < 10) freshness = 'recent';
-        else if (ageMin < 60) freshness = 'old';
+        else freshness = 'old';
       }
       return { ...loc, ageMin, freshness };
     });
@@ -750,10 +721,27 @@ router.get('/locations', requireAuth, async (req, res) => {
 router.get('/locations/stats', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
+    const dbLocations = snap.docs.map(d => d.data());
+    
+    let liveLocations = [];
+    try {
+        const keys = await redis.keys('loc:*');
+        if (keys && keys.length > 0) {
+          const rawData = await redis.mget(...keys);
+          liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
+        }
+    } catch (e) {}
+
+    const redisMap = {};
+    liveLocations.forEach(l => { redisMap[l.uid] = l; });
+    const merged = dbLocations.map(dbLoc => redisMap[dbLoc.uid] ? { ...dbLoc, ...redisMap[dbLoc.uid] } : dbLoc);
+    const dbUids = new Set(dbLocations.map(d => d.uid));
+    liveLocations.forEach(l => { if (!dbUids.has(l.uid)) merged.push(l); });
+
     const now = Date.now();
     let live = 0, moving = 0, idle = 0, paused = 0, noConsent = 0;
-    for (const d of snap.docs) {
-      const data = d.data();
+    
+    for (const data of merged) {
       if (data.paused) { paused++; continue; }
       if (!data.consent) { noConsent++; continue; }
       const ageMin = data.ts ? (now - new Date(data.ts).getTime()) / 60000 : null;
@@ -764,7 +752,7 @@ router.get('/locations/stats', requireAuth, async (req, res) => {
         else idle++;
       }
     }
-    res.json({ total: snap.size, live, moving, idle, paused, noConsent });
+    res.json({ total: merged.length, live, moving, idle, paused, noConsent });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -780,27 +768,40 @@ router.post('/locations/settings', requireAuth, requireOwner, async (req, res) =
     const { trackEnabled, pingInterval, retentionDays } = req.body || {};
     const patch = {
       trackEnabled: trackEnabled === true,
-      // 🔥 PATCH: Turunkan batas minimal interval ping ke 2 detik agar bisa TRUE LIVE
       pingInterval: Math.max(2, Math.min(300, parseInt(pingInterval) || 30)),
       retentionDays: Math.max(1, Math.min(90, parseInt(retentionDays) || 7)),
       updatedAt: new Date().toISOString(), updatedBy: req.admin.sub
     };
     await db.collection('settings').doc('app').set(patch, { merge: true });
     await logAudit(req.admin.sub, 'TRACKING_SETTINGS', null, patch);
-    await notifyOps(
-      `📍 <b>Tracking Settings</b> diubah ${req.admin.sub}\n${patch.trackEnabled ? 'ON' : 'OFF'} • ${patch.pingInterval}s • retensi ${patch.retentionDays}d`,
-      { safe: `📍 Tracking settings diubah ${req.admin.sub}`, type: 'system' }
-    );
+    await notifyOps(`📍 <b>Tracking Settings</b> diubah ${req.admin.sub}\n${patch.trackEnabled ? 'ON' : 'OFF'} • ${patch.pingInterval}s • retensi ${patch.retentionDays}d`, { safe: `📍 Tracking settings diubah ${req.admin.sub}`, type: 'system' });
     res.json({ status: 'OK' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.get('/locations/:uid', requireAuth, async (req, res) => {
   try {
-    const d = await db.collection('user_locations').doc(req.params.uid).get();
-    if (!d.exists) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
-    await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: d.data().username });
-    res.json(serializeLocation(d));
+    let locData = null;
+    try {
+       const r = await redis.get(`loc:${req.params.uid}`);
+       if (r) locData = typeof r === 'string' ? JSON.parse(r) : r;
+    } catch (e) {}
+    
+    if (!locData) {
+        const d = await db.collection('user_locations').doc(req.params.uid).get();
+        if (d.exists) locData = d.data();
+    }
+    
+    if (!locData) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
+    await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: locData.username });
+    
+    res.json({
+        uid: req.params.uid, username: locData.username || null, packageName: locData.packageName || null,
+        lat: locData.lat, lng: locData.lng, accuracy: locData.accuracy, speed: locData.speed,
+        bearing: locData.bearing, battery: locData.battery, netType: locData.netType,
+        appState: locData.appState, consent: locData.consent === true, paused: locData.paused === true,
+        ts: locData.ts || null
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -821,14 +822,24 @@ router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
 router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
   try {
     const uid = req.params.uid;
+    const ts = new Date().toISOString();
     await db.collection('user_locations').doc(uid).set({
-      paused: true, stoppedBy: req.admin.sub, stoppedAt: new Date().toISOString()
+      paused: true, stoppedBy: req.admin.sub, stoppedAt: ts
     }, { merge: true });
+    
+    try {
+        let liveData = await redis.get(`loc:${uid}`);
+        if (liveData) {
+            if (typeof liveData === 'string') liveData = JSON.parse(liveData);
+            liveData.paused = true;
+            liveData.stoppedBy = req.admin.sub;
+            liveData.stoppedAt = ts;
+            await redis.set(`loc:${uid}`, JSON.stringify(liveData), { ex: 60 });
+        }
+    } catch(e){}
+
     await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
-    await notifyOps(
-      `🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`,
-      { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' }
-    );
+    await notifyOps(`🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`, { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' });
     res.json({ status: 'STOPPED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -862,12 +873,7 @@ router.post('/admins/:username/reset-password', requireAuth, requireOwner, async
     if (!t.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
     if (t.data().role === 'owner') return res.status(403).json({ error: 'Owner mengganti password lewat menu Ganti Password' });
     const epoch = (t.data().epoch || 0) + 1;
-    await db.collection('admin_accounts').doc(req.params.username).update({
-      passHash: await bcrypt.hash(newPassword, 10),
-      epoch,
-      failCount: 0,
-      lockedUntil: null
-    });
+    await db.collection('admin_accounts').doc(req.params.username).update({ passHash: await bcrypt.hash(newPassword, 10), epoch, failCount: 0, lockedUntil: null });
     await logAudit(req.admin.sub, 'ADMIN_RESET_PASS', req.params.username);
     await notifyOps(`🔑 <b>Password direset</b>: ${req.params.username} oleh ${req.admin.sub} (sesi lama diputus)`, { safe: `🔑 Reset pass: ${req.params.username}`, critical: true });
     res.json({ status: 'OK' });
@@ -894,9 +900,7 @@ router.post('/admins/:username/activate', requireAuth, requireOwner, async (req,
 router.get('/arcade/leaderboard', requireAuth, async (req, res) => {
   try {
     const range = req.query.range || 'weekly';
-    const since = range === 'daily' ? new Date(Date.now() - 86400000).toISOString()
-      : range === 'weekly' ? new Date(Date.now() - 7 * 86400000).toISOString()
-      : '1970-01-01T00:00:00Z';
+    const since = range === 'daily' ? new Date(Date.now() - 86400000).toISOString() : range === 'weekly' ? new Date(Date.now() - 7 * 86400000).toISOString() : '1970-01-01T00:00:00Z';
     const snap = await db.collection('arcade_scores').where('at', '>=', since).orderBy('at', 'desc').limit(500).get();
     const best = {};
     snap.docs.forEach(d => { const s = d.data(); if (!best[s.username] || s.score > best[s.username].score) best[s.username] = s; });
@@ -963,9 +967,7 @@ try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e
 router.post('/fcm-token', requireAuth, async (req, res) => {
   const token = String(req.body.token || '');
   if (!token) return res.status(400).json({ error: 'Token wajib' });
-  await db.collection('fcm_tokens').doc(req.admin.sub).set({
-    token, role: req.admin.role, updatedAt: new Date().toISOString()
-  });
+  await db.collection('fcm_tokens').doc(req.admin.sub).set({ token, role: req.admin.role, updatedAt: new Date().toISOString() });
   res.json({ status: 'OK' });
 });
 
@@ -990,14 +992,8 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Vercel.` });
 
   try {
-    const snap = await db.collection('bot_messages')
-      .where('chatId', '==', String(gid))
-      .limit(1000)
-      .get();
-
-    if (snap.empty) {
-      return res.json({ status: 'OK', deleted: 0, failed: 0, note: 'Data riwayat kosong.' });
-    }
+    const snap = await db.collection('bot_messages').where('chatId', '==', String(gid)).limit(1000).get();
+    if (snap.empty) return res.json({ status: 'OK', deleted: 0, failed: 0, note: 'Data riwayat kosong.' });
 
     const ids = snap.docs.map(d => d.data().messageId);
     const docRefs = snap.docs.map(d => d.ref);
@@ -1010,10 +1006,7 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
         deleted += batch.length;
       } catch (e) {
         for (const mid of batch) {
-          try { 
-            await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); 
-            deleted++; 
-          } catch (e2) { failed++; }
+          try { await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); deleted++; } catch (e2) { failed++; }
         }
       }
     }
@@ -1026,7 +1019,6 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
 
     await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted, failed });
     await notifyOps(`🧹 <b>Clean Grup</b> ${target} oleh ${req.admin.sub}: ${deleted} dihapus${failed ? `, ${failed} gagal` : ''}`, { safe: `🧹 Clean ${target}: ${deleted} dihapus` });
-    
     res.json({ status: 'OK', deleted, failed });
   } catch (e) {
     console.error('CLEAN ERROR', e.message);
@@ -1038,41 +1030,29 @@ router.post('/team/chat/clear', requireAuth, requireOwner, async (req, res) => {
   try {
     const countSnap = await db.collection('team_chat').count().get();
     const total = countSnap.data().count || 0;
-    
-    if (total === 0) {
-      return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
-    }
+    if (total === 0) return res.json({ status: 'OK', deleted: 0, note: 'Chat sudah kosong' });
 
     let deleted = 0;
     const BATCH_SIZE = 400;
-    
     while (true) {
       const snap = await db.collection('team_chat').limit(BATCH_SIZE).get();
       if (snap.empty) break;
-      
       const batch = db.batch();
       snap.docs.forEach(doc => batch.delete(doc.ref));
       await batch.commit();
       deleted += snap.size;
-      
       if (snap.size < BATCH_SIZE) break;
     }
 
     const metaSnap = await db.collection('team_meta').get();
     if (!metaSnap.empty) {
       const resetBatch = db.batch();
-      metaSnap.docs.forEach(doc => {
-        resetBatch.update(doc.ref, { lastChatRead: '1970-01-01T00:00:00Z' });
-      });
+      metaSnap.docs.forEach(doc => { resetBatch.update(doc.ref, { lastChatRead: '1970-01-01T00:00:00Z' }); });
       await resetBatch.commit();
     }
 
     await logAudit(req.admin.sub, 'CLEAR_ALL_CHAT', null, { deleted });
-    await notifyOps(`🧹 <b>Chat Tim Dibersihkan</b> oleh ${req.admin.sub}: ${deleted} pesan dihapus permanen`, { 
-      safe: `🧹 Chat tim dibersihkan oleh ${req.admin.sub}`, 
-      type: 'critical' 
-    });
-
+    await notifyOps(`🧹 <b>Chat Tim Dibersihkan</b> oleh ${req.admin.sub}: ${deleted} pesan dihapus permanen`, { safe: `🧹 Chat tim dibersihkan oleh ${req.admin.sub}`, type: 'critical' });
     res.json({ status: 'OK', deleted });
   } catch (e) {
     console.error('CLEAR CHAT ERROR:', e.message);
@@ -1113,13 +1093,9 @@ const AI_MAX = 50;
 const iso = (t) => (t && t.toDate) ? t.toDate().toISOString() : (t || null);
 
 const maskUser = (u) => ({
-  uid: u.uid || u.id || null,
-  username: u.username || null,
+  uid: u.uid || u.id || null, username: u.username || null,
   email: u.email ? (String(u.email).split('@')[0].slice(0, 2) + '***@' + (String(u.email).split('@')[1] || '')) : null,
-  status: u.status || null,
-  expiredAt: iso(u.expiredAt),
-  createdAt: u.createdAt || null,
-  hwidBound: !!u.deviceId
+  status: u.status || null, expiredAt: iso(u.expiredAt), createdAt: u.createdAt || null, hwidBound: !!u.deviceId
 });
 
 const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
@@ -1268,11 +1244,7 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
     for (let round = 0; round < 3; round++) {
       const r = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
         model: process.env.AI_MODEL || 'qwen/qwen3.8-27b',
-        messages,
-        tools: AI_TOOLS,
-        tool_choice: 'auto',
-        temperature: 0.4,
-        max_tokens: 1024
+        messages, tools: AI_TOOLS, tool_choice: 'auto', temperature: 0.4, max_tokens: 1024
       }, {
         headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
         timeout: 6000
@@ -1297,7 +1269,6 @@ router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
 
     const newHist = [...history, { role: 'user', content: q }, { role: 'assistant', content: answer }].slice(-6);
     await db.collection('ai_chats').doc(req.admin.sub).set({ history: newHist, updatedAt: new Date().toISOString() });
-
     res.json({ answer, quotaLeft: AI_MAX - used - 1 });
   } catch (e) {
     console.error('AI ERROR:', e.response ? JSON.stringify(e.response.data) : e.message);
