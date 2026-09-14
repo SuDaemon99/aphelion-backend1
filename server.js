@@ -149,7 +149,8 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
 };
 
 // ===== 📍 LOCATION PING (dari app produksi, auth via token lisensi) =====
-const pingLimiter = rateLimit({ windowMs: 20 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
+// 🔥 PATCH: Turunkan batas limit ping ke 2 detik biar bener-bener LIVE
+const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
 
 app.post('/api/user/ping', pingLimiter, async (req, res) => {
   try {
