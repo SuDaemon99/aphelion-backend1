@@ -747,7 +747,7 @@ const serializeLocation = (d) => {
   };
 };
 
-// GET /locations — semua lokasi user terbaru (owner + admin)
+// 1. GET /locations — semua lokasi user terbaru (owner + admin)
 router.get('/locations', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
@@ -767,7 +767,8 @@ router.get('/locations', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /locations/stats — ringkasan (owner + admin)
+// 2. GET /locations/stats — ringkasan (owner + admin)
+// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.get('/locations/stats', requireAuth, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
@@ -789,50 +790,8 @@ router.get('/locations/stats', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /locations/:uid — detail 1 user + AUDIT (owner + admin)
-router.get('/locations/:uid', requireAuth, async (req, res) => {
-  try {
-    const d = await db.collection('user_locations').doc(req.params.uid).get();
-    if (!d.exists) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
-    // 🔒 AUDIT: setiap kali admin buka lokasi user
-    await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: d.data().username });
-    res.json(serializeLocation(d));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /locations/:uid/trail — jejak titik N jam terakhir (owner + admin)
-router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
-  try {
-    const hours = Math.min(parseInt(req.query.hours) || 24, 168); // max 7 hari
-    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
-    const snap = await db.collection('location_history').doc(req.params.uid).collection('points')
-      .where('ts', '>=', since).orderBy('ts', 'asc').limit(2000).get();
-    const points = snap.docs.map(d => {
-      const data = d.data();
-      return { lat: data.lat, lng: data.lng, accuracy: data.accuracy, speed: data.speed, bearing: data.bearing, ts: data.ts };
-    });
-    res.json({ uid: req.params.uid, hours, count: points.length, points });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST /locations/:uid/stop — matikan tracking per user (owner + admin)
-router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
-  try {
-    const uid = req.params.uid;
-    // Set paused=true di doc lokasi + hapus dari jejak terbaru biar admin lihat "admin stop"
-    await db.collection('user_locations').doc(uid).set({
-      paused: true, stoppedBy: req.admin.sub, stoppedAt: new Date().toISOString()
-    }, { merge: true });
-    await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
-    await notifyOps(
-      `🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`,
-      { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' }
-    );
-    res.json({ status: 'STOPPED' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /locations/settings — baca setting tracking (owner + admin)
+// 3. GET /locations/settings — baca setting tracking (owner + admin)
+// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.get('/locations/settings', requireAuth, async (req, res) => {
   try {
     const settings = await getTrackSettings();
@@ -840,7 +799,8 @@ router.get('/locations/settings', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /locations/settings — update master switch (OWNER ONLY)
+// 4. POST /locations/settings — update master switch (OWNER ONLY)
+// ⚠️ WAJIB DI ATAS /:uid biar nggak ketelan!
 router.post('/locations/settings', requireAuth, requireOwner, async (req, res) => {
   try {
     const { trackEnabled, pingInterval, retentionDays } = req.body || {};
@@ -860,32 +820,50 @@ router.post('/locations/settings', requireAuth, requireOwner, async (req, res) =
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= END LOCATION TRACKING =================
-
-// ================= SETTINGS [OWNER] =================
-router.post('/settings/update', requireAuth, requireOwner, async (req, res) => {
-  const { price, planDays } = req.body || {};
-  const patch = {};
-  if (price) patch.price = parseInt(price);
-  if (planDays) patch.planDays = parseInt(planDays);
-  if (req.body.vipHumans !== undefined) patch.vipHumans = parseInt(req.body.vipHumans);
-  if (req.body.publicHumans !== undefined) patch.publicHumans = parseInt(req.body.publicHumans);
-  if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Tidak ada yang diupdate' });
-  patch.updatedAt = new Date().toISOString();
-  patch.updatedBy = req.admin.sub;
-  await db.collection('settings').doc('app').set(patch, { merge: true });
-  await logAudit(req.admin.sub, 'SETTINGS_UPDATE', null, patch);
-  await notifyOps(`⚙️ <b>Settings</b> diubah ${req.admin.sub}`, { safe: `⚙️ Settings diubah ${req.admin.sub}` });
-
-  if (patch.price || patch.planDays) {
-    const cur = await db.collection('settings').doc('app').get();
-    const p = cur.exists && cur.data().price ? cur.data().price : 10000;
-    const d = cur.exists && cur.data().planDays ? cur.data().planDays : 30;
-    const info = await getTpl('settings_info', { harga: Number(p).toLocaleString('id-ID'), hari: d });
-    await broadcastAll(info);
-  }
-  res.json({ status: 'OK' });
+// 5. GET /locations/:uid — detail 1 user + AUDIT (owner + admin)
+// 👇 ROUTE DINAMIS (PAKAI PARAMETER) TARUH PALING BAWAH DARI GRUP INI
+router.get('/locations/:uid', requireAuth, async (req, res) => {
+  try {
+    const d = await db.collection('user_locations').doc(req.params.uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'Lokasi tidak ditemukan' });
+    // 🔒 AUDIT: setiap kali admin buka lokasi user
+    await logAudit(req.admin.sub, 'LOCATION_VIEW', req.params.uid, { username: d.data().username });
+    res.json(serializeLocation(d));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// 6. GET /locations/:uid/trail — jejak titik N jam terakhir (owner + admin)
+router.get('/locations/:uid/trail', requireAuth, async (req, res) => {
+  try {
+    const hours = Math.min(parseInt(req.query.hours) || 24, 168); // max 7 hari
+    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+    const snap = await db.collection('location_history').doc(req.params.uid).collection('points')
+      .where('ts', '>=', since).orderBy('ts', 'asc').limit(2000).get();
+    const points = snap.docs.map(d => {
+      const data = d.data();
+      return { lat: data.lat, lng: data.lng, accuracy: data.accuracy, speed: data.speed, bearing: data.bearing, ts: data.ts };
+    });
+    res.json({ uid: req.params.uid, hours, count: points.length, points });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 7. POST /locations/:uid/stop — matikan tracking per user (owner + admin)
+router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    await db.collection('user_locations').doc(uid).set({
+      paused: true, stoppedBy: req.admin.sub, stoppedAt: new Date().toISOString()
+    }, { merge: true });
+    await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
+    await notifyOps(
+      `🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`,
+      { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' }
+    );
+    res.json({ status: 'STOPPED' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ================= END LOCATION TRACKING =================
 
 // ================= ADMIN ACCOUNTS [OWNER] =================
 router.get('/admins', requireAuth, requireOwner, async (req, res) => {
