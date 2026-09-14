@@ -155,7 +155,7 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
-// ===== 📍 LOCATION PING (HYBRID: REDIS + FIRESTORE) =====
+// ===== 📍 LOCATION PING (FULL CACHE REDIS + FIRESTORE HYBRID) =====
 const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
 
 app.post('/api/user/ping', pingLimiter, async (req, res) => {
@@ -164,21 +164,41 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
     if (!token || !deviceId) return res.status(400).json({ error: 'Token & deviceId wajib' });
     if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
-    // 1. Cek master switch
-    const settingsDoc = await db.collection('settings').doc('app').get();
-    const settings = settingsDoc.exists ? settingsDoc.data() : {};
-    if (settings.trackEnabled !== true) return res.status(403).json({ status: 'TRACKING_DISABLED' });
+    let u = null;
+    let uid = null;
+    let trackEnabled = false;
 
-    // 2. Validasi token + deviceId
-    const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
-    if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
-    const userDoc = snapUsers.docs[0];
-    const u = userDoc.data();
-    const uid = userDoc.id;
+    // 🔥 1. CEK CACHE REDIS DULU (Biar hemat jatah Read Firestore)
+    const cacheKey = `auth_cache:${token}`;
+    let cachedAuth = null;
+    try { cachedAuth = await redis.get(cacheKey); } catch (e) {}
 
+    if (cachedAuth) {
+      // ✅ Data ada di memori RAM, tidak perlu sentuh Firestore sama sekali!
+      const parsed = typeof cachedAuth === 'string' ? JSON.parse(cachedAuth) : cachedAuth;
+      u = parsed.user;
+      uid = parsed.uid;
+      trackEnabled = parsed.trackEnabled;
+    } else {
+      // 🐢 Data nggak ada di RAM, terpaksa narik Firestore (CUMA TERJADI 1x SETIAP 10 MENIT)
+      const settingsDoc = await db.collection('settings').doc('app').get();
+      trackEnabled = settingsDoc.exists ? (settingsDoc.data().trackEnabled === true) : false;
+
+      const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
+      if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
+      
+      uid = snapUsers.docs[0].id;
+      u = snapUsers.docs[0].data();
+
+      // Simpan ke Redis selama 10 menit (600 detik)
+      try { 
+        await redis.set(cacheKey, JSON.stringify({ uid, user: u, trackEnabled }), { ex: 600 }); 
+      } catch (e) {}
+    }
+
+    if (!trackEnabled) return res.status(403).json({ status: 'TRACKING_DISABLED' });
     if (u.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
     if (u.deviceId && u.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
-
     if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
     
     if (paused === true) {
@@ -186,12 +206,12 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
         uid, username: u.username || null, packageName: u.packageName || null,
         paused: true, consent: true, ts: new Date().toISOString()
       };
-      await db.collection('user_locations').doc(uid).set(pData, { merge: true });
+      // Usahakan hemat Firestore untuk paused
       try { await redis.set(`loc:${uid}`, JSON.stringify(pData), { ex: 60 }); } catch(e){}
       return res.status(200).json({ status: 'PAUSED' });
     }
 
-    // 4. Simpan lokasi ke REDIS & FIRESTORE
+    // 2. Siapkan titik kordinat
     const now = new Date();
     const point = {
       uid, username: u.username || null, packageName: u.packageName || null,
@@ -203,36 +223,22 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
       consent: true, paused: false, ts: now.toISOString()
     };
 
-    // 🔥 TULIS KE REDIS (True Live Tracking - 0 Quota Firestore)
+    // 🔥 3. TULIS LOKASI LIVE KE REDIS (True Live Tracking - 0 Quota Firestore)
     try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
     catch(redisErr) { console.error("Redis Error:", redisErr.message); }
 
-    // 🔥 TULIS KE FIRESTORE (Hanya 5 Menit Sekali per User)
+    // 🐢 4. TULIS JEJAK KE FIRESTORE (Hanya 5 Menit Sekali per User)
     try {
         const lastDbWrite = await redis.get(`last_db_write:${uid}`);
         if (!lastDbWrite) {
-          // Update lokasi terakhir di Firestore (Jaga-jaga kalau Redis expired)
           await db.collection('user_locations').doc(uid).set(point, { merge: true });
-          
-          // Tambah titik jejak (trail)
           await db.collection('location_history').doc(uid).collection('points').add({
             lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
           });
-          
-          // Cap Firestore trail limit (tetap di dalam blok 5 menit biar hemat)
-          const totalSnap = await db.collection('location_history').doc(uid).collection('points').count().get();
-          if ((totalSnap.data().count || 0) > 500) {
-            const oldSnap = await db.collection('location_history').doc(uid).collection('points').orderBy('ts', 'asc').limit(50).get();
-            if (!oldSnap.empty) {
-              const batch = db.batch();
-              oldSnap.docs.forEach(d => batch.delete(d.ref));
-              await batch.commit();
-            }
-          }
-          // Kunci selama 5 menit (300 detik)
+          // Kunci 5 menit (300 detik)
           await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
         }
-    } catch (dbErr) { console.error("DB Trail Error:", dbErr.message); }
+    } catch (dbErr) { /* Abaikan kalau gagal tulis jejak */ }
 
     res.status(200).json({ status: 'OK', ts: now.toISOString() });
   } catch (e) {
