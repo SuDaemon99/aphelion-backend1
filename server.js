@@ -164,36 +164,41 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
     if (!token || !deviceId) return res.status(400).json({ error: 'Token & deviceId wajib' });
     if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
-    let u = null;
-    let uid = null;
-    let trackEnabled = false;
-
-    // 🔥 1. CEK CACHE REDIS DULU (Biar hemat jatah Read Firestore)
+    let u = null, uid = null, trackEnabled = false;
     const cacheKey = `auth_cache:${token}`;
+
+    // ✅ 1. CEK REDIS DENGAN ERROR HANDLING YANG BENAR
     let cachedAuth = null;
-    try { cachedAuth = await redis.get(cacheKey); } catch (e) {}
+    try { 
+      cachedAuth = await redis.get(cacheKey); 
+    } catch (e) { 
+      console.error("🚨 REDIS AUTH CACHE ERROR:", e.message);
+      // CRITICAL: Jangan fallback ke Firestore! Tolak request dengan aman agar kuota tidak habis.
+      return res.status(503).json({ status: 'SYNC_PAUSED', message: 'Server sedang sinkronisasi' });
+    }
 
     if (cachedAuth) {
-      // ✅ Data ada di memori RAM, tidak perlu sentuh Firestore sama sekali!
       const parsed = typeof cachedAuth === 'string' ? JSON.parse(cachedAuth) : cachedAuth;
       u = parsed.user;
       uid = parsed.uid;
       trackEnabled = parsed.trackEnabled;
     } else {
-      // 🐢 Data nggak ada di RAM, terpaksa narik Firestore (CUMA TERJADI 1x SETIAP 10 MENIT)
-      const settingsDoc = await db.collection('settings').doc('app').get();
-      trackEnabled = settingsDoc.exists ? (settingsDoc.data().trackEnabled === true) : false;
+      // 🐢 Fallback ke Firestore HANYA jika Redis benar-benar kosong (cache miss normal)
+      try {
+        const settingsDoc = await db.collection('settings').doc('app').get();
+        trackEnabled = settingsDoc.exists ? (settingsDoc.data().trackEnabled === true) : false;
 
-      const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
-      if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
-      
-      uid = snapUsers.docs[0].id;
-      u = snapUsers.docs[0].data();
+        const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
+        if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
+        
+        uid = snapUsers.docs[0].id;
+        u = snapUsers.docs[0].data();
 
-      // Simpan ke Redis selama 10 menit (600 detik)
-      try { 
         await redis.set(cacheKey, JSON.stringify({ uid, user: u, trackEnabled }), { ex: 600 }); 
-      } catch (e) {}
+      } catch (dbErr) {
+        console.error("🚨 FIRESTORE FALLBACK ERROR:", dbErr.message);
+        return res.status(503).json({ status: 'SYNC_PAUSED', message: 'Database sedang sibuk' });
+      }
     }
 
     if (!trackEnabled) return res.status(403).json({ status: 'TRACKING_DISABLED' });
@@ -202,32 +207,25 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
     if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
     
     if (paused === true) {
-      const pData = {
-        uid, username: u.username || null, packageName: u.packageName || null,
-        paused: true, consent: true, ts: new Date().toISOString()
-      };
-      // Usahakan hemat Firestore untuk paused
-      try { await redis.set(`loc:${uid}`, JSON.stringify(pData), { ex: 60 }); } catch(e){}
+      try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
+      catch(e){ console.error("Redis paused error:", e.message); }
       return res.status(200).json({ status: 'PAUSED' });
     }
 
-    // 2. Siapkan titik kordinat
     const now = new Date();
     const point = {
       uid, username: u.username || null, packageName: u.packageName || null,
       lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
-      speed: typeof speed === 'number' ? speed : null,
-      bearing: typeof bearing === 'number' ? bearing : null,
-      battery: typeof battery === 'number' ? battery : null,
-      netType: netType || null, appState: appState || 'foreground',
-      consent: true, paused: false, ts: now.toISOString()
+      speed: typeof speed === 'number' ? speed : null, bearing: typeof bearing === 'number' ? bearing : null,
+      battery: typeof battery === 'number' ? battery : null, netType: netType || null, 
+      appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
     };
 
-    // 🔥 3. TULIS LOKASI LIVE KE REDIS (True Live Tracking - 0 Quota Firestore)
+    // ✅ 2. TULIS KE REDIS (Jika gagal, abaikan, JANGAN tembak Firestore)
     try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
-    catch(redisErr) { console.error("Redis Error:", redisErr.message); }
+    catch(redisErr) { console.error("Redis loc error:", redisErr.message); }
 
-    // 🐢 4. TULIS JEJAK KE FIRESTORE (Hanya 5 Menit Sekali per User)
+    // ✅ 3. TULIS JEJAK KE FIRESTORE (Hanya jika Redis last_db_write berhasil dibaca)
     try {
         const lastDbWrite = await redis.get(`last_db_write:${uid}`);
         if (!lastDbWrite) {
@@ -235,10 +233,12 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
           await db.collection('location_history').doc(uid).collection('points').add({
             lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
           });
-          // Kunci 5 menit (300 detik)
-          await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
+          await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); 
         }
-    } catch (dbErr) { /* Abaikan kalau gagal tulis jejak */ }
+    } catch (dbErr) { 
+        console.error("🚨 FIRESTORE WRITE ERROR:", dbErr.message);
+        // Jangan biarkan error ini menyebabkan loop write
+    }
 
     res.status(200).json({ status: 'OK', ts: now.toISOString() });
   } catch (e) {
