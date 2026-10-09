@@ -312,7 +312,7 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/finance/summary', requireAuth, requireOwner, async (req, res) => {
+router.get('/finance/summary', requireAuth, requireApprover, async (req, res) => {
   try {
     const range = req.query.range || '7d';
     const days = range === 'today' ? 1 : range === '30d' ? 30 : 7;
@@ -326,7 +326,7 @@ router.get('/finance/summary', requireAuth, requireOwner, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/transactions', requireAuth, requireOwner, async (req, res) => {
+router.get('/transactions', requireAuth, requireApprover, async (req, res) => {
   const limit = 20;
   let ref = db.collection('transactions').orderBy('paidAt', 'desc').limit(limit);
   if (req.query.cursor) ref = ref.startAfter(String(req.query.cursor));
@@ -531,15 +531,14 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     else if (types.includes('critical')) sound = 'critical';
     else if (types.includes('maint')) sound = 'maint';
     else if (types.includes('login')) sound = 'login';
-        let financePending = 0;
+            let financePending = 0; let canApprove = false;
     try {
       const setDoc2 = await db.collection('settings').doc('app').get();
       const approvers = (setDoc2.exists && setDoc2.data().financeApprovers) || ['admin1'];
-      if (req.admin.role === 'owner' || approvers.includes(req.admin.sub)) {
-        financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
-      }
+      canApprove = req.admin.role === 'owner' || approvers.includes(req.admin.sub);
+      if (canApprove) financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
     } catch (e) { /* abaikan */ }
-    res.json({ chat, feed: feedSnap.size, sound, financePending });
+    res.json({ chat, feed: feedSnap.size, sound, financePending, canApprove });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1532,6 +1531,38 @@ router.post('/finance/backfill', requireAuth, requireOwner, async (req, res) => 
     await logAudit(req.admin.sub, 'FINANCE_BACKFILL', null, { days });
     await notifyOps(`🛠 <b>Buku besar direparasi</b> oleh ${req.admin.sub} (${days} hari)`, { safe: `🛠 Backfill finance ${days} hari` });
     res.json({ status: 'OK', days: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🗑 PURGE TRANSAKSI TEST / SALAH INPUT [OWNER] + koreksi buku besar otomatis
+router.post('/finance/transactions/:id/purge', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const d = await db.collection('transactions').doc(id).get();
+    if (!d.exists) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    const t = d.data();
+    const dateKey = String(t.paidAt || '').slice(0, 10);
+    if (t.status !== 'void' && dateKey) {
+      const dayRef = db.collection('finance_daily').doc(dateKey);
+      const day = await dayRef.get();
+      if (day.exists) {
+        await dayRef.update({
+          gross: Math.max(0, (day.data().gross || 0) - (t.amount || 0)),
+          count: Math.max(0, (day.data().count || 1) - 1)
+        });
+      }
+      const tot = await db.collection('finance_total').doc('all').get();
+      if (tot.exists) {
+        await db.collection('finance_total').doc('all').update({
+          gross: Math.max(0, (tot.data().gross || 0) - (t.amount || 0)),
+          count: Math.max(0, (tot.data().count || 1) - 1)
+        });
+      }
+    }
+    await d.ref.delete();
+    await logAudit(req.admin.sub, 'FINANCE_PURGE_TX', id, { orderId: t.orderId, amount: t.amount });
+    await notifyOps(`🗑 <b>Transaksi dipurge</b> oleh ${req.admin.sub}\n${t.orderId} • Rp ${(t.amount || 0).toLocaleString('id-ID')}`, { safe: `🗑 Purge tx ${t.orderId}`, critical: true });
+    res.json({ status: 'PURGED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 module.exports = router;
