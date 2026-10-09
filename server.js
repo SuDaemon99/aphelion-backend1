@@ -255,6 +255,49 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (update.callback_query) {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
+            if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
+        const [action, pid] = cb.data.split(':');
+        await answerCallbackQuery(cb.id, 'Memproses...');
+        if (String(cb.from.id) !== String(process.env.OWNER_TELEGRAM_ID)) {
+          try { await sendTelegramMessage(cb.message.chat.id, '⛔ Approve via Telegram khusus OWNER. Admin1 approve lewat Admin Panel.'); } catch (e) {}
+          return res.status(200).json({ status: 'ok' });
+        }
+        if (action === 'pay_approve') {
+          const result = await approvePendingPayment(db, pid, cb.from.username || 'owner', 0);
+          if (!result.ok) {
+            try { await sendTelegramMessage(cb.message.chat.id, '❌ Gagal approve: ' + result.error); } catch (e) {}
+            return res.status(200).json({ status: 'ok' });
+          }
+          await finalizeApprovedPayment(db, {
+            sendTG: sendTelegramMessage, getTpl, createInviteLink,
+            vipGroupId: VIP_GROUP_ID, pushAll: pushAllAdmins, notifyOps
+          }, result);
+          try {
+            await axios.post(`${TELEGRAM_API}/editMessageText`, {
+              chat_id: cb.message.chat.id, message_id: cb.message.message_id,
+              text: `✅ <b>APPROVED</b> oleh @${cb.from.username || 'owner'}\nOrder: ${result.orderId}\nNominal: Rp ${result.amount.toLocaleString('id-ID')}\nUser: @${result.username || '-'} → ACTIVE s/d ${result.expiredAt.toLocaleDateString('id-ID')}`,
+              parse_mode: 'HTML'
+            });
+          } catch (e) {}
+          await logAudit('owner_tg', 'FINANCE_APPROVE', pid, { orderId: result.orderId, amount: result.amount });
+        } else {
+          const reason = 'Ditolak owner via Telegram';
+          await db.collection('pending_payments').doc(pid).update({ status: 'rejected', rejectedBy: cb.from.username || 'owner', rejectedAt: new Date().toISOString(), reason });
+          const pd = await db.collection('pending_payments').doc(pid).get();
+          if (pd.exists && pd.data().chatId) {
+            try { await sendTelegramMessage(pd.data().chatId, `❌ Pembayaran kamu ditolak. Alasan: ${reason}\nHubungi admin jika ini kesalahan.`); } catch (e) {}
+          }
+          try {
+            await axios.post(`${TELEGRAM_API}/editMessageText`, {
+              chat_id: cb.message.chat.id, message_id: cb.message.message_id,
+              text: `❌ <b>DITOLAK</b> oleh @${cb.from.username || 'owner'}\nAlasan: ${reason}`, parse_mode: 'HTML'
+            });
+          } catch (e) {}
+          await logAudit('owner_tg', 'FINANCE_REJECT', pid, { reason });
+        }
+        return res.status(200).json({ status: 'ok' });
+      }
+
       if (cb.data === 'trial_claim') {
         await answerCallbackQuery(cb.id, 'Memproses permintaan trial...');
         await db.collection('telegram_chats').doc(uid).set({
