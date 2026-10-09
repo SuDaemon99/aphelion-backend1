@@ -1,9 +1,9 @@
 // finance.js — MODUL PEMBUKUAN ATOMIK APHELION
-// Satu pintu pencatatan: jurnal (transactions) + buku besar (finance_daily/total)
+// Aturan emas Firestore: dalam runTransaction, SEMUA READ dulu, BARU WRITE.
 const { FieldValue } = require('firebase-admin/firestore');
 const crypto = require('crypto');
 
-// 🔥 SATU-SATUNYA PINTU PENCATATAN TRANSAKSI (anti bocor: jurnal & buku besar selalu sinkron)
+// 🔥 SATU-SATUNYA PINTU PENCATATAN TRANSAKSI (jurnal + buku besar atomik)
 async function recordTransaction(db, tx) {
   const {
     orderId, uid, amount, channel = 'gopay', mode = 'production',
@@ -19,16 +19,19 @@ async function recordTransaction(db, tx) {
     const dayRef = db.collection('finance_daily').doc(dateKey);
     const totRef = db.collection('finance_total').doc('all');
 
+    // ✅ FASE 1: SEMUA READ DILAKUKAN DULUAN (wajib sebelum write apa pun)
     const exist = await t.get(txRef);
+    const day = await t.get(dayRef);
+
     if (exist.exists) throw new Error('OrderId sudah tercatat (double entry ditolak)');
 
+    // ✅ FASE 2: BARU SEMUA WRITE (tidak ada read lagi setelah titik ini)
     t.set(txRef, {
       orderId, uid: uid || null, amount, status, channel, mode,
       email, note, source, createdBy, paidAt,
       createdAt: new Date().toISOString()
     });
 
-    const day = await t.get(dayRef);
     if (day.exists) {
       t.update(dayRef, {
         gross: FieldValue.increment(amount),
@@ -45,7 +48,7 @@ async function recordTransaction(db, tx) {
   return { orderId, dateKey };
 }
 
-// 🔥 AKTIVASI USER SETELAH PAYMENT DISAHKAN (logika sama persis dengan webhook Midtrans)
+// 🔥 AKTIVASI USER SETELAH PAYMENT DISAHKAN (logika sama dengan webhook Midtrans)
 async function activatePaymentUser(db, uid, planDays, channel) {
   const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
   const expiredDate = new Date();
@@ -61,7 +64,7 @@ async function activatePaymentUser(db, uid, planDays, channel) {
   const isNewUser = !existingUser.exists;
 
   await db.collection('users').doc(uid).set({
-    uid, username, email: emailSafe(uid),
+    uid, username, email: `gopay_${uid}@aphelion.id`,
     token: tokenMod,
     deviceId: existingUser.exists ? existingUser.data().deviceId : null,
     expiredAt: expiredDate, status: 'ACTIVE',
@@ -75,18 +78,17 @@ async function activatePaymentUser(db, uid, planDays, channel) {
 
   return { token: tokenMod, expiredAt: expiredDate, username, isNewUser };
 }
-const emailSafe = (uid) => `gopay_${uid}@aphelion.id`;
 
-// 🔥 APPROVE PENDING PAYMENT (anti double-approve via transaksi status flip)
+// 🔥 APPROVE PENDING PAYMENT (anti double-approve: flip status dalam transaksi)
 async function approvePendingPayment(db, pendingId, byName, editedAmount) {
   const ref = db.collection('pending_payments').doc(pendingId);
   let p = null;
   try {
     await db.runTransaction(async (t) => {
-      const d = await t.get(ref);
+      const d = await t.get(ref);           // read dulu
       if (!d.exists) throw new Error('Data tidak ditemukan');
       if (d.data().status !== 'pending') throw new Error('Sudah diproses sebelumnya (' + d.data().status + ')');
-      t.update(ref, { status: 'processing', approvedBy: byName, approvedAt: new Date().toISOString() });
+      t.update(ref, { status: 'processing', approvedBy: byName, approvedAt: new Date().toISOString() }); // write setelah semua read
       p = d.data();
     });
   } catch (e) {
@@ -112,6 +114,7 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
       token: act.token, expiredAt: act.expiredAt, isNewUser: act.isNewUser
     };
   } catch (e) {
+    // rollback: kembalikan ke pending biar bisa dicoba lagi
     await ref.update({ status: 'pending', approvedBy: null, approvedAt: null }).catch(() => {});
     return { ok: false, error: e.message };
   }
