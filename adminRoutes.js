@@ -1376,4 +1376,50 @@ router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, r
   res.json({ token: d.data().token || null });
 });
 
+// ================= 🗑 DELETE USER & PURGE PENDING [OWNER] =================
+router.delete('/users/:uid', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    const d = await db.collection('users').doc(uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const u = d.data();
+
+    // Best-effort: bersihkan data turunan biar tidak jadi sampah
+    try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) {}
+    try { await db.collection('user_locations').doc(uid).delete(); } catch (e) {}
+    try {
+      const pts = await db.collection('location_history').doc(uid).collection('points').limit(400).get();
+      if (!pts.empty) { const b = db.batch(); pts.docs.forEach(x => b.delete(x.ref)); await b.commit(); }
+      await db.collection('location_history').doc(uid).delete();
+    } catch (e) {}
+
+    await d.ref.delete();
+    await logAudit(req.admin.sub, 'USER_DELETE', uid, { status: u.status || null, source: u.source || null });
+    await notifyOps(`🗑 <b>User dihapus</b> oleh ${req.admin.sub}\nUID <code>${uid}</code> (${u.status || '-'})`, { safe: `🗑 User ${uid} dihapus ${req.admin.sub}`, critical: true });
+    res.json({ status: 'DELETED' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/users/purge-pending', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const days = parseInt(req.body.days) || 0; // 0 = SEMUA pending
+    const cutoff = days > 0 ? new Date(Date.now() - days * 86400000).toISOString() : null;
+    let deleted = 0;
+    while (true) {
+      const snap = await db.collection('users').where('status', '==', 'PENDING').limit(400).get();
+      if (snap.empty) break;
+      const targets = snap.docs.filter(x => !cutoff || (x.data().createdAt || '') < cutoff);
+      if (!targets.length) break;
+      const b = db.batch();
+      targets.forEach(x => b.delete(x.ref));
+      await b.commit();
+      deleted += targets.length;
+      if (snap.size < 400) break;
+    }
+    await logAudit(req.admin.sub, 'PURGE_PENDING', null, { days, deleted });
+    await notifyOps(`🧹 <b>Purge pending</b> oleh ${req.admin.sub}: ${deleted} token hangus dihapus`, { safe: `🧹 Purge pending: ${deleted} dihapus`, critical: true });
+    res.json({ status: 'OK', deleted });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
