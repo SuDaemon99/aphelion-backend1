@@ -6,8 +6,8 @@ const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken'); // 🔥 TAMBAHKAN INI DI SINI
-const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
+const jwt = require('jsonwebtoken'); // 🔥 TAMBAHAN: Library JWT
+const { Redis } = require('@upstash/redis');
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
@@ -64,8 +64,10 @@ const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || '-1003951848425';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-// 🔥 KONFIGURASI JWT UNTUK USER (Aman, fallback ke JWT_SECRET jika JWT_USER_SECRET belum di-set di Vercel)
+
+// 🔥 KONFIGURASI JWT UNTUK USER (Aman, fallback ke JWT_SECRET jika JWT_USER_SECRET belum di-set)
 const JWT_USER_SECRET = process.env.JWT_USER_SECRET || process.env.JWT_SECRET;
+
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const sendTelegramMessage = async (chatId, text, options = {}) => {
@@ -157,55 +159,29 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
-// ===== 📍 LOCATION PING (FULL CACHE REDIS + FIRESTORE HYBRID) =====
-const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.token || req.ip });
+// ===== 📍 LOCATION PING (ZERO READS FIRESTORE - JWT VERIFICATION) =====
+const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.jwt || req.ip });
 
 app.post('/api/user/ping', pingLimiter, async (req, res) => {
   try {
-    const { token, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
-    if (!token || !deviceId) return res.status(400).json({ error: 'Token & deviceId wajib' });
+    const { jwt: jwtToken, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
+    
+    if (!jwtToken) return res.status(401).json({ error: 'JWT Token wajib' });
     if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
-    let u = null, uid = null, trackEnabled = false;
-    const cacheKey = `auth_cache:${token}`;
-
-    // ✅ 1. CEK REDIS DENGAN ERROR HANDLING YANG BENAR
-    let cachedAuth = null;
-    try { 
-      cachedAuth = await redis.get(cacheKey); 
-    } catch (e) { 
-      console.error("🚨 REDIS AUTH CACHE ERROR:", e.message);
-      // CRITICAL: Jangan fallback ke Firestore! Tolak request dengan aman agar kuota tidak habis.
-      return res.status(503).json({ status: 'SYNC_PAUSED', message: 'Server sedang sinkronisasi' });
+    let decoded;
+    try {
+      // 🔥 MAGIC: Verifikasi tanda tangan kriptografi di RAM. 0 Reads Firestore!
+      decoded = jwt.verify(jwtToken, JWT_USER_SECRET);
+    } catch (e) {
+      return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid atau kedaluwarsa' });
     }
 
-    if (cachedAuth) {
-      const parsed = typeof cachedAuth === 'string' ? JSON.parse(cachedAuth) : cachedAuth;
-      u = parsed.user;
-      uid = parsed.uid;
-      trackEnabled = parsed.trackEnabled;
-    } else {
-      // 🐢 Fallback ke Firestore HANYA jika Redis benar-benar kosong (cache miss normal)
-      try {
-        const settingsDoc = await db.collection('settings').doc('app').get();
-        trackEnabled = settingsDoc.exists ? (settingsDoc.data().trackEnabled === true) : false;
-
-        const snapUsers = await db.collection('users').where('token', '==', token).limit(1).get();
-        if (snapUsers.empty) return res.status(404).json({ status: 'NOT_FOUND' });
-        
-        uid = snapUsers.docs[0].id;
-        u = snapUsers.docs[0].data();
-
-        await redis.set(cacheKey, JSON.stringify({ uid, user: u, trackEnabled }), { ex: 600 }); 
-      } catch (dbErr) {
-        console.error("🚨 FIRESTORE FALLBACK ERROR:", dbErr.message);
-        return res.status(503).json({ status: 'SYNC_PAUSED', message: 'Database sedang sibuk' });
-      }
-    }
-
-    if (!trackEnabled) return res.status(403).json({ status: 'TRACKING_DISABLED' });
-    if (u.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
-    if (u.deviceId && u.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
+    const uid = decoded.uid;
+    
+    // 🔥 VALIDASI KEAMANAN DI RAM
+    if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
+    if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
     if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
     
     if (paused === true) {
@@ -216,18 +192,17 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
 
     const now = new Date();
     const point = {
-      uid, username: u.username || null, packageName: u.packageName || null,
-      lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
+      uid, lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
       speed: typeof speed === 'number' ? speed : null, bearing: typeof bearing === 'number' ? bearing : null,
       battery: typeof battery === 'number' ? battery : null, netType: netType || null, 
       appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
     };
 
-    // ✅ 2. TULIS KE REDIS (Jika gagal, abaikan, JANGAN tembak Firestore)
+    // 1. Tulis ke Redis (Cepat, murah, tidak dihitung sebagai Firestore Read)
     try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
     catch(redisErr) { console.error("Redis loc error:", redisErr.message); }
 
-    // ✅ 3. TULIS JEJAK KE FIRESTORE (Hanya jika Redis last_db_write berhasil dibaca)
+    // 2. Tulis ke Firestore HANYA 1x per 5 menit per user (Batching)
     try {
         const lastDbWrite = await redis.get(`last_db_write:${uid}`);
         if (!lastDbWrite) {
@@ -235,14 +210,15 @@ app.post('/api/user/ping', pingLimiter, async (req, res) => {
           await db.collection('location_history').doc(uid).collection('points').add({
             lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
           });
+          // Kunci selama 5 menit (300 detik)
           await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); 
         }
     } catch (dbErr) { 
-        console.error("🚨 FIRESTORE WRITE ERROR:", dbErr.message);
-        // Jangan biarkan error ini menyebabkan loop write
+        // Abaikan error write, jangan sampai mengganggu response ke user
     }
 
-    res.status(200).json({ status: 'OK', ts: now.toISOString() });
+    // Kirim interval 60 detik ke Android agar tidak spam
+    res.status(200).json({ status: 'OK', ts: now.toISOString(), pingInterval: 60 });
   } catch (e) {
     console.error('PING ERROR:', e.message);
     res.status(500).json({ error: e.message });
@@ -629,10 +605,9 @@ const handleModLogin = async (req, res) => {
       return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Token terikat di perangkat lain.' });
     }
 
-        const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
+    const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
     if (pkg && !u.packageName) patchOk.packageName = pkg;
     await db.collection('users').doc(uid).update(patchOk);
-    
     await logAudit('system', 'USER_LOGIN', uid, { first: false, telegram: u.username ? `@${u.username}` : null, package: pkg || u.packageName || null, device: devLabel });
     await notifyOps(`🔔 <b>LOGIN</b>\n@${u.username || uid} • ${pkg || u.packageName || '-'}\n${devLabel}`, { safe: `🔔 Login: @${u.username || uid}`, type: 'login' });
     await pushAllAdmins('🔔 LOGIN', `@${u.username || uid} • ${devLabel}`, 'login');
@@ -647,7 +622,7 @@ const handleModLogin = async (req, res) => {
     const jwtToken = jwt.sign(jwtPayload, JWT_USER_SECRET, { expiresIn: '30d' });
 
     // 🔥 KIRIM JWT KE APLIKASI ANDROID
-        res.status(200).json({ 
+    res.status(200).json({ 
       status: 'ACTIVE', 
       firstLogin: false, 
       message: 'Otentikasi Berhasil!', 
@@ -660,7 +635,6 @@ const handleModLogin = async (req, res) => {
   }
 };
 
-// Baru setelah ini route-nya
 app.post('/api/mod/verify', modLoginLimiter, handleModLogin);
 app.post('/api/mod/login', modLoginLimiter, handleModLogin);
 
