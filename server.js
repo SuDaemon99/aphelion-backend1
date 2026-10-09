@@ -6,6 +6,7 @@ const cors = require('cors');
 const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken'); // 🔥 TAMBAHKAN INI DI SINI
 const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense } = require('./licenses');
