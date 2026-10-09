@@ -126,6 +126,30 @@ const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
 };
 
+// ===== 💰 SMART PAIRING: foto & nominal boleh menyusul (max 15 menit) =====
+const PROOF_TTL_MS = 15 * 60 * 1000;
+const proofRef = (uid) => db.collection('pending_proofs').doc(String(uid));
+
+const finalizeProof = async (uid, data) => {
+  const ref = await db.collection('pending_payments').add({
+    uid: String(uid), username: data.username || null, firstName: data.firstName || null,
+    amount: data.amount, channel: 'gopay', proofFileId: data.fileId || null,
+    caption: data.caption || '', status: 'pending',
+    createdAt: new Date().toISOString(), chatId: data.chatId || uid
+  });
+  const markup = { inline_keyboard: [[
+    { text: '✅ APPROVE', callback_data: `pay_approve:${ref.id}` },
+    { text: '❌ TOLAK', callback_data: `pay_reject:${ref.id}` }
+  ]] };
+  try {
+    await sendTelegramMessage(process.env.OWNER_TELEGRAM_ID,
+      `💰 <b>PEMBAYARAN MENUNGGU APPROVE</b>\nUID: <code>${uid}</code>\nUser: @${data.username || '-'}\nNominal: Rp ${data.amount.toLocaleString('id-ID')}\nChannel: GoPay\nCaption: ${escapeHtml(data.caption || '-')}\n\n<i>Edit nominal bisa lewat Admin Panel → Finance.</i>`,
+      { parse_mode: 'HTML', reply_markup: markup });
+  } catch (e) { console.error('Kirim kartu approve gagal:', e.message); }
+  await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${data.username || uid} • Rp ${data.amount.toLocaleString('id-ID')}`, { safe: `💰 Bukti bayar @${data.username || uid}`, type: 'pay' });
+  return ref.id;
+};
+
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
 const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
@@ -255,7 +279,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (update.callback_query) {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
-            if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
+
+      if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
         const [action, pid] = cb.data.split(':');
         await answerCallbackQuery(cb.id, 'Memproses...');
         if (String(cb.from.id) !== String(process.env.OWNER_TELEGRAM_ID)) {
@@ -313,6 +338,33 @@ app.post('/api/telegram-webhook', async (req, res) => {
       const msg = update.message;
       const uid = String(msg.from.id);
       const text = msg.text;
+
+      // 💰 SMART PAIRING: teks nominal (bukan command) di chat pribadi
+      if (msg.chat.type === 'private' && !text.startsWith('/')) {
+        const amt = parseAmount(text);
+        const pRef = proofRef(uid);
+        const pDoc = await pRef.get().catch(() => null);
+        const fresh = pDoc && pDoc.exists && (Date.now() - new Date(pDoc.data().updatedAt || 0).getTime()) < PROOF_TTL_MS;
+
+        if (amt && fresh && pDoc.data().fileId) {
+          // Foto sudah ada, nominal menyusul → COCOK
+          const d = pDoc.data();
+          await pRef.delete();
+          await finalizeProof(uid, { username: d.username, firstName: d.firstName, chatId: d.chatId || msg.chat.id, amount: amt, fileId: d.fileId, caption: text });
+          await sendTelegramMessage(msg.chat.id, `✅ Nominal Rp ${amt.toLocaleString('id-ID')} + foto cocok! Menunggu verifikasi owner/admin1.`);
+          return res.status(200).json({ status: 'ok' });
+        }
+        if (amt) {
+          // Nominal dulu, foto menyusul
+          await pRef.set({ uid, amount: amt, caption: text, username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id, fileId: null, updatedAt: new Date().toISOString() });
+          await sendTelegramMessage(msg.chat.id, `💵 Nominal Rp ${amt.toLocaleString('id-ID')} dicatat!\nSekarang kirim foto bukti transfernya 📸`, { parse_mode: 'HTML' });
+          return res.status(200).json({ status: 'ok' });
+        }
+        if (fresh && pDoc.data().fileId) {
+          await sendTelegramMessage(msg.chat.id, '❓ Nominal tidak terbaca. Ketik seperti ini:\n<code>bayar 20000</code>', { parse_mode: 'HTML' });
+          return res.status(200).json({ status: 'ok' });
+        }
+      }
 
       if (text.startsWith('/start trial') || text === '/start trial') {
         if (msg.chat.type === 'private') {
@@ -431,33 +483,38 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
     }
-    // ===== 💰 BUKTI BAYAR GOPAY (FOTO + CAPTION) =====
+
+    // ===== 💰 BUKTI BAYAR GOPAY (SMART PAIRING: foto & nominal boleh menyusul) =====
     if (update.message && update.message.photo && update.message.chat.type === 'private') {
       const msg = update.message;
       const uid = String(msg.from.id);
       const caption = msg.caption || '';
-      const amount = parseAmount(caption);
       const fileId = msg.photo[msg.photo.length - 1].file_id;
-      if (!amount) {
-        await sendTelegramMessage(msg.chat.id, '❓ Foto diterima tapi nominal tidak terbaca.\nKirim ulang dengan caption contoh: <code>bayar 15000</code>', { parse_mode: 'HTML' });
+      const base = { username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id };
+      const amount = parseAmount(caption);
+
+      // C1: foto + caption lengkap → langsung jadi kartu approve
+      if (amount) {
+        await finalizeProof(uid, { ...base, amount, fileId, caption });
+        await sendTelegramMessage(msg.chat.id, '✅ Bukti pembayaran diterima! Menunggu verifikasi owner/admin1.');
         return res.status(200).json({ status: 'ok' });
       }
-      const ref = await db.collection('pending_payments').add({
-        uid, username: msg.from.username || null, firstName: msg.from.first_name || null,
-        amount, channel: 'gopay', proofFileId: fileId, caption,
-        status: 'pending', createdAt: new Date().toISOString(), chatId: msg.chat.id
-      });
-      const markup = { inline_keyboard: [[
-        { text: '✅ APPROVE', callback_data: `pay_approve:${ref.id}` },
-        { text: '❌ TOLAK', callback_data: `pay_reject:${ref.id}` }
-      ]] };
-      try {
-        await sendTelegramMessage(process.env.OWNER_TELEGRAM_ID,
-          `💰 <b>PEMBAYARAN MENUNGGU APPROVE</b>\nUID: <code>${uid}</code>\nUser: @${msg.from.username || '-'} (${escapeHtml(msg.from.first_name || '')})\nNominal: Rp ${amount.toLocaleString('id-ID')}\nChannel: GoPay\nCaption: ${escapeHtml(caption || '-')}\n\n<i>Edit nominal bisa lewat Admin Panel → Finance.</i>`,
-          { parse_mode: 'HTML', reply_markup: markup });
-      } catch (e) { console.error('Kirim kartu approve gagal:', e.message); }
-      await sendTelegramMessage(msg.chat.id, '✅ Bukti pembayaran diterima! Menunggu verifikasi owner/admin1.');
-      await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${msg.from.username || uid} • Rp ${amount.toLocaleString('id-ID')}`, { safe: `💰 Bukti bayar @${msg.from.username || uid}`, type: 'pay' });
+
+      // C2: foto menyusul setelah nominal → jodohkan
+      const pRef = proofRef(uid);
+      const pDoc = await pRef.get();
+      if (pDoc.exists && pDoc.data().amount && (Date.now() - new Date(pDoc.data().updatedAt || 0).getTime()) < PROOF_TTL_MS) {
+        const amt = pDoc.data().amount;
+        const cap = pDoc.data().caption || caption;
+        await pRef.delete();
+        await finalizeProof(uid, { ...base, amount: amt, fileId, caption: cap });
+        await sendTelegramMessage(msg.chat.id, `✅ Foto + nominal Rp ${amt.toLocaleString('id-ID')} cocok! Menunggu verifikasi owner/admin1.`);
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      // C3: foto dulu, nominal menyusul → simpan & tagih nominal
+      await pRef.set({ uid, fileId, caption, username: base.username, firstName: base.firstName, chatId: base.chatId, amount: null, updatedAt: new Date().toISOString() });
+      await sendTelegramMessage(msg.chat.id, '📸 Foto bukti disimpan!\nSekarang ketik nominalnya, contoh:\n<code>bayar 20000</code>', { parse_mode: 'HTML' });
       return res.status(200).json({ status: 'ok' });
     }
 
