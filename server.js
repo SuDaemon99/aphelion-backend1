@@ -64,7 +64,8 @@ const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
 const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || '-1003951848425';
 const PAYMENT_WEB_URL = process.env.PAYMENT_WEB_URL || 'https://aphelion-pay.vercel.app';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-
+// 🔥 KONFIGURASI JWT UNTUK USER (Aman, fallback ke JWT_SECRET jika JWT_USER_SECRET belum di-set di Vercel)
+const JWT_USER_SECRET = process.env.JWT_USER_SECRET || process.env.JWT_SECRET;
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const sendTelegramMessage = async (chatId, text, options = {}) => {
