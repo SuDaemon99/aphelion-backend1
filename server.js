@@ -431,6 +431,35 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
     }
+    // ===== 💰 BUKTI BAYAR GOPAY (FOTO + CAPTION) =====
+    if (update.message && update.message.photo && update.message.chat.type === 'private') {
+      const msg = update.message;
+      const uid = String(msg.from.id);
+      const caption = msg.caption || '';
+      const amount = parseAmount(caption);
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      if (!amount) {
+        await sendTelegramMessage(msg.chat.id, '❓ Foto diterima tapi nominal tidak terbaca.\nKirim ulang dengan caption contoh: <code>bayar 15000</code>', { parse_mode: 'HTML' });
+        return res.status(200).json({ status: 'ok' });
+      }
+      const ref = await db.collection('pending_payments').add({
+        uid, username: msg.from.username || null, firstName: msg.from.first_name || null,
+        amount, channel: 'gopay', proofFileId: fileId, caption,
+        status: 'pending', createdAt: new Date().toISOString(), chatId: msg.chat.id
+      });
+      const markup = { inline_keyboard: [[
+        { text: '✅ APPROVE', callback_data: `pay_approve:${ref.id}` },
+        { text: '❌ TOLAK', callback_data: `pay_reject:${ref.id}` }
+      ]] };
+      try {
+        await sendTelegramMessage(process.env.OWNER_TELEGRAM_ID,
+          `💰 <b>PEMBAYARAN MENUNGGU APPROVE</b>\nUID: <code>${uid}</code>\nUser: @${msg.from.username || '-'} (${escapeHtml(msg.from.first_name || '')})\nNominal: Rp ${amount.toLocaleString('id-ID')}\nChannel: GoPay\nCaption: ${escapeHtml(caption || '-')}\n\n<i>Edit nominal bisa lewat Admin Panel → Finance.</i>`,
+          { parse_mode: 'HTML', reply_markup: markup });
+      } catch (e) { console.error('Kirim kartu approve gagal:', e.message); }
+      await sendTelegramMessage(msg.chat.id, '✅ Bukti pembayaran diterima! Menunggu verifikasi owner/admin1.');
+      await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${msg.from.username || uid} • Rp ${amount.toLocaleString('id-ID')}`, { safe: `💰 Bukti bayar @${msg.from.username || uid}`, type: 'pay' });
+      return res.status(200).json({ status: 'ok' });
+    }
 
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
