@@ -210,7 +210,7 @@ router.get('/users', requireAuth, async (req, res) => {
         .sort((a, b) => (b.u.expiredAt && b.u.expiredAt.toMillis ? b.u.expiredAt.toMillis() : 0) - (a.u.expiredAt && a.u.expiredAt.toMillis ? a.u.expiredAt.toMillis() : 0));
       return res.json({ users: sorted.map(x => serializeUser(x.id, x.u)), nextCursor: null });
     }
-    let ref = db.collection('users').orderBy('expiredAt', 'desc').limit(limit);
+    let ref = db.collection('users').orderBy('createdAt', 'asc').limit(limit);
     if (cursor) ref = ref.startAfter(new Date(parseInt(cursor)));
     const snap = await ref.get();
     const users = snap.docs.map(x => serializeUser(x.id, x.data()));
