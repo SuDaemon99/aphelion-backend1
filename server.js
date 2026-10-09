@@ -629,19 +629,38 @@ const handleModLogin = async (req, res) => {
       return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Token terikat di perangkat lain.' });
     }
 
-    const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
+        const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
     if (pkg && !u.packageName) patchOk.packageName = pkg;
     await db.collection('users').doc(uid).update(patchOk);
+    
     await logAudit('system', 'USER_LOGIN', uid, { first: false, telegram: u.username ? `@${u.username}` : null, package: pkg || u.packageName || null, device: devLabel });
     await notifyOps(`🔔 <b>LOGIN</b>\n@${u.username || uid} • ${pkg || u.packageName || '-'}\n${devLabel}`, { safe: `🔔 Login: @${u.username || uid}`, type: 'login' });
     await pushAllAdmins('🔔 LOGIN', `@${u.username || uid} • ${devLabel}`, 'login');
-    res.status(200).json({ status: 'ACTIVE', firstLogin: false, message: 'Otentikasi Berhasil!', expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null });
+
+    // 🔥 GENERATE JWT (KTP DIGITAL) DI SINI
+    const jwtPayload = {
+      uid: uid,
+      status: u.status,
+      expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
+      deviceId: deviceId // Mengikat JWT ke device ini agar tidak bisa dicopy ke HP lain
+    };
+    const jwtToken = jwt.sign(jwtPayload, JWT_USER_SECRET, { expiresIn: '30d' });
+
+    // 🔥 KIRIM JWT KE APLIKASI ANDROID
+        res.status(200).json({ 
+      status: 'ACTIVE', 
+      firstLogin: false, 
+      message: 'Otentikasi Berhasil!', 
+      expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
+      jwt: jwtToken // <--- INI KUNCINYA
+    });
   } catch (error) {
     console.error('MOD LOGIN ERROR:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
 
+// Baru setelah ini route-nya
 app.post('/api/mod/verify', modLoginLimiter, handleModLogin);
 app.post('/api/mod/login', modLoginLimiter, handleModLogin);
 
