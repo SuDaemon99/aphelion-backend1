@@ -9,7 +9,22 @@ const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
 const trial = require('./trial');
+const { recordTransaction, activatePaymentUser, approvePendingPayment, finalizeApprovedPayment } = require('./finance');
 
+const createInviteLinkLocal = async (chatId, options = {}) => {
+  const r = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: chatId, ...options });
+  return r.data.result;
+};
+
+// 🔥 GERBANG FINANCE: hanya OWNER + approver (default: admin1). List bisa diganti via settings.financeApprovers
+const requireApprover = async (req, res, next) => {
+  try {
+    const setDoc = await db.collection('settings').doc('app').get();
+    const approvers = (setDoc.exists && setDoc.data().financeApprovers) || ['admin1'];
+    if (req.admin.role === 'owner' || approvers.includes(req.admin.sub)) return next();
+    return res.status(403).json({ error: 'Khusus owner & finance approver (admin1)' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+};
 const db = getFirestore();
 const router = express.Router();
 
