@@ -13,6 +13,22 @@ const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
 const trial = require('./trial');
 
+const { approvePendingPayment, finalizeApprovedPayment } = require('./finance');
+
+// 💰 Parse nominal dari caption: "bayar 15000" / "rp 15.000" / "15k" / "15rb" / "15"
+const parseAmount = (text) => {
+  const t = String(text || '').toLowerCase().replace(/rp/g, ' ').trim();
+  let m = t.match(/(\d+(?:[.,]\d+)?)\s*(rb|ribu|k)\b/);
+  if (m) return Math.round(parseFloat(m[1].replace(',', '.')) * 1000);
+  m = t.match(/\d[\d.,]*/);
+  if (m) {
+    const num = parseFloat(m[0].replace(/\./g, '').replace(',', '.'));
+    if (!isNaN(num) && num >= 1000) return Math.round(num);
+    if (!isNaN(num) && num > 0) return Math.round(num * 1000); // "15" dianggap 15.000 (owner bisa edit sebelum approve)
+  }
+  return null;
+};
+
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
   throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 environment variable is missing!');
 }
