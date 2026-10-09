@@ -1445,4 +1445,90 @@ router.post('/users/purge-pending', requireAuth, requireOwner, async (req, res) 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ================= 💰 FINANCE: PENDING APPROVAL + MANUAL [APPROVER] =================
+router.get('/finance/pending', requireAuth, async (req, res) => {
+  try {
+    const snap = await db.collection('pending_payments').where('status', '==', 'pending').limit(50).get();
+    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    res.json({ pending: list });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/finance/pending/:id/approve', requireAuth, requireApprover, async (req, res) => {
+  try {
+    const edited = parseInt(req.body.amount) || 0; // 0 = pakai nominal auto-detect
+    const result = await approvePendingPayment(db, req.params.id, req.admin.sub, edited);
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    await finalizeApprovedPayment(db, {
+      sendTG: sendTG, getTpl, createInviteLink: createInviteLinkLocal,
+      vipGroupId: VIP_GROUP_ID, pushAll, notifyOps
+    }, result);
+    await logAudit(req.admin.sub, 'FINANCE_APPROVE', req.params.id, { orderId: result.orderId, amount: result.amount, edited: edited > 0 });
+    res.json({ status: 'APPROVED', orderId: result.orderId, amount: result.amount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/finance/pending/:id/reject', requireAuth, requireApprover, async (req, res) => {
+  try {
+    const reason = String(req.body.reason || 'Ditolak admin');
+    const d = await db.collection('pending_payments').doc(req.params.id).get();
+    if (!d.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
+    if (d.data().status !== 'pending') return res.status(409).json({ error: 'Sudah diproses' });
+    await d.ref.update({ status: 'rejected', rejectedBy: req.admin.sub, rejectedAt: new Date().toISOString(), reason });
+    try { await sendTG(d.data().chatId || d.data().uid, `❌ Pembayaran kamu ditolak. Alasan: ${reason}\nHubungi admin jika ini kesalahan.`); } catch (e) {}
+    await logAudit(req.admin.sub, 'FINANCE_REJECT', req.params.id, { reason });
+    await notifyOps(`❌ <b>Bukti bayar ditolak</b> oleh ${req.admin.sub}\nUID <code>${d.data().uid}</code> — ${reason}`, { safe: `❌ Bukti bayar ditolak ${req.admin.sub}` });
+    res.json({ status: 'REJECTED' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🧾 FALLBACK: catat manual (tunai/transfer/GoPay yang tidak lewat bot) — langsung POSTED + aktivasi
+router.post('/finance/record-manual', requireAuth, requireApprover, async (req, res) => {
+  try {
+    const uid = String(req.body.uid || '');
+    const amount = parseInt(req.body.amount) || 0;
+    const channel = String(req.body.channel || 'gopay');
+    const note = String(req.body.note || '');
+    if (!/^\d{5,15}$/.test(uid)) return res.status(400).json({ error: 'UID Telegram tidak valid' });
+    if (amount < 1000) return res.status(400).json({ error: 'Nominal minimal Rp 1.000' });
+    const orderId = 'MAN-' + Date.now();
+    const setDoc = await db.collection('settings').doc('app').get();
+    const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
+
+    await recordTransaction(db, { orderId, uid, amount, channel, source: 'manual', createdBy: req.admin.sub, note });
+    const act = await activatePaymentUser(db, uid, planDays, channel);
+    await finalizeApprovedPayment(db, {
+      sendTG: sendTG, getTpl, createInviteLink: createInviteLinkLocal,
+      vipGroupId: VIP_GROUP_ID, pushAll, notifyOps
+    }, { uid, amount, orderId, approvedBy: req.admin.sub, chatId: uid, username: act.username, token: act.token, expiredAt: act.expiredAt });
+    await logAudit(req.admin.sub, 'FINANCE_MANUAL', uid, { orderId, amount, channel });
+    res.json({ status: 'OK', orderId, token: act.token });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🛠 REPARASI BUKU BESAR: hitung ulang finance_daily dari jurnal (fix bug summary Rp 0 vs list Rp 15.000)
+router.post('/finance/backfill', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.body.days) || 30, 90);
+    const out = [];
+    for (let i = 0; i < days; i++) {
+      const dk = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      const snap = await db.collection('transactions')
+        .where('paidAt', '>=', dk + 'T00:00:00Z').where('paidAt', '<=', dk + 'T23:59:59Z').get();
+      let gross = 0, count = 0; const byChannel = {};
+      snap.docs.forEach(d => {
+        const t = d.data();
+        if (t.status === 'void') return;
+        gross += t.amount || 0; count++;
+        byChannel[t.channel || 'unknown'] = (byChannel[t.channel || 'unknown'] || 0) + (t.amount || 0);
+      });
+      await db.collection('finance_daily').doc(dk).set({ date: dk, gross, count, byChannel }, { merge: true });
+      out.push({ date: dk, gross, count });
+    }
+    await logAudit(req.admin.sub, 'FINANCE_BACKFILL', null, { days });
+    await notifyOps(`🛠 <b>Buku besar direparasi</b> oleh ${req.admin.sub} (${days} hari)`, { safe: `🛠 Backfill finance ${days} hari` });
+    res.json({ status: 'OK', days: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 module.exports = router;
