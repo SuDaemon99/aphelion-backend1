@@ -1451,7 +1451,10 @@ router.get('/finance/pending', requireAuth, async (req, res) => {
     const snap = await db.collection('pending_payments').where('status', '==', 'pending').limit(50).get();
     const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-    res.json({ pending: list });
+        const setDoc = await db.collection('settings').doc('app').get();
+    const approvers = (setDoc.exists && setDoc.data().financeApprovers) || ['admin1'];
+    const canApprove = req.admin.role === 'owner' || approvers.includes(req.admin.sub);
+    res.json({ pending: list, canApprove });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
