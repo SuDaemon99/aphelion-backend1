@@ -531,7 +531,15 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     else if (types.includes('critical')) sound = 'critical';
     else if (types.includes('maint')) sound = 'maint';
     else if (types.includes('login')) sound = 'login';
-    res.json({ chat, feed: feedSnap.size, sound });
+        let financePending = 0;
+    try {
+      const setDoc2 = await db.collection('settings').doc('app').get();
+      const approvers = (setDoc2.exists && setDoc2.data().financeApprovers) || ['admin1'];
+      if (req.admin.role === 'owner' || approvers.includes(req.admin.sub)) {
+        financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
+      }
+    } catch (e) { /* abaikan */ }
+    res.json({ chat, feed: feedSnap.size, sound, financePending });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
