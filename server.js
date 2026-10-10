@@ -165,6 +165,56 @@ app.get('/', (req, res) => {
   res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Vercel!' });
 });
 
+// ===== 🔑 SELF-SERVICE RECOVERY: RESET HWID & KIRIM TOKEN =====
+const shortPkg = (p) => p ? String(p).split('.').pop() : '-';
+const maskTok = (t) => !t ? '-' : (t.length > 8 ? t.slice(0, 4) + '-****-****-' + t.slice(-4) : t);
+
+const findLicensesByTg = async (tgUid, tgUsername) => {
+  const out = [];
+  try {
+    const d = await db.collection('users').doc(String(tgUid)).get();
+    if (d.exists) out.push({ id: d.id, ...d.data() });
+  } catch (e) {}
+  if (tgUsername) {
+    try {
+      const s = await db.collection('users').where('username', '==', String(tgUsername).toLowerCase()).limit(5).get();
+      s.docs.forEach(x => { if (!out.find(o => o.id === x.id)) out.push({ id: x.id, ...x.data() }); });
+    } catch (e) {}
+  }
+  return out;
+};
+
+const boundOk = (lic, from) =>
+  String(lic.id) === String(from.id) ||
+  (lic.username && String(lic.username).replace(/^@/, '').toLowerCase() === String(from.username || '').toLowerCase());
+
+const handleResetEntry = async (msg) => {
+  const tgUid = String(msg.from.id);
+  const tgUser = msg.from.username || null;
+  await db.collection('telegram_chats').doc(tgUid).set({
+    chatId: msg.chat.id, username: tgUser, firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+  }, { merge: true });
+  const lics = await findLicensesByTg(tgUid, tgUser);
+  if (!lics.length) {
+    await sendTelegramMessage(msg.chat.id, '❓ Tidak ditemukan lisensi atas akun Telegram ini.\nKalau kamu yakin punya token, hubungi admin lewat menu ✈️ di layar login.');
+    return;
+  }
+  const rows = lics.slice(0, 3).map(l => {
+    const st = l.status === 'ACTIVE' ? '🟢 ACTIVE' : l.status === 'EXPIRED' ? '🟠 EXPIRED' : l.status === 'PENDING' ? '🎫 PENDING' : '⚫ ' + (l.status || '-');
+    const exp = l.expiredAt && l.expiredAt.toDate ? l.expiredAt.toDate().toLocaleDateString('id-ID') : '-';
+    return `• <code>${l.packageName || '-'}</code> — ${st}\n  Token: <code>${maskTok(l.token)}</code> • Exp: ${exp}`;
+  }).join('\n');
+  const kb = { inline_keyboard: [] };
+  lics.slice(0, 3).forEach(l => {
+    kb.inline_keyboard.push([{ text: `🔄 Reset HWID — ${shortPkg(l.packageName)}`, callback_data: `rs_req:${l.id}` }]);
+    kb.inline_keyboard.push([{ text: `🔑 Kirim Ulang Token — ${shortPkg(l.packageName)}`, callback_data: `rs_token:${l.id}` }]);
+  });
+  kb.inline_keyboard.push([{ text: '💬 Chat Admin', url: 'https://t.me/' + (process.env.OWNER_TELEGRAM_USER || 'Mr_PH0B05') }]);
+  await sendTelegramMessage(msg.chat.id,
+    `🔐 <b>PULIHKAN AKSES</b>\nHalo @${tgUser || tgUid}! Lisensi terdaftar atas akunmu:\n\n${rows}\n\nPilih tindakan di bawah. Request reset perlu approval owner/admin1 (maks 1×24 jam).`,
+    { parse_mode: 'HTML', reply_markup: kb });
+};
+
 // ===== 🎁 HANDLER CLAIM TRIAL =====
 const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   try {
@@ -279,6 +329,81 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (update.callback_query) {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
+      // ===== 🔄 REQUEST RESET HWID (dari user) =====
+      if (cb.data && cb.data.startsWith('rs_req:')) {
+        const licId = cb.data.split(':')[1];
+        await answerCallbackQuery(cb.id, 'Memproses...');
+        const d = await db.collection('users').doc(licId).get();
+        if (!d.exists) { await sendTelegramMessage(cb.message.chat.id, '❌ Data lisensi tidak ditemukan.'); return res.status(200).json({ status: 'ok' }); }
+        const lic = d.data();
+        if (!boundOk(lic, cb.from)) { await sendTelegramMessage(cb.message.chat.id, '⛔ Lisensi ini tidak terikat ke akun Telegram kamu.'); return res.status(200).json({ status: 'ok' }); }
+        if (lic.status === 'BANNED' || lic.status === 'REVOKED') { await sendTelegramMessage(cb.message.chat.id, '⛔ Status lisensi ' + lic.status + '. Hubungi admin langsung.'); return res.status(200).json({ status: 'ok' }); }
+        if (lic.lastResetReqAt && Date.now() - new Date(lic.lastResetReqAt).getTime() < 7 * 86400000) {
+          await sendTelegramMessage(cb.message.chat.id, '⏳ Kamu sudah request reset dalam 7 hari terakhir. Tunggu respons admin atau chat langsung.'); return res.status(200).json({ status: 'ok' });
+        }
+        const req = await db.collection('reset_requests').add({
+          licId, tgUid: String(cb.from.id), username: cb.from.username || null,
+          oldDeviceId: lic.deviceId || null, status: 'pending', at: new Date().toISOString()
+        });
+        await d.ref.update({ lastResetReqAt: new Date().toISOString() });
+        const mk = { inline_keyboard: [[
+          { text: '✅ APPROVE RESET', callback_data: `rs_approve:${req.id}` },
+          { text: '❌ TOLAK', callback_data: `rs_reject:${req.id}` }
+        ]] };
+        try {
+          await sendTelegramMessage(process.env.OWNER_TELEGRAM_ID,
+            `🔄 <b>REQUEST RESET HWID</b>\nUser: @${cb.from.username || cb.from.id}\nApp: <code>${lic.packageName || '-'}</code>\nDevice lama: <code>${lic.deviceId || '-'}</code>\nStatus: ${lic.status || '-'}\n\nApprove = lepas ikatan device, user bisa login di HP baru.`,
+            { parse_mode: 'HTML', reply_markup: mk });
+        } catch (e) {}
+        await notifyOps(`🔄 <b>Request reset HWID</b>\n@${cb.from.username || cb.from.id} • ${lic.packageName || '-'}`, { safe: `🔄 Request reset @${cb.from.username || cb.from.id}`, type: 'critical' });
+        await pushAllAdmins('🔄 RESET HWID REQUEST', `@${cb.from.username || cb.from.id} • ${shortPkg(lic.packageName)}`, 'critical');
+        await sendTelegramMessage(cb.message.chat.id, '✅ Request terkirim! Kamu akan diberi tahu di chat ini begitu disetujui owner/admin1.');
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      // ===== 🔑 KIRIM ULANG TOKEN (rate-limit 24 jam) =====
+      if (cb.data && cb.data.startsWith('rs_token:')) {
+        const licId = cb.data.split(':')[1];
+        await answerCallbackQuery(cb.id, 'Memproses...');
+        const d = await db.collection('users').doc(licId).get();
+        if (!d.exists) { await sendTelegramMessage(cb.message.chat.id, '❌ Data lisensi tidak ditemukan.'); return res.status(200).json({ status: 'ok' }); }
+        const lic = d.data();
+        if (!boundOk(lic, cb.from)) { await sendTelegramMessage(cb.message.chat.id, '⛔ Lisensi ini tidak terikat ke akun Telegram kamu.'); return res.status(200).json({ status: 'ok' }); }
+        if (lic.lastSelfTokenAt && Date.now() - new Date(lic.lastSelfTokenAt).getTime() < 24 * 3600000) {
+          await sendTelegramMessage(cb.message.chat.id, '⏳ Token sudah dikirim ulang dalam 24 jam terakhir. Scroll chat lama atau hubungi admin.'); return res.status(200).json({ status: 'ok' });
+        }
+        await d.ref.update({ lastSelfTokenAt: new Date().toISOString() });
+        await sendTelegramMessage(cb.message.chat.id,
+          `🔑 Token lisensi kamu (<code>${lic.packageName || '-'}</code>):\n<code>${lic.token || '-'}</code>\n\n⚠️ JANGAN bagikan ke siapapun. Token terikat 1 device setelah login pertama.`,
+          { parse_mode: 'HTML' });
+        await logAudit('self:' + (cb.from.username || cb.from.id), 'TOKEN_SELF_RESEND', licId);
+        await notifyOps(`🔑 <b>Token self-resend</b>\n@${cb.from.username || cb.from.id} • ${lic.packageName || '-'}`, { safe: `🔑 Self-resend @${cb.from.username || cb.from.id}` });
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      // ===== ✅❌ APPROVE / REJECT RESET (khusus Owner via TG) =====
+      if (cb.data && (cb.data.startsWith('rs_approve:') || cb.data.startsWith('rs_reject:'))) {
+        const [act, reqId] = cb.data.split(':');
+        await answerCallbackQuery(cb.id, 'Memproses...');
+        if (String(cb.from.id) !== String(process.env.OWNER_TELEGRAM_ID)) {
+          await sendTelegramMessage(cb.message.chat.id, '⛔ Approve reset via Telegram khusus OWNER. Admin1 bisa lewat Admin Panel.'); return res.status(200).json({ status: 'ok' });
+        }
+        const r = await db.collection('reset_requests').doc(reqId).get();
+        if (!r.exists || r.data().status !== 'pending') { await sendTelegramMessage(cb.message.chat.id, 'Request sudah diproses sebelumnya.'); return res.status(200).json({ status: 'ok' }); }
+        const rd = r.data();
+        if (act === 'rs_approve') {
+          await db.collection('users').doc(rd.licId).update({ deviceId: null, deviceInfo: null });
+          await r.ref.update({ status: 'approved', by: cb.from.username || 'owner', decidedAt: new Date().toISOString() });
+          await logAudit('owner_tg', 'RESET_HWID', rd.licId, { via: 'self_request' });
+          try { await sendTelegramMessage(rd.tgUid, '✅ <b>Reset HWID disetujui!</b>\nBuka aplikasi dan login ulang pakai token kamu di perangkat baru. Jika token juga hilang, pakai tombol 🔑 Kirim Ulang Token.', { parse_mode: 'HTML' }); } catch (e) {}
+          try { await axios.post(`${TELEGRAM_API}/editMessageText`, { chat_id: cb.message.chat.id, message_id: cb.message.message_id, text: `✅ RESET APPROVED oleh @${cb.from.username || 'owner'} • UID ${rd.licId}`, parse_mode: 'HTML' }); } catch (e) {}
+        } else {
+          await r.ref.update({ status: 'rejected', by: cb.from.username || 'owner', decidedAt: new Date().toISOString() });
+          try { await sendTelegramMessage(rd.tgUid, '❌ Request reset HWID kamu ditolak. Hubungi admin untuk keterangan.'); } catch (e) {}
+          try { await axios.post(`${TELEGRAM_API}/editMessageText`, { chat_id: cb.message.chat.id, message_id: cb.message.message_id, text: `❌ RESET DITOLAK oleh @${cb.from.username || 'owner'} • UID ${rd.licId}`, parse_mode: 'HTML' }); } catch (e) {}
+        }
+        return res.status(200).json({ status: 'ok' });
+      }
 
       if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
         const [action, pid] = cb.data.split(':');
@@ -364,6 +489,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
           await sendTelegramMessage(msg.chat.id, '❓ Nominal tidak terbaca. Ketik seperti ini:\n<code>bayar 20000</code>', { parse_mode: 'HTML' });
           return res.status(200).json({ status: 'ok' });
         }
+      }
+      // 🔑 TANGKAP DEEP-LINK DARI APP (Lupa Token / Ganti HP)
+      if (msg.chat.type === 'private' && (text.startsWith('/start reset_') || text === '/pulihkan' || text.startsWith('/pulihkan '))) {
+        await handleResetEntry(msg);
+        return res.status(200).json({ status: 'ok' });
       }
 
       if (text.startsWith('/start trial') || text === '/start trial') {
