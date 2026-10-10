@@ -147,7 +147,45 @@ const finalizeProof = async (uid, data) => {
   await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${data.username || uid} • Rp ${data.amount.toLocaleString('id-ID')}`, { safe: `💰 Bukti bayar @${data.username || uid}`, type: 'pay' });
   return ref.id;
 };
+// ===== 💳 KARTU QRIS (pengganti halaman web) =====
+const sendQrisMessage = async (chatId) => {
+  const setDoc = await db.collection('settings').doc('app').get();
+  const st = setDoc.exists ? setDoc.data() : {};
+  const price = st.price ? parseInt(st.price) : 10000;
+  const planDays = st.planDays ? parseInt(st.planDays) : 30;
+  const caption = await getTpl('pay_qris', { price: price.toLocaleString('id-ID'), planDays });
+  const markup = { inline_keyboard: [
+    [ { text: '📖 PANDUAN LENGKAP', callback_data: 'pay_guide' }, { text: '🎁 TRIAL GRATIS', callback_data: 'trial_claim' } ],
+    [ { text: '💬 BANTUAN', url: 'https://t.me/' + (process.env.OWNER_TELEGRAM_USER || 'Mr_PH0B05') } ]
+  ] };
+  const fileId = st.qrisFileId || process.env.QRIS_FILE_ID || null;
+  if (fileId) {
+    try {
+      await axios.post(`${TELEGRAM_API}/sendPhoto`, {
+        chat_id: chatId, photo: fileId, caption,
+        parse_mode: 'HTML', reply_markup: markup
+      });
+      return;
+    } catch (e) { console.error('sendPhoto QRIS gagal:', e.message); }
+  }
+  await sendTelegramMessage(chatId,
+    '🖼 <b>Gambar QRIS belum dipasang.</b>\nOwner: kirim foto QRIS ke chat ini dengan caption <code>/setqris</code>\n\n' + caption,
+    { parse_mode: 'HTML', reply_markup: markup });
+};
 
+const sendPayGuide = async (chatId) => {
+  const setDoc = await db.collection('settings').doc('app').get();
+  const st = setDoc.exists ? setDoc.data() : {};
+  const price = st.price ? parseInt(st.price) : 10000;
+  const planDays = st.planDays ? parseInt(st.planDays) : 30;
+  const guide = await getTpl('pay_guide', { price: price.toLocaleString('id-ID'), planDays });
+  await sendTelegramMessage(chatId, guide, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [
+      [ { text: '🔙 KEMBALI KE QRIS', callback_data: 'pay_qris' }, { text: '🎁 TRIAL GRATIS', callback_data: 'trial_claim' } ]
+    ] }
+  });
+};
 console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
 
 const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
@@ -319,7 +357,19 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (update.callback_query) {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
-      
+
+            // ===== 💳 QRIS & PANDUAN (pengganti halaman web) =====
+      if (cb.data === 'pay_qris') {
+        await answerCallbackQuery(cb.id, 'Menyiapkan QRIS...');
+        await sendQrisMessage(cb.message.chat.id);
+        return res.status(200).json({ status: 'ok' });
+      }
+      if (cb.data === 'pay_guide') {
+        await answerCallbackQuery(cb.id, 'Memuat panduan...');
+        await sendPayGuide(cb.message.chat.id);
+        return res.status(200).json({ status: 'ok' });
+      }
+
       // ===== 🔄 REQUEST RESET HWID =====
       if (cb.data && cb.data.startsWith('rs_req:')) {
         const licId = cb.data.split(':')[1];
@@ -612,9 +662,9 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
             trialDays: trialSet.days
           });
 
-          const markup = {
+                    const markup = {
             inline_keyboard: [
-              [{ text: '💳 BAYAR VIP', url: payLink }],
+              [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
               [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
             ]
           };
@@ -676,6 +726,16 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
       const uid = String(msg.from.id);
       const caption = msg.caption || '';
       const fileId = msg.photo[msg.photo.length - 1].file_id;
+            // 🖼 /setqris — owner pasang/ganti gambar QRIS resmi
+      if (caption.trim().startsWith('/setqris')) {
+        if (String(uid) !== String(process.env.OWNER_TELEGRAM_ID)) {
+          await sendTelegramMessage(msg.chat.id, '⛔ Perintah ini khusus owner.');
+          return res.status(200).json({ status: 'ok' });
+        }
+        await db.collection('settings').doc('app').set({ qrisFileId: fileId, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
+        await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan!\nSemua tombol 💳 BAYAR VIA QRIS sekarang menampilkan gambar ini beserta panduan bayar.');
+        return res.status(200).json({ status: 'ok' });
+      }
       const base = { username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id };
       const amount = parseAmount(caption);
 
