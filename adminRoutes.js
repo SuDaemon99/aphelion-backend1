@@ -526,19 +526,47 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     const chat = chatSnap.docs.filter(x => x.data().sender !== req.admin.sub && x.data().deleted !== true).length;
     const feedSnap = await db.collection('ops_feed').where('at', '>', lastFeed).get();
     const types = feedSnap.docs.map(x => x.data().type || 'system');
-    let sound = null;
-    if (req.admin.role === 'owner' && types.includes('pay')) sound = 'pay';
-    else if (types.includes('critical')) sound = 'critical';
-    else if (types.includes('maint')) sound = 'maint';
-    else if (types.includes('login')) sound = 'login';
-            let financePending = 0; let canApprove = false;
+
+    // ===== 🔔 APPROVER CHECK (owner + financeApprovers) =====
+    let canApprove = false;
     try {
       const setDoc2 = await db.collection('settings').doc('app').get();
       const approvers = (setDoc2.exists && setDoc2.data().financeApprovers) || ['admin1'];
       canApprove = req.admin.role === 'owner' || approvers.includes(req.admin.sub);
-      if (canApprove) financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
+    } catch (e) {}
+
+    // ===== 🔊 SOUND PRIORITAS (buka 'pay' untuk approver, bukan owner saja) =====
+    let sound = null;
+    if (canApprove && types.includes('pay')) sound = 'pay';          // ✅ DIBUKA
+    else if (types.includes('critical')) sound = 'critical';
+    else if (types.includes('maint')) sound = 'maint';
+    else if (types.includes('login')) sound = 'login';
+
+    // ===== 💰 HITUNG PENDING + NOMINAL PERTAMA (untuk TTS app) =====
+    let financePending = 0;
+    let pendingFirstAmount = 0;
+    try {
+      if (canApprove) {
+        const pendingSnap = await db.collection('pending_payments')
+          .where('status', '==', 'pending')
+          .orderBy('createdAt', 'asc')
+          .limit(1)
+          .get();
+        financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
+        if (!pendingSnap.empty) {
+          pendingFirstAmount = parseInt(pendingSnap.docs[0].data().amount) || 0;
+        }
+      }
     } catch (e) { /* abaikan */ }
-    res.json({ chat, feed: feedSnap.size, sound, financePending, canApprove });
+
+    res.json({ 
+      chat, 
+      feed: feedSnap.size, 
+      sound, 
+      financePending, 
+      canApprove,
+      pendingFirstAmount   // 🆕 field baru untuk TTS
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
