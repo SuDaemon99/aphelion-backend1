@@ -542,22 +542,25 @@ router.get('/team/unread', requireAuth, async (req, res) => {
     else if (types.includes('maint')) sound = 'maint';
     else if (types.includes('login')) sound = 'login';
 
-    // ===== 💰 HITUNG PENDING + NOMINAL PERTAMA (untuk TTS app) =====
+        // ===== 💰 HITUNG PENDING + NOMINAL PERTAMA (untuk TTS app) =====
     let financePending = 0;
     let pendingFirstAmount = 0;
     try {
       if (canApprove) {
         const pendingSnap = await db.collection('pending_payments')
           .where('status', '==', 'pending')
-          .orderBy('createdAt', 'asc')
-          .limit(1)
+          .limit(50)
           .get();
-        financePending = (await db.collection('pending_payments').where('status', '==', 'pending').count().get()).data().count;
+        financePending = pendingSnap.size;
         if (!pendingSnap.empty) {
-          pendingFirstAmount = parseInt(pendingSnap.docs[0].data().amount) || 0;
+          const docs = pendingSnap.docs
+            .map(d => d.data())
+            .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+          pendingFirstAmount = parseInt(docs[0].amount) || 0;
         }
       }
-    } catch (e) { /* abaikan */ }
+    } catch (e) { console.error('UNREAD pending error:', e.message); }
+    console.log(`UNREAD ${req.admin.sub}: sound=${sound} pending=${financePending} amount=${pendingFirstAmount}`);
 
     res.json({ 
       chat, 
