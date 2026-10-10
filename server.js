@@ -29,6 +29,34 @@ const parseAmount = (text) => {
   return null;
 };
 
+// 🧠 DETEKSI CHANNEL DARI TEKS USER (gopay/ovo/shopeepay/dana/bank dll)
+const detectChannel = (text) => {
+  const t = String(text || '').toLowerCase();
+  if (t.includes('shopeepay') || t.includes('shopee') || t.includes('spay')) return 'shopeepay';
+  if (t.includes('ovo')) return 'ovo';
+  if (t.includes('dana')) return 'dana';
+  if (t.includes('gopay') || t.includes('go-pay')) return 'gopay';
+  if (t.includes('linkaja')) return 'linkaja';
+  if (t.includes('bca')) return 'bca';
+  if (t.includes('bri')) return 'bri';
+  if (t.includes('bni')) return 'bni';
+  if (t.includes('mandiri')) return 'mandiri';
+  if (t.includes('bsi') || t.includes('syariah')) return 'bsi';
+  if (t.includes('seabank') || t.includes('sea bank')) return 'seabank';
+  if (t.includes('bank') || t.includes('transfer') || t.includes('m-banking') || t.includes('mobile banking')) return 'bank';
+  return null;
+};
+
+// 🎛️ TOMBOL PILIHAN CHANNEL PEMBAYARAN
+const CHANNEL_KB = { inline_keyboard: [
+  [ { text: '💙 GoPay', callback_data: 'pay_ch:gopay' }, { text: '💜 OVO', callback_data: 'pay_ch:ovo' }, { text: '🧡 ShopeePay', callback_data: 'pay_ch:shopeepay' } ],
+  [ { text: '💛 DANA', callback_data: 'pay_ch:dana' }, { text: '🏦 Transfer Bank', callback_data: 'pay_ch:bank' }, { text: '❓ Lain/QRIS', callback_data: 'pay_ch:qris' } ]
+] };
+
+const sendChannelPicker = async (chatId) => {
+  await sendTelegramMessage(chatId, '💳 <b>Terakhir:</b> kamu bayar pakai aplikasi apa?\nKetuk salah satu di bawah:', { parse_mode: 'HTML', reply_markup: CHANNEL_KB });
+};
+
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
   throw new Error('FIREBASE_SERVICE_ACCOUNT_B64 environment variable is missing!');
 }
@@ -128,10 +156,12 @@ const kickFromGroup = async (userId) => {
 const PROOF_TTL_MS = 15 * 60 * 1000;
 const proofRef = (uid) => db.collection('pending_proofs').doc(String(uid));
 
+// ===== 💰 FINALIZE BUKTI BAYAR (dengan channel dinamis) =====
 const finalizeProof = async (uid, data) => {
+  const channelFinal = data.channel || 'qris';
   const ref = await db.collection('pending_payments').add({
     uid: String(uid), username: data.username || null, firstName: data.firstName || null,
-    amount: data.amount, channel: 'gopay', proofFileId: data.fileId || null,
+    amount: data.amount, channel: channelFinal, proofFileId: data.fileId || null,
     caption: data.caption || '', status: 'pending',
     createdAt: new Date().toISOString(), chatId: data.chatId || uid
   });
@@ -141,12 +171,13 @@ const finalizeProof = async (uid, data) => {
   ]] };
   try {
     await sendTelegramMessage(process.env.OWNER_TELEGRAM_ID,
-      `💰 <b>PEMBAYARAN MENUNGGU APPROVE</b>\nUID: <code>${uid}</code>\nUser: @${data.username || '-'}\nNominal: Rp ${data.amount.toLocaleString('id-ID')}\nChannel: GoPay\nCaption: ${escapeHtml(data.caption || '-')}\n\n<i>Edit nominal bisa lewat Admin Panel → Finance.</i>`,
+      `💰 <b>PEMBAYARAN MENUNGGU APPROVE</b>\nUID: <code>${uid}</code>\nUser: @${data.username || '-'}\nNominal: Rp ${data.amount.toLocaleString('id-ID')}\nChannel: <b>${channelFinal.toUpperCase()}</b>\nCaption: ${escapeHtml(data.caption || '-')}\n\n<i>Edit nominal bisa lewat Admin Panel → Finance.</i>`,
       { parse_mode: 'HTML', reply_markup: markup });
   } catch (e) { console.error('Kirim kartu approve gagal:', e.message); }
-  await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${data.username || uid} • Rp ${data.amount.toLocaleString('id-ID')}`, { safe: `💰 Bukti bayar @${data.username || uid}`, type: 'pay' });
+  await notifyOps(`💰 <b>Bukti bayar masuk</b>\n@${data.username || uid} • Rp ${data.amount.toLocaleString('id-ID')} • ${channelFinal.toUpperCase()}`, { safe: `💰 Bukti bayar @${data.username || uid}`, type: 'pay' });
   return ref.id;
 };
+
 // ===== 💳 KARTU QRIS (pengganti halaman web) =====
 const sendQrisMessage = async (chatId) => {
   const setDoc = await db.collection('settings').doc('app').get();
@@ -358,7 +389,25 @@ app.post('/api/telegram-webhook', async (req, res) => {
       const cb = update.callback_query;
       const uid = String(cb.from.id);
 
-            // ===== 💳 QRIS & PANDUAN (pengganti halaman web) =====
+      // ===== 💳 PILIH CHANNEL PEMBAYARAN =====
+      if (cb.data && cb.data.startsWith('pay_ch:')) {
+        const ch = cb.data.split(':')[1];
+        const uidC = String(cb.from.id);
+        await answerCallbackQuery(cb.id, 'Mencatat channel...');
+        const pRefC = proofRef(uidC);
+        const pDocC = await pRefC.get();
+        if (!pDocC.exists || !pDocC.data().fileId || !pDocC.data().amount) {
+          await sendTelegramMessage(cb.message.chat.id, '⏳ Sesi kadaluarsa. Kirim ulang foto bukti + nominalnya ya.');
+          return res.status(200).json({ status: 'ok' });
+        }
+        const dC = pDocC.data();
+        await pRefC.delete();
+        await finalizeProof(uidC, { username: dC.username, firstName: dC.firstName, chatId: dC.chatId || cb.message.chat.id, amount: dC.amount, fileId: dC.fileId, caption: dC.caption || '', channel: ch });
+        await sendTelegramMessage(cb.message.chat.id, `✅ Channel tercatat: <b>${ch.toUpperCase()}</b>. Bukti menunggu verifikasi owner/admin1!`, { parse_mode: 'HTML' });
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      // ===== 💳 QRIS & PANDUAN (pengganti halaman web) =====
       if (cb.data === 'pay_qris') {
         await answerCallbackQuery(cb.id, 'Menyiapkan QRIS...');
         await sendQrisMessage(cb.message.chat.id);
@@ -505,7 +554,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       const uid = String(msg.from.id);
       const text = msg.text;
 
-      // 💰 SMART PAIRING
+      // 💰 SMART PAIRING (dengan deteksi channel)
       if (msg.chat.type === 'private' && !text.startsWith('/')) {
         const amt = parseAmount(text);
         const pRef = proofRef(uid);
@@ -514,18 +563,25 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
         if (amt && fresh && pDoc.data().fileId) {
           const d = pDoc.data();
-          await pRef.delete();
-          await finalizeProof(uid, { username: d.username, firstName: d.firstName, chatId: d.chatId || msg.chat.id, amount: amt, fileId: d.fileId, caption: text });
-          await sendTelegramMessage(msg.chat.id, `✅ Nominal Rp ${amt.toLocaleString('id-ID')} + foto cocok! Menunggu verifikasi owner/admin1.`);
+          const ch = detectChannel(text) || d.channel || null;
+          if (ch) {
+            await pRef.delete();
+            await finalizeProof(uid, { username: d.username, firstName: d.firstName, chatId: d.chatId || msg.chat.id, amount: amt, fileId: d.fileId, caption: text, channel: ch });
+            await sendTelegramMessage(msg.chat.id, `✅ Nominal Rp ${amt.toLocaleString('id-ID')} + foto + channel (<b>${ch}</b>) cocok! Menunggu verifikasi.`, { parse_mode: 'HTML' });
+          } else {
+            await pRef.set({ ...d, amount: amt, caption: text, updatedAt: new Date().toISOString() });
+            await sendChannelPicker(msg.chat.id);
+          }
           return res.status(200).json({ status: 'ok' });
         }
         if (amt) {
-          await pRef.set({ uid, amount: amt, caption: text, username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id, fileId: null, updatedAt: new Date().toISOString() });
-          await sendTelegramMessage(msg.chat.id, `💵 Nominal Rp ${amt.toLocaleString('id-ID')} dicatat!\nSekarang kirim foto bukti transfernya 📸`, { parse_mode: 'HTML' });
+          const ch = detectChannel(text);
+          await pRef.set({ uid, amount: amt, caption: text, channel: ch, username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id, fileId: null, updatedAt: new Date().toISOString() });
+          await sendTelegramMessage(msg.chat.id, `💵 Nominal Rp ${amt.toLocaleString('id-ID')} dicatat!${ch ? ` Channel: <b>${ch}</b>.` : ''}\nSekarang kirim foto buktinya 📸`, { parse_mode: 'HTML' });
           return res.status(200).json({ status: 'ok' });
         }
         if (fresh && pDoc.data().fileId) {
-          await sendTelegramMessage(msg.chat.id, '❓ Nominal tidak terbaca. Ketik seperti ini:\n<code>bayar 20000</code>', { parse_mode: 'HTML' });
+          await sendTelegramMessage(msg.chat.id, '❓ Nominal tidak terbaca. Ketik seperti ini:\n<code>bayar 20000 shopeepay</code>', { parse_mode: 'HTML' });
           return res.status(200).json({ status: 'ok' });
         }
       }
@@ -587,7 +643,7 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
           inline_keyboard: [
             [
               { text: '🎁 TRIAL GRATIS', callback_data: 'trial_claim' },
-              { text: '💳 DONASI VIP', url: `${PAYMENT_WEB_URL}?uid=${uid}` }
+              { text: '💳 DONASI VIP', callback_data: 'pay_qris' }
             ],
             [
               { text: '❓ BANTUAN', url: `https://t.me/${process.env.OWNER_TELEGRAM_USER || 'Mr_PH0B05'}` }
@@ -662,7 +718,7 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
             trialDays: trialSet.days
           });
 
-                    const markup = {
+          const markup = {
             inline_keyboard: [
               [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
               [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
@@ -677,6 +733,21 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
 
       const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
+
+      // ===== 🛠 /setqris VIA TEKS (owner kirim teks dulu, foto menyusul) =====
+      if (isBotAdmin && (text === '/setqris' || text.startsWith('/setqris '))) {
+        // Jalur A: reply ke foto QRIS
+        if (msg.reply_to_message && msg.reply_to_message.photo) {
+          const fid = msg.reply_to_message.photo[msg.reply_to_message.photo.length - 1].file_id;
+          await db.collection('settings').doc('app').set({ qrisFileId: fid, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
+          await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan (via reply)! Otomatis dipakai di menu pembayaran semua user.');
+          return res.status(200).json({ status: 'ok' });
+        }
+        // Jalur B: teks dulu → foto berikutnya otomatis jadi QRIS
+        await db.collection('admin_flags').doc(uid).set({ awaitQris: true, at: new Date().toISOString() });
+        await sendTelegramMessage(msg.chat.id, '📤 <b>Mode QRIS aktif:</b> kirim FOTO QRIS sekarang (tanpa caption juga boleh).', { parse_mode: 'HTML' });
+        return res.status(200).json({ status: 'ok' });
+      }
 
       if (isBotAdmin && text.startsWith('/gentoken')) {
         const parts = text.split(/\s+/);
@@ -720,44 +791,71 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
       }
     }
 
-    // ===== 💰 BUKTI BAYAR GOPAY =====
+    // ===== 💰 BUKTI BAYAR (dengan deteksi channel otomatis) =====
     if (update.message && update.message.photo && update.message.chat.type === 'private') {
       const msg = update.message;
       const uid = String(msg.from.id);
       const caption = msg.caption || '';
       const fileId = msg.photo[msg.photo.length - 1].file_id;
-            // 🖼 /setqris — owner pasang/ganti gambar QRIS resmi
-      if (caption.trim().startsWith('/setqris')) {
-        if (String(uid) !== String(process.env.OWNER_TELEGRAM_ID)) {
-          await sendTelegramMessage(msg.chat.id, '⛔ Perintah ini khusus owner.');
-          return res.status(200).json({ status: 'ok' });
-        }
+
+      const isAdm = (uid === String(process.env.OWNER_TELEGRAM_ID)) ||
+        (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(uid);
+
+      // 🖼 /setqris via caption (owner kirim foto + caption /setqris)
+      if (isAdm && caption.trim().startsWith('/setqris')) {
         await db.collection('settings').doc('app').set({ qrisFileId: fileId, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
-        await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan!\nSemua tombol 💳 BAYAR VIA QRIS sekarang menampilkan gambar ini beserta panduan bayar.');
+        await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan (via caption)! Otomatis dipakai di menu pembayaran semua user.');
         return res.status(200).json({ status: 'ok' });
       }
+
+      // 🖼 /setqris via flag (owner kirim /setqris dulu, lalu foto tanpa caption)
+      if (isAdm) {
+        const flagDoc = await db.collection('admin_flags').doc(uid).get().catch(() => null);
+        if (flagDoc && flagDoc.exists && flagDoc.data().awaitQris) {
+          await db.collection('admin_flags').doc(uid).delete();
+          await db.collection('settings').doc('app').set({ qrisFileId: fileId, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
+          await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan! Otomatis dipakai di menu pembayaran semua user.');
+          return res.status(200).json({ status: 'ok' });
+        }
+      }
+
       const base = { username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id };
       const amount = parseAmount(caption);
 
+      // C1: foto + caption nominal → deteksi channel atau tanyakan
       if (amount) {
-        await finalizeProof(uid, { ...base, amount, fileId, caption });
-        await sendTelegramMessage(msg.chat.id, '✅ Bukti pembayaran diterima! Menunggu verifikasi owner/admin1.');
+        const ch = detectChannel(caption);
+        if (ch) {
+          await finalizeProof(uid, { ...base, amount, fileId, caption, channel: ch });
+          await sendTelegramMessage(msg.chat.id, `✅ Bukti + nominal + channel (<b>${ch}</b>) diterima! Menunggu verifikasi owner/admin1.`, { parse_mode: 'HTML' });
+        } else {
+          await proofRef(uid).set({ uid, fileId, caption, username: base.username, firstName: base.firstName, chatId: base.chatId, amount, updatedAt: new Date().toISOString() });
+          await sendChannelPicker(msg.chat.id);
+        }
         return res.status(200).json({ status: 'ok' });
       }
 
+      // C2: foto menyusul setelah nominal → jodohkan
       const pRef = proofRef(uid);
       const pDoc = await pRef.get();
       if (pDoc.exists && pDoc.data().amount && (Date.now() - new Date(pDoc.data().updatedAt || 0).getTime()) < PROOF_TTL_MS) {
         const amt = pDoc.data().amount;
         const cap = pDoc.data().caption || caption;
-        await pRef.delete();
-        await finalizeProof(uid, { ...base, amount: amt, fileId, caption: cap });
-        await sendTelegramMessage(msg.chat.id, `✅ Foto + nominal Rp ${amt.toLocaleString('id-ID')} cocok! Menunggu verifikasi owner/admin1.`);
+        const ch = pDoc.data().channel || detectChannel(cap) || null;
+        if (ch) {
+          await pRef.delete();
+          await finalizeProof(uid, { ...base, amount: amt, fileId, caption: cap, channel: ch });
+          await sendTelegramMessage(msg.chat.id, `✅ Foto + nominal Rp ${amt.toLocaleString('id-ID')} + channel (<b>${ch}</b>) cocok! Menunggu verifikasi.`, { parse_mode: 'HTML' });
+        } else {
+          await pRef.set({ ...pDoc.data(), fileId, updatedAt: new Date().toISOString() });
+          await sendChannelPicker(msg.chat.id);
+        }
         return res.status(200).json({ status: 'ok' });
       }
 
+      // C3: foto dulu, nominal menyusul
       await pRef.set({ uid, fileId, caption, username: base.username, firstName: base.firstName, chatId: base.chatId, amount: null, updatedAt: new Date().toISOString() });
-      await sendTelegramMessage(msg.chat.id, '📸 Foto bukti disimpan!\nSekarang ketik nominalnya, contoh:\n<code>bayar 20000</code>', { parse_mode: 'HTML' });
+      await sendTelegramMessage(msg.chat.id, '📸 Foto bukti disimpan!\nSekarang ketik nominal + aplikasi (opsional), contoh:\n<code>bayar 20000 shopeepay</code>', { parse_mode: 'HTML' });
       return res.status(200).json({ status: 'ok' });
     }
 
@@ -823,7 +921,7 @@ Aphelion = <b>Tools Premium</b> untuk:
    → Akses ${planDays} hari penuh
    → Donasi lebih = apresiasi dev
    → Semua nominal = akses sama
-   → Pembayaran QRIS / GoPay
+   → Pembayaran QRIS / GoPay / ShopeePay / OVO / DANA / Bank
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -840,9 +938,8 @@ Aphelion = <b>Tools Premium</b> untuk:
    🛡️ @MrDeimos823 (Admin)
 
 💳 <b>PEMBAYARAN RESMI</b>:
-   • QRIS Merchant (scan code)
-   • GoPay Merchant (invoice otomatis)
-   • Token dikirim otomatis setelah bayar
+   • QRIS Merchant (semua e-wallet & bank)
+   • Token dikirim otomatis setelah verifikasi
 
 ━━━━━━━━━━━━━━━━━━━━━━━
 
