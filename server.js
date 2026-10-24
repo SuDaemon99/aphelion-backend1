@@ -7,13 +7,62 @@ const axios = require('axios');
 const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { Redis } = require('@upstash/redis');
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
 const trial = require('./trial');
 
 const { approvePendingPayment, finalizeApprovedPayment } = require('./finance');
+
+// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
+const createSafeRedis = () => {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+  
+  let redisBlockedUntil = 0;
+  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
+  
+  try {
+    const { Redis } = require('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+
+    const safeGet = async (key) => {
+      if (Date.now() < redisBlockedUntil) return null;
+      try {
+        return await redis.get(key);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000; // cooldown 1 jam
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+        return null;
+      }
+    };
+
+    const safeSet = async (key, value, opts) => {
+      if (Date.now() < redisBlockedUntil) return;
+      try {
+        await redis.set(key, value, opts);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+      }
+    };
+
+    return { get: safeGet, set: safeSet };
+  } catch (e) {
+    console.error('Redis init error:', e.message);
+    return null;
+  }
+};
+
+const redis = createSafeRedis();
 
 // 💰 Parse nominal dari caption
 const parseAmount = (text) => {
@@ -76,11 +125,6 @@ if (getApps().length === 0) {
 const db = getFirestore();
 const app = express();
 app.set('trust proxy', 1);
-
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
 
 let messaging = null;
 try { messaging = require('firebase-admin/messaging').getMessaging(); } catch (e) { messaging = null; }
@@ -217,7 +261,7 @@ const sendPayGuide = async (chatId) => {
     ] }
   });
 };
-console.log('Bot Telegram dikonfigurasi untuk Vercel Webhook...');
+console.log('Bot Telegram dikonfigurasi untuk Webhook...');
 
 const MIDTRANS_MODE = process.env.MIDTRANS_MODE || 'production';
 const isProduction = MIDTRANS_MODE === 'production';
@@ -229,7 +273,7 @@ const snap = new midtransClient.Snap({
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Vercel!' });
+  res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Render!' });
 });
 
 // ===== 🔑 SELF-SERVICE RECOVERY =====
@@ -316,63 +360,82 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
-// ===== 📍 LOCATION PING =====
-const pingLimiter = rateLimit({ windowMs: 2 * 1000, max: 1, keyGenerator: (req) => req.body?.jwt || req.ip });
+// ===== 📍 LOCATION PING (CONDITIONAL - bisa dimatikan via DISABLE_PING env) =====
+const DISABLE_PING = process.env.DISABLE_PING === 'true';
 
-app.post('/api/user/ping', pingLimiter, async (req, res) => {
-  try {
-    const { jwt: jwtToken, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
-    
-    if (!jwtToken) return res.status(401).json({ error: 'JWT Token wajib' });
-    if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
+if (!DISABLE_PING) {
+  const { ipKeyGenerator } = require('express-rate-limit');
+  const pingLimiter = rateLimit({ 
+    windowMs: 2 * 1000, 
+    max: 1, 
+    keyGenerator: (req) => req.body?.jwt || ipKeyGenerator(req.ip) 
+  });
 
-    let decoded;
+  app.post('/api/user/ping', pingLimiter, async (req, res) => {
     try {
-      decoded = jwt.verify(jwtToken, JWT_USER_SECRET);
-    } catch (e) {
-      return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid atau kedaluwarsa' });
-    }
+      const { jwt: jwtToken, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
+      
+      if (!jwtToken) return res.status(401).json({ error: 'JWT Token wajib' });
+      if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
-    const uid = decoded.uid;
-    
-    if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
-    if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
-    if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
-    
-    if (paused === true) {
-      try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
-      catch(e){ console.error("Redis paused error:", e.message); }
-      return res.status(200).json({ status: 'PAUSED' });
-    }
+      let decoded;
+      try {
+        decoded = jwt.verify(jwtToken, JWT_USER_SECRET);
+      } catch (e) {
+        return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid atau kedaluwarsa' });
+      }
 
-    const now = new Date();
-    const point = {
-      uid, lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
-      speed: typeof speed === 'number' ? speed : null, bearing: typeof bearing === 'number' ? bearing : null,
-      battery: typeof battery === 'number' ? battery : null, netType: netType || null, 
-      appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
-    };
+      const uid = decoded.uid;
+      
+      if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
+      if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
+      if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
+      
+      if (paused === true) {
+        if (redis) {
+          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
+          catch(e){ console.error("Redis paused error:", e.message); }
+        }
+        return res.status(200).json({ status: 'PAUSED' });
+      }
 
-    try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
-    catch(redisErr) { console.error("Redis loc error:", redisErr.message); }
+      const now = new Date();
+      const point = {
+        uid, lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
+        speed: typeof speed === 'number' ? speed : null, bearing: typeof bearing === 'number' ? bearing : null,
+        battery: typeof battery === 'number' ? battery : null, netType: netType || null, 
+        appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
+      };
 
-    try {
-        const lastDbWrite = await redis.get(`last_db_write:${uid}`);
+      if (redis) {
+        try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
+        catch(redisErr) { console.error("Redis loc error:", redisErr.message); }
+      }
+
+      try {
+        const lastDbWrite = redis ? await redis.get(`last_db_write:${uid}`) : null;
         if (!lastDbWrite) {
           await db.collection('user_locations').doc(uid).set(point, { merge: true });
           await db.collection('location_history').doc(uid).collection('points').add({
             lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
           });
-          await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); 
+          if (redis) {
+            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); 
+          }
         }
-    } catch (dbErr) { }
+      } catch (dbErr) { 
+        console.error('DB write error:', dbErr.message);
+      }
 
-    res.status(200).json({ status: 'OK', ts: now.toISOString(), pingInterval: 60 });
-  } catch (e) {
-    console.error('PING ERROR:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
+      res.status(200).json({ status: 'OK', ts: now.toISOString(), pingInterval: 60 });
+    } catch (e) {
+      console.error('PING ERROR:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+} else {
+  console.log('🔴 Location ping endpoint disabled (DISABLE_PING=true)');
+}
 
 // ===== A. WEBHOOK TELEGRAM =====
 app.post('/api/telegram-webhook', async (req, res) => {
