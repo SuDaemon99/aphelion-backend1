@@ -4,7 +4,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
-const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
@@ -28,11 +27,81 @@ const requireApprover = async (req, res, next) => {
 const db = getFirestore();
 const router = express.Router();
 
-// 🔥 INISIALISASI REDIS ADMIN
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
+const createSafeRedis = () => {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+  
+  let redisBlockedUntil = 0;
+  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
+  
+  try {
+    const { Redis } = require('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+
+    const safeGet = async (key) => {
+      if (Date.now() < redisBlockedUntil) return null;
+      try {
+        return await redis.get(key);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000; // cooldown 1 jam
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+        return null;
+      }
+    };
+
+    const safeSet = async (key, value, opts) => {
+      if (Date.now() < redisBlockedUntil) return;
+      try {
+        await redis.set(key, value, opts);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+      }
+    };
+
+    const safeKeys = async (pattern) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try {
+        return await redis.keys(pattern);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+        return [];
+      }
+    };
+
+    const safeMget = async (...keys) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try {
+        return await redis.mget(...keys);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+        return [];
+      }
+    };
+
+    return { get: safeGet, set: safeSet, keys: safeKeys, mget: safeMget };
+  } catch (e) {
+    console.error('Redis init error:', e.message);
+    return null;
+  }
+};
+
+const redis = createSafeRedis();
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
@@ -734,13 +803,15 @@ router.get('/locations', requireAuth, async (req, res) => {
     const dbLocations = snap.docs.map(serializeLocation).filter(Boolean);
     
     let liveLocations = [];
-    try {
+    if (redis) {
+      try {
         const keys = await redis.keys('loc:*');
         if (keys && keys.length > 0) {
           const rawData = await redis.mget(...keys);
           liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
         }
-    } catch (redisErr) { console.error("Redis Read Error:", redisErr.message); }
+      } catch (redisErr) { console.error("Redis Read Error:", redisErr.message); }
+    }
 
     // Merge: Data dari Redis otomatis nimpa data dari Firestore biar lebih akurat
     const redisMap = {};
@@ -777,13 +848,15 @@ router.get('/locations/stats', requireAuth, async (req, res) => {
     const dbLocations = snap.docs.map(d => d.data());
     
     let liveLocations = [];
-    try {
+    if (redis) {
+      try {
         const keys = await redis.keys('loc:*');
         if (keys && keys.length > 0) {
           const rawData = await redis.mget(...keys);
           liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
         }
-    } catch (e) {}
+      } catch (e) {}
+    }
 
     const redisMap = {};
     liveLocations.forEach(l => { redisMap[l.uid] = l; });
@@ -835,10 +908,12 @@ router.post('/locations/settings', requireAuth, requireOwner, async (req, res) =
 router.get('/locations/:uid', requireAuth, async (req, res) => {
   try {
     let locData = null;
-    try {
-       const r = await redis.get(`loc:${req.params.uid}`);
-       if (r) locData = typeof r === 'string' ? JSON.parse(r) : r;
-    } catch (e) {}
+    if (redis) {
+      try {
+        const r = await redis.get(`loc:${req.params.uid}`);
+        if (r) locData = typeof r === 'string' ? JSON.parse(r) : r;
+      } catch (e) {}
+    }
     
     if (!locData) {
         const d = await db.collection('user_locations').doc(req.params.uid).get();
@@ -880,7 +955,8 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
       paused: true, stoppedBy: req.admin.sub, stoppedAt: ts
     }, { merge: true });
     
-    try {
+    if (redis) {
+      try {
         let liveData = await redis.get(`loc:${uid}`);
         if (liveData) {
             if (typeof liveData === 'string') liveData = JSON.parse(liveData);
@@ -889,7 +965,8 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
             liveData.stoppedAt = ts;
             await redis.set(`loc:${uid}`, JSON.stringify(liveData), { ex: 60 });
         }
-    } catch(e){}
+      } catch(e){}
+    }
 
     await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
     await notifyOps(`🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`, { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' });
@@ -1042,7 +1119,7 @@ const pushRaidKill = (by) => pushAll('👹 RAID TUMBANG!', `GALAXY WARDEN ditumb
 router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
   const target = req.body.target === 'public' ? 'public' : 'vip';
   const gid = target === 'vip' ? VIP_GROUP_ID : PUBLIC_GROUP_ID;
-  if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Vercel.` });
+  if (!gid) return res.status(400).json({ error: `Group ID ${target} belum diset di Environment Variables Render.` });
 
   try {
     const snap = await db.collection('bot_messages').where('chatId', '==', String(gid)).limit(1000).get();
@@ -1152,13 +1229,13 @@ const maskUser = (u) => ({
 });
 
 const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
-- Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
-- Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
+- Backend Node.js+Express di RENDER (Web Service). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
+- Log produksi: Render Dashboard → Services → Logs.
 - DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages, packages).
 - Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook (bukan polling).
 - Pembayaran: Midtrans Snap (halaman aphelion-pay) + webhook /api/payment-webhook → settlement = user ACTIVE + invite VIP.
 - Lisensi manual: generate token PENDING (status PENDING, durasi belum jalan) → user aktivasi di app produksi → status ACTIVE, expired mulai dihitung.
-- Cron: scheduler eksternal memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
+- Cron: scheduler eksternal (cron-job.org) memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
 - App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID + username Telegram + package name.
 - Arcade: shooter internal admin (leaderboard + raid boss mingguan 100K HP).
 - Bisnis: langganan VIP (harga & planDays di settings), grup Telegram VIP + publik.`;
