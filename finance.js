@@ -2,6 +2,7 @@
 // Aturan emas Firestore: dalam runTransaction, SEMUA READ dulu, BARU WRITE.
 const { FieldValue } = require('firebase-admin/firestore');
 const crypto = require('crypto');
+const { createPendingLicense } = require('./licenses');
 
 // 🔥 SATU-SATUNYA PINTU PENCATATAN TRANSAKSI (jurnal + buku besar atomik)
 async function recordTransaction(db, tx) {
@@ -48,7 +49,7 @@ async function recordTransaction(db, tx) {
   return { orderId, dateKey };
 }
 
-// 🔥 AKTIVASI USER SETELAH PAYMENT DISAHKAN (logika sama dengan webhook Midtrans)
+// 🔥 AKTIVASI USER SETELAH PAYMENT DISAHKAN (untuk Midtrans webhook — flow lama 1 token)
 async function activatePaymentUser(db, uid, planDays, channel) {
   const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
   const expiredDate = new Date();
@@ -79,7 +80,7 @@ async function activatePaymentUser(db, uid, planDays, channel) {
   return { token: tokenMod, expiredAt: expiredDate, username, isNewUser };
 }
 
-// 🔥 APPROVE PENDING PAYMENT (anti double-approve: flip status dalam transaksi)
+// 🔥 APPROVE PENDING PAYMENT — GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-app)
 async function approvePendingPayment(db, pendingId, byName, editedAmount) {
   const ref = db.collection('pending_payments').doc(pendingId);
   let p = null;
@@ -101,17 +102,58 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
     const setDoc = await db.collection('settings').doc('app').get();
     const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
 
+    // 🔥 AMBIL SEMUA PACKAGE AKTIF (otomatis: grab + phantom + apa pun yang aktif)
+    const pkgSnap = await db.collection('packages').where('active', '==', true).get();
+    const activePackages = pkgSnap.docs.map(d => d.data().packageName);
+
+    if (activePackages.length === 0) {
+      throw new Error('Tidak ada package aktif di database. Hubungi owner untuk setup packages.');
+    }
+
+    // 🔥 GENERATE 1 PENDING LICENSE PER PACKAGE AKTIF (multi-token)
+    const tokens = [];
+    for (const pkg of activePackages) {
+      const { id, code, masked } = await createPendingLicense(db, {
+        packageName: pkg,
+        durationDays: planDays,
+        createdBy: byName,
+        source: 'gopay_proof'
+      });
+      // Stamp username Telegram ke doc user biar admin panel kelihatan
+      await db.collection('users').doc(id).update({
+        username: p.username || null,
+        source: 'gopay_proof',
+        createdBy: byName
+      });
+      tokens.push({ code, masked, packageName: pkg, id });
+    }
+
+    // Catat 1 transaksi (total amount, dengan metadata jumlah token)
     await recordTransaction(db, {
       orderId, uid: p.uid, amount, channel: p.channel || 'gopay',
       source: 'gopay_proof', createdBy: byName, note: p.caption || null
     });
-    const act = await activatePaymentUser(db, p.uid, planDays, 'gopay');
-    await ref.update({ status: 'approved', finalAmount: amount, orderId });
+
+    await ref.update({
+      status: 'approved',
+      finalAmount: amount,
+      orderId,
+      tokenCount: tokens.length,
+      tokens: tokens.map(t => ({ code: t.masked, packageName: t.packageName }))
+    });
 
     return {
-      ok: true, uid: p.uid, amount, orderId, approvedBy: byName,
-      chatId: p.chatId || p.uid, username: act.username || p.username || null,
-      token: act.token, expiredAt: act.expiredAt, isNewUser: act.isNewUser
+      ok: true,
+      uid: p.uid,
+      amount,
+      orderId,
+      approvedBy: byName,
+      chatId: p.chatId || p.uid,
+      username: p.username || null,
+      tokens,                  // array of {code, masked, packageName, id}
+      token: tokens[0].code,   // backward compat untuk Midtrans webhook lama
+      planDays,
+      tokenCount: tokens.length
     };
   } catch (e) {
     // rollback: kembalikan ke pending biar bisa dicoba lagi
@@ -120,10 +162,20 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
   }
 }
 
-// 🔥 EFEK DOMINO SETELAH APPROVE: DM user + invite VIP + push FCM + ops feed
+// 🔥 EFEK DOMINO SETELAH APPROVE: DM user (semua token) + invite VIP + push FCM + ops feed
 async function finalizeApprovedPayment(db, helpers, r) {
   const { sendTG, getTpl, createInviteLink, vipGroupId, pushAll, notifyOps } = helpers;
+
+  // 1. DM USER dengan semua token (format dinamis per-package)
   try {
+    const tokenLines = (r.tokens || []).map(t => {
+      const shortPkg = t.packageName.split('.').pop();
+      let label = `📱 <b>${shortPkg}</b>`;
+      if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 <b>App Grab Driver</b>';
+      else if (t.packageName.includes('phantom')) label = '👻 <b>App Phantom</b>';
+      return `${label}:\n<code>${t.code}</code>`;
+    }).join('\n\n');
+
     let inviteText = '⚠️ Link invite VIP gagal dibuat otomatis.';
     let inviteMarkup = undefined;
     try {
@@ -131,20 +183,31 @@ async function finalizeApprovedPayment(db, helpers, r) {
       inviteText = '🚪 Ketuk tombol di bawah untuk masuk (link sekali pakai):';
       inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
     } catch (e) { /* abaikan */ }
+
     const msgText = await getTpl('payment_success', {
-      tanggal: r.expiredAt.toLocaleString('id-ID'), token: r.token, invite: inviteText
+      planDays: r.planDays || 30,
+      tokens: tokenLines || '⚠️ Token tidak tersedia',
+      invite: inviteText
     });
     await sendTG(r.chatId, msgText, { parse_mode: 'HTML', ...(inviteMarkup ? { reply_markup: inviteMarkup } : {}) });
   } catch (e) { console.error('DM payment success gagal:', e.message); }
 
+  // 2. Push FCM ke admin
   try {
-    if (pushAll) await pushAll('💰 Pembayaran GoPay Masuk!', `Rp ${r.amount.toLocaleString('id-ID')} • UID ${r.uid} • approve: ${r.approvedBy}`, 'pay');
+    const tokenCount = r.tokenCount || (r.tokens ? r.tokens.length : 1);
+    if (pushAll) await pushAll(
+      '💰 Pembayaran Masuk!',
+      `Rp ${r.amount.toLocaleString('id-ID')} • UID ${r.uid} • approve: ${r.approvedBy} • ${tokenCount} token`,
+      'pay'
+    );
   } catch (e) { /* abaikan */ }
 
+  // 3. Notify ops feed
   try {
+    const tokenPreview = (r.tokens || []).map(t => `${t.packageName.split('.').pop()}: ${t.masked}`).join(' • ');
     if (notifyOps) await notifyOps(
-      `💰 <b>GoPay APPROVED</b> oleh ${r.approvedBy}\nRp ${r.amount.toLocaleString('id-ID')} • UID <code>${r.uid}</code> • ${r.orderId}`,
-      { safe: `💰 GoPay approved ${r.approvedBy} • Rp ${r.amount.toLocaleString('id-ID')}`, type: 'pay' }
+      `💰 <b>APPROVED</b> oleh ${r.approvedBy}\nRp ${r.amount.toLocaleString('id-ID')} • UID <code>${r.uid}</code> • ${r.orderId}\n<b>${r.tokenCount || 1} token:</b> ${tokenPreview}`,
+      { safe: `💰 Approved ${r.approvedBy} • Rp ${r.amount.toLocaleString('id-ID')} (${r.tokenCount || 1} token)`, type: 'pay' }
     );
   } catch (e) { /* abaikan */ }
 }
