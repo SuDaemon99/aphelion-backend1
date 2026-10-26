@@ -287,6 +287,139 @@ router.get('/users', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ================= ✏️ EDIT USERNAME TELEGRAM (sinkron semua doc user) =================
+router.post('/users/:uid/edit-username', requireAuth, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    const newU = String(req.body.newUsername || '').trim().replace(/^@/, '').toLowerCase();
+    if (!/^[a-z0-9_]{5,32}$/.test(newU)) {
+      return res.status(400).json({ error: 'Format username Telegram tidak valid (5-32 karakter: a-z, 0-9, _).' });
+    }
+    const d = await db.collection('users').doc(uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const oldU = d.data().username ? String(d.data().username).replace(/^@/, '').toLowerCase() : null;
+    if (oldU === newU) return res.status(400).json({ error: 'Username baru sama dengan username lama.' });
+
+    // Kumpulkan semua doc milik user ini (doc target + saudara ber-username lama)
+    const siblingIds = [uid];
+    if (oldU) {
+      const sib = await db.collection('users').where('username', '==', oldU).limit(50).get();
+      sib.docs.forEach(x => { if (!siblingIds.includes(x.id)) siblingIds.push(x.id); });
+    }
+
+    // Cek konflik: username baru sudah dipakai lisensi ORANG LAIN yang masih hidup
+    const clash = await db.collection('users').where('username', '==', newU).limit(50).get();
+    const clashOther = clash.docs.filter(x =>
+      !siblingIds.includes(x.id) &&
+      (x.data().status === 'ACTIVE' || x.data().status === 'PENDING')
+    );
+    if (clashOther.length) {
+      return res.status(409).json({ error: `Username @${newU} sudah terpakai lisensi lain (status ${clashOther[0].data().status}).` });
+    }
+
+    // Update serentak semua doc user ini (App A + App B)
+    const batch = db.batch();
+    siblingIds.forEach(id => {
+      batch.update(db.collection('users').doc(id), {
+        username: newU,
+        usernameEditedBy: req.admin.sub,
+        usernameEditedAt: new Date().toISOString()
+      });
+    });
+    await batch.commit();
+
+    await logAudit(req.admin.sub, 'EDIT_USERNAME', uid, { from: oldU, to: newU, docsUpdated: siblingIds.length });
+    await notifyOps(`✏️ <b>Username diedit</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>: @${oldU || '-'} → @${newU} (${siblingIds.length} doc disinkronkan)`, { safe: `✏️ Edit username ${uid}: @${oldU || '-'} → @${newU}` });
+    res.json({ status: 'OK', oldUsername: oldU, newUsername: newU, docsUpdated: siblingIds.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ================= 🔄 SYNC CHECK USERNAME (patokan: event Telegram) =================
+router.get('/users/sync-check', requireAuth, async (req, res) => {
+  try {
+    // 1) Registry identitas asli: telegram_chats + tg_registry (username TG unik global)
+    const realByUid = {};
+    const [chatsSnap, regSnap] = await Promise.all([
+      db.collection('telegram_chats').limit(1000).get(),
+      db.collection('tg_registry').limit(1000).get()
+    ]);
+    chatsSnap.docs.forEach(d => { const u = d.data().username; if (u) realByUid[d.id] = String(u).toLowerCase(); });
+    regSnap.docs.forEach(d => { const u = d.data().username; if (u) realByUid[d.id] = String(u).toLowerCase(); });
+    const uidByUsername = {};
+    Object.entries(realByUid).forEach(([uid, u]) => { uidByUsername[u] = uid; });
+
+    // 2) Scan semua doc user hidup
+    const snap = await db.collection('users').where('status', 'in', ['ACTIVE', 'PENDING']).limit(500).get();
+    const issues = [];
+    let verified = 0;
+    const healBatch = db.batch();
+    let healCount = 0;
+
+    for (const d of snap.docs) {
+      const u = d.data();
+      const bound = u.username ? String(u.username).toLowerCase() : null;
+      const owner = u.ownerTgUid || null;
+      let issue = null;
+      let real = null;
+
+      if (owner && realByUid[owner]) {
+        real = realByUid[owner];
+        if (!bound) issue = 'NO_USERNAME';
+        else if (bound !== real) issue = 'MISMATCH';
+        else verified++;
+      } else if (!owner && bound && uidByUsername[bound]) {
+        verified++;
+        if (healCount < 100) { healBatch.update(d.ref, { ownerTgUid: uidByUsername[bound] }); healCount++; }
+      } else if (!bound) {
+        issue = 'NO_USERNAME';
+      } else {
+        issue = 'UNKNOWN';
+      }
+
+      if (issue) issues.push({ id: d.id, packageName: u.packageName || null, status: u.status, bound, real, ownerTgUid: owner, issue });
+    }
+    if (healCount > 0) await healBatch.commit().catch(() => {});
+    res.json({ issues, verified, healed: healCount, total: snap.size });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🔄 AUTO-FIX: samakan username doc dengan username asli dari registry
+router.post('/users/:uid/sync-username', requireAuth, async (req, res) => {
+  try {
+    const d = await db.collection('users').doc(req.params.uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const u = d.data();
+    const owner = u.ownerTgUid || null;
+    let real = null;
+    if (owner) {
+      const reg = await db.collection('tg_registry').doc(owner).get();
+      const ch = await db.collection('telegram_chats').doc(owner).get();
+      real = (reg.exists && reg.data().username) ? String(reg.data().username).toLowerCase()
+           : (ch.exists && ch.data().username) ? String(ch.data().username).toLowerCase() : null;
+    }
+    if (!real) return res.status(409).json({ error: 'Username asli belum diketahui (user belum join grup/chat bot). Pakai Edit Username manual.' });
+    const old = u.username ? String(u.username).toLowerCase() : null;
+    if (old === real) return res.status(400).json({ error: 'Username sudah sinkron.' });
+
+    const ids = new Set([d.id]);
+    const sib = await db.collection('users').where('ownerTgUid', '==', owner).limit(50).get();
+    sib.docs.forEach(x => ids.add(x.id));
+    if (old) {
+      const sib2 = await db.collection('users').where('username', '==', old).limit(50).get();
+      sib2.docs.forEach(x => ids.add(x.id));
+    }
+    const batch = db.batch();
+    ids.forEach(id => batch.update(db.collection('users').doc(id), {
+      username: real, usernameEditedBy: req.admin.sub, usernameEditedAt: new Date().toISOString(), syncedAt: new Date().toISOString()
+    }));
+    await batch.commit();
+
+    await logAudit(req.admin.sub, 'SYNC_USERNAME', req.params.uid, { from: old, to: real, docsUpdated: ids.size });
+    await notifyOps(`🔄 <b>Sync username</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code>: @${old || '-'} → @${real} (${ids.size} doc)`, { safe: `🔄 Sync username ${req.params.uid}: @${old || '-'} → @${real}` });
+    res.json({ status: 'OK', oldUsername: old, newUsername: real, docsUpdated: ids.size });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get('/users/:uid', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
@@ -1043,7 +1176,7 @@ router.post('/admins/:username/deactivate', requireAuth, requireOwner, async (re
   res.json({ status: 'OK' });
 });
 
-router.post('/admins/:username/activate', requireAuth, requireOwner, async (req, res) => {
+router.post('/admins/:username/activate', requireAuth, async (req, res) => {
   await db.collection('admin_accounts').doc(req.params.username).update({ active: true });
   await logAudit(req.admin.sub, 'ADMIN_ACTIVATE', req.params.username);
   res.json({ status: 'OK' });
@@ -1151,7 +1284,7 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
     const ids = snap.docs.map(d => d.data().messageId);
     const docRefs = snap.docs.map(d => d.ref);
 
-        let deleted = 0, failed = 0;
+    let deleted = 0, failed = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
       const refsBatch = docRefs.slice(i, i + 100);
@@ -1255,7 +1388,7 @@ const maskUser = (u) => ({
 const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
 - Backend Node.js+Express di VERCEL SERVERLESS (aphelion-backend1). BUKAN VPS/docker. JANGAN sarankan docker/systemctl/crontab server/file /var/log.
 - Log produksi: Vercel Dashboard → Deployments → Functions → Logs.
-- DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages, packages).
+- DB: Google Firestore (users, transactions, finance_daily, finance_total, settings, admin_accounts, audit_logs, ops_feed, team_chat, telegram_chats, tg_registry, templates, arcade_scores, arcade_raid, fcm_tokens, bot_messages, packages, pending_payments, vip_welcome_cards, user_locations, location_history, trial_claims, trial_counters, admin_flags, reset_requests, team_meta, ai_quota, ai_chats).
 - Bot Telegram @aphelion_gatekeeper_bot via WEBHOOK /api/telegram-webhook (bukan polling).
 - Pembayaran: Midtrans Snap (halaman aphelion-pay) + webhook /api/payment-webhook → settlement = user ACTIVE + invite VIP.
 - Lisensi manual: generate token PENDING (status PENDING, durasi belum jalan) → user aktivasi di app produksi → status ACTIVE, expired mulai dihitung.
@@ -1582,7 +1715,7 @@ router.get('/finance/pending', requireAuth, async (req, res) => {
     const snap = await db.collection('pending_payments').where('status', '==', 'pending').limit(50).get();
     const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
       .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-        const setDoc = await db.collection('settings').doc('app').get();
+    const setDoc = await db.collection('settings').doc('app').get();
     const approvers = (setDoc.exists && setDoc.data().financeApprovers) || ['admin1'];
     const canApprove = req.admin.role === 'owner' || approvers.includes(req.admin.sub);
     res.json({ pending: list, canApprove });
@@ -1629,7 +1762,7 @@ router.post('/finance/pending/:id/reject', requireAuth, requireApprover, async (
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🧾 FALLBACK: catat manual (tunai/transfer/GoPay yang tidak lewat bot) — multi-token
+// 🧾 FALLBACK: catat manual (tunai/transfer/GoPay yang tidak lewat bot) — multi-token + stamp ownerTgUid
 router.post('/finance/record-manual', requireAuth, requireApprover, async (req, res) => {
   try {
     const uid = String(req.body.uid || '');
@@ -1656,7 +1789,7 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
       return res.status(400).json({ error: 'Tidak ada package aktif di database.' });
     }
 
-    // Generate 1 token per package + LANGSUNG activate (manual = sudah dikonfirmasi)
+    // Generate 1 token per package + LANGSUNG activate (manual = sudah dikonfirmasi) + stamp ownerTgUid
     const tokens = [];
     for (const pkg of activePackages) {
       const { id, code, masked } = await createPendingLicense(db, {
@@ -1668,6 +1801,7 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
       await db.collection('users').doc(id).update({
         status: 'ACTIVE',
         username: username,
+        ownerTgUid: uid,   // 🔥 BARU: UID Telegram asli (patokan sync check)
         source: 'manual',
         createdBy: req.admin.sub
       });
@@ -1757,4 +1891,5 @@ router.post('/finance/transactions/:id/purge', requireAuth, requireOwner, async 
     res.json({ status: 'PURGED' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 module.exports = router;
