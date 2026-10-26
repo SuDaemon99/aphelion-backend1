@@ -2,14 +2,18 @@
   "name": "aphelion-backend",
   "version": "1.0.0",
   "description": "Aphelion Backend System",
-  "main": "server.js",
+  "main": "start.js",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node start.js",
+    "dev": "node start.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.31.0",
     "axios": "^1.7.0",
-    "bcryptjs": "^3.0.3",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.2",
