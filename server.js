@@ -888,50 +888,189 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.status(200).json({ status: 'ok' });
     }
 
-    // ===== 🎉 WELCOME MESSAGE =====
+        // ===== 🎉 WELCOME MESSAGE — VIP (kartu member) + PUBLIK (upsell) =====
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
+      const isVip = String(chatId) === String(VIP_GROUP_ID);
 
       for (const member of update.message.new_chat_members) {
-        if (!member.is_bot) {
-          const uid = String(member.id);
-          const username = member.username || '-';
-          const firstName = member.first_name || 'Teman';
-          const tanggal = new Date().toLocaleDateString('id-ID', {
-            day: 'numeric', month: 'long', year: 'numeric'
-          });
+        if (member.is_bot) continue;
 
-          const setDoc = await db.collection('settings').doc('app').get();
-          const price = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
-          const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
+        const uid = String(member.id);
+        const username = member.username || '-';
+        const firstName = member.first_name || 'Teman';
 
-          const trialSet = await trial.getTrialSettings(db);
-          const trialDays = trialSet.days || 7;
+        // ===== 🌟 GRUP VIP: Kartu keanggotaan otomatis =====
+        if (isVip && username && username !== '-') {
+          try {
+            const userSnap = await db.collection('users')
+              .where('username', '==', String(username).toLowerCase())
+              .limit(1).get();
 
-          const pesan = `👋 Halo <b>${escapeHtml(firstName)}</b>! Selamat datang di komunitas Aphelion\n\n📋 <b>PROFIL KAMU</b>\n🆔 UID: <code>${uid}</code>\n👤 Username: @${escapeHtml(username)}\n📅 Bergabung: ${tanggal}\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🏠 <b>APA ITU APHELION?</b>\n\nAphelion = <b>Tools Premium</b> untuk:\n🛵 Driver Ojol (Grab, Gojek, dll)\n🎮 Mobile Gamer\n📍 Fake GPS & Location Spoofing\n🔧 Produktivitas & Automation\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🚀 <b>APHELION VIP = AKSES PENUH</b>\n\n✅ Unlock semua fitur premium\n✅ Update prioritas & beta access\n✅ Support langsung developer\n✅ Bebas iklan & watermark\n✅ Anti-banned system\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🎁 <b>PILIH JALAN MASUK</b>\n\n<b>1️⃣ TRIAL GRATIS ${trialDays} HARI</b>\n   → 1x seumur hidup per device\n   → Full akses, tanpa batas\n   → Coba dulu sebelum commit\n\n<b>2️⃣ DONASI VIP (Mulai Rp ${price.toLocaleString('id-ID')})</b>\n   → Akses ${planDays} hari penuh\n   → Donasi lebih = apresiasi dev\n   → Semua nominal = akses sama\n   → Pembayaran QRIS / GoPay / ShopeePay / OVO / DANA / Bank\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ <b>PERINGATAN KEAMANAN</b>\n\n🚫 Admin & bot <b>TIDAK PERNAH</b>:\n   • Japri / chat personal duluan\n   • Minta password / OTP / token\n   • Minta transfer ke rekening pribadi\n\n✅ <b>ADMIN RESMI</b> (selain ini = PENIPU):\n   👑 @Mr_PH0B05 (Owner)\n   🛡️ @Draven_89 (Admin)\n   🛡️ @MrDeimos823 (Admin)\n\n💳 <b>PEMBAYARAN RESMI</b>:\n   • QRIS Merchant (semua e-wallet & bank)\n   • Token dikirim otomatis setelah verifikasi\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>KETUK TOMBOL DI BAWAH</b>\n(Otomatis buka chat pribadi bot)`;
+            if (!userSnap.empty) {
+              const uDoc = userSnap.docs[0];
+              const u = uDoc.data();
 
-          const markup = {
-            inline_keyboard: [
-              [
-                { text: '🎁 CLAIM TRIAL GRATIS', url: `https://t.me/${BOT_USERNAME}?start=trial_${uid}` },
-                { text: '💳 DONASI VIP', url: `https://t.me/${BOT_USERNAME}?start=beli_${uid}` }
-              ],
-              [
-                { text: '📖 CARA MULAI (3 LANGKAH)', url: `https://t.me/${BOT_USERNAME}?start=panduan_${uid}` }
-              ],
-              [
-                { text: '🛡️ LAPOR PENIPU', url: `https://t.me/${process.env.OWNER_TELEGRAM_USER || 'Mr_PH0B05'}` }
-              ]
-            ]
-          };
+              if (u.status === 'ACTIVE' || u.status === 'PENDING') {
+                const setDoc = await db.collection('settings').doc('app').get();
+                const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
+                const joinDate = new Date().toLocaleString('id-ID', {
+                  day: 'numeric', month: 'short', year: 'numeric',
+                  hour: '2-digit', minute: '2-digit', hour12: false
+                });
 
-          await sendTelegramMessage(chatId, pesan, {
-            parse_mode: 'HTML',
-            reply_markup: markup,
-            disable_web_page_preview: true
-          });
+                let expiredLabel = '⏳ Aktif s/d : <b>mulai dihitung saat login pertama di app</b>';
+                if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate) {
+                  const expStr = u.expiredAt.toDate().toLocaleString('id-ID', {
+                    day: 'numeric', month: 'short', year: 'numeric',
+                    hour: '2-digit', minute: '2-digit', hour12: false
+                  });
+                  expiredLabel = `⏳ Aktif s/d : <b>${expStr}</b>`;
+                }
+
+                // Cek lisensi per-package
+                const allDocs = await db.collection('users')
+                  .where('username', '==', String(username).toLowerCase())
+                  .where('status', 'in', ['ACTIVE', 'PENDING'])
+                  .get();
+                const licenseMap = {};
+                allDocs.docs.forEach(d => {
+                  const pkg = d.data().packageName;
+                  if (pkg) licenseMap[pkg] = d.data().status === 'ACTIVE' ? '✅' : '⏳';
+                });
+                const licenseParts = [];
+                if (licenseMap['com.grabtaxi.driver2']) licenseParts.push(`🚗 Grab ${licenseMap['com.grabtaxi.driver2']}`);
+                if (licenseMap['com.deimos.phantom']) licenseParts.push(`👻 Phantom ${licenseMap['com.deimos.phantom']}`);
+                const licenseStatus = licenseParts.length ? licenseParts.join(' • ') : '⏳ Menunggu aktivasi';
+
+                const pesan = await getTpl('welcome_vip_card', {
+                  firstName: escapeHtml(firstName),
+                  uid,
+                  username: escapeHtml(username),
+                  joinDate,
+                  expiredLabel,
+                  planDays,
+                  licenseStatus
+                });
+
+                const sentMsg = await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
+
+                // Simpan untuk auto-delete 24 jam (cron akan sweep)
+                if (sentMsg && sentMsg.result && sentMsg.result.message_id) {
+                  await db.collection('vip_welcome_cards').add({
+                    chatId: String(chatId),
+                    messageId: sentMsg.result.message_id,
+                    uid,
+                    username: String(username).toLowerCase(),
+                    createdAt: new Date().toISOString()
+                  }).catch(() => {});
+                }
+              }
+            }
+          } catch (e) {
+            console.error('VIP welcome card error:', e.message);
+          }
+          continue; // skip welcome publik untuk grup VIP
         }
+
+        // ===== 📢 GRUP PUBLIK: Welcome lama (upsell) =====
+        const tanggal = new Date().toLocaleDateString('id-ID', {
+          day: 'numeric', month: 'long', year: 'numeric'
+        });
+
+        const setDoc = await db.collection('settings').doc('app').get();
+        const price = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
+        const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
+
+        const trialSet = await trial.getTrialSettings(db);
+        const trialDays = trialSet.days || 7;
+
+        const pesan = `👋 Halo <b>${escapeHtml(firstName)}</b>! Selamat datang di komunitas Aphelion
+
+📋 <b>PROFIL KAMU</b>
+🆔 UID: <code>${uid}</code>
+👤 Username: @${escapeHtml(username)}
+📅 Bergabung: ${tanggal}
+
+━━━━━━━━━━━━━━━━━━━━━━━
+
+🏠 <b>APA ITU APHELION?</b>
+
+Aphelion = <b>Tools Premium</b> untuk:
+🛵 Driver Ojol (Grab, Gojek, dll)
+🎮 Mobile Gamer
+📍 Fake GPS & Location Spoofing
+🔧 Produktivitas & Automation
+
+━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 <b>APHELION VIP = AKSES PENUH</b>
+
+✅ Unlock semua fitur premium
+✅ Update prioritas & beta access
+✅ Support langsung developer
+✅ Bebas iklan & watermark
+✅ Anti-banned system
+
+━━━━━━━━━━━━━━━━━━━━━━━
+
+🎁 <b>PILIH JALAN MASUK</b>
+
+<b>1️⃣ TRIAL GRATIS ${trialDays} HARI</b>
+   → 1x seumur hidup per device
+   → Full akses, tanpa batas
+   → Coba dulu sebelum commit
+
+<b>2️⃣ DONASI VIP (Mulai Rp ${price.toLocaleString('id-ID')})</b>
+   → Akses ${planDays} hari penuh
+   → Donasi lebih = apresiasi dev
+   → Semua nominal = akses sama
+   → Pembayaran QRIS / GoPay / ShopeePay / OVO / DANA / Bank
+
+━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ <b>PERINGATAN KEAMANAN</b>
+
+🚫 Admin & bot <b>TIDAK PERNAH</b>:
+   • Japri / chat personal duluan
+   • Minta password / OTP / token
+   • Minta transfer ke rekening pribadi
+
+✅ <b>ADMIN RESMI</b> (selain ini = PENIPU):
+   👑 @Mr_PH0B05 (Owner)
+   🛡️ @Draven_89 (Admin)
+   🛡️ @MrDeimos823 (Admin)
+
+💳 <b>PEMBAYARAN RESMI</b>:
+   • QRIS Merchant (semua e-wallet & bank)
+   • Token dikirim otomatis setelah verifikasi
+
+━━━━━━━━━━━━━━━━━━━━━━━
+
+👇 <b>KETUK TOMBOL DI BAWAH</b>
+(Otomatis buka chat pribadi bot)`;
+
+        const markup = {
+          inline_keyboard: [
+            [
+              { text: '🎁 CLAIM TRIAL GRATIS', url: `https://t.me/${BOT_USERNAME}?start=trial_${uid}` },
+              { text: '💳 DONASI VIP', url: `https://t.me/${BOT_USERNAME}?start=beli_${uid}` }
+            ],
+            [
+              { text: '📖 CARA MULAI (3 LANGKAH)', url: `https://t.me/${BOT_USERNAME}?start=panduan_${uid}` }
+            ],
+            [
+              { text: '🛡️ LAPOR PENIPU', url: `https://t.me/${process.env.OWNER_TELEGRAM_USER || 'Mr_PH0B05'}` }
+            ]
+          ]
+        };
+
+        await sendTelegramMessage(chatId, pesan, {
+          parse_mode: 'HTML',
+          reply_markup: markup,
+          disable_web_page_preview: true
+        });
       }
     }
 
@@ -1241,12 +1380,25 @@ app.get('/api/cron/check-expired', async (req, res) => {
       expiredCount++;
       const chatDoc = await db.collection('telegram_chats').doc(uid).get();
       const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-      try {
+            try {
         if (u.tier === 'trial' || u.source === 'trial') {
           await sendTelegramMessage(chatId, await getTpl('trial_expired', { nama: u.username || 'Teman' }), { parse_mode: 'HTML' });
         } else {
           try { await kickFromGroup(uid); } catch (e) {}
           await sendTelegramMessage(chatId, await getTpl('expired_dm'), { parse_mode: 'HTML' });
+
+          // 📢 Post pengumuman kick di grup VIP
+          if (u.username) {
+            try {
+              const expLabel = u.expiredAt && u.expiredAt.toDate
+                ? u.expiredAt.toDate().toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' })
+                : 'hari ini';
+              await sendTelegramMessage(VIP_GROUP_ID, await getTpl('kick_announcement', {
+                username: escapeHtml(u.username),
+                tanggal: expLabel
+              }), { parse_mode: 'HTML' });
+            } catch (e) { console.error('Kick announcement error:', e.message); }
+          }
         }
       } catch (err) { console.error(`Gagal DM user ${uid}:`, err.message); }
     }
@@ -1281,7 +1433,27 @@ app.get('/api/cron/check-expired', async (req, res) => {
         await notifyOps(`🚨 <b>WATCHDOG</b>\nBot senyap > 24 jam`, { critical: true });
       }
     }
-    await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
+        // 🧹 SWEEP VIP WELCOME CARDS > 24 JAM
+    try {
+      const cutoffCards = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+      const cardsSnap = await db.collection('vip_welcome_cards')
+        .where('createdAt', '<', cutoffCards)
+        .limit(100).get();
+      let cardsDeleted = 0;
+      for (const card of cardsSnap.docs) {
+        const cd = card.data();
+        try {
+          await axios.post(`${TELEGRAM_API}/deleteMessage`, {
+            chat_id: cd.chatId, message_id: cd.messageId
+          });
+        } catch (e) { /* pesan mungkin udah dihapus manual */ }
+        await card.ref.delete().catch(() => {});
+        cardsDeleted++;
+      }
+      if (cardsDeleted > 0) console.log(`🧹 Swept ${cardsDeleted} VIP welcome cards > 24h`);
+    } catch (e) { console.error('Welcome cards sweep error:', e.message); }
+
+       await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
     if (expiredCount > 0 || reminded > 0) {
       await notifyOps(`⏰ <b>Cron</b>: ${expiredCount} expired • ${reminded} reminder`, { safe: `⏰ Cron: ${expiredCount} expired • ${reminded} reminder` });
     }
