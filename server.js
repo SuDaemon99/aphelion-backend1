@@ -888,7 +888,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.status(200).json({ status: 'ok' });
     }
 
-        // ===== 🎉 WELCOME MESSAGE — VIP (kartu member) + PUBLIK (upsell) =====
+    // ===== 🎉 WELCOME MESSAGE — VIP (kartu member) + PUBLIK (upsell) =====
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -900,6 +900,16 @@ app.post('/api/telegram-webhook', async (req, res) => {
         const uid = String(member.id);
         const username = member.username || '-';
         const firstName = member.first_name || 'Teman';
+
+        // 📒 REGISTRY IDENTITAS ASLI (patokan sync check): dari event Telegram, anti-typo
+        try {
+          await db.collection('tg_registry').doc(uid).set({
+            username: username !== '-' ? String(username).toLowerCase() : null,
+            firstName,
+            src: isVip ? 'vip' : 'public',
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+        } catch (e) { /* abaikan */ }
 
         // ===== 🌟 GRUP VIP: Kartu keanggotaan otomatis =====
         if (isVip && username && username !== '-') {
@@ -1157,7 +1167,7 @@ app.post('/api/payment-webhook', async (req, res) => {
       return res.status(200).json({ status: 'ERROR_NO_PACKAGES' });
     }
 
-    // 🔥 GENERATE N TOKEN + LANGSUNG AKTIFKAN
+    // 🔥 GENERATE N TOKEN + LANGSUNG AKTIFKAN + STAMP OWNER TG UID
     const tokens = [];
     for (const pkg of activePackages) {
       const { id, code, masked } = await createPendingLicense(db, {
@@ -1169,6 +1179,7 @@ app.post('/api/payment-webhook', async (req, res) => {
       await db.collection('users').doc(id).update({
         status: 'ACTIVE',
         username: username,
+        ownerTgUid: uid,   // 🔥 BARU: UID Telegram asli (patokan sync check)
         email: userEmail || null,
         expiredAt: expiredDate,
         activatedAt: now.toISOString(),
@@ -1351,7 +1362,7 @@ const handleModLogin = async (req, res) => {
       if (!bound) await db.collection('users').doc(uid).update({ username: tg });
     }
 
-        if (!u.deviceId) {
+    if (!u.deviceId) {
       await db.collection('users').doc(uid).update({ deviceId, deviceInfo: deviceInfo || null });
     } else if (u.deviceId !== deviceId) {
       // 🔁 Coba SMART AUTO-REBIND sebelum menolak mentah-mentah
@@ -1439,7 +1450,7 @@ app.get('/api/cron/check-expired', async (req, res) => {
       expiredCount++;
       const chatDoc = await db.collection('telegram_chats').doc(uid).get();
       const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-            try {
+      try {
         if (u.tier === 'trial' || u.source === 'trial') {
           await sendTelegramMessage(chatId, await getTpl('trial_expired', { nama: u.username || 'Teman' }), { parse_mode: 'HTML' });
         } else {
@@ -1492,7 +1503,7 @@ app.get('/api/cron/check-expired', async (req, res) => {
         await notifyOps(`🚨 <b>WATCHDOG</b>\nBot senyap > 24 jam`, { critical: true });
       }
     }
-        // 🧹 SWEEP VIP WELCOME CARDS > 24 JAM
+    // 🧹 SWEEP VIP WELCOME CARDS > 24 JAM
     try {
       const cutoffCards = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
       const cardsSnap = await db.collection('vip_welcome_cards')
@@ -1512,7 +1523,7 @@ app.get('/api/cron/check-expired', async (req, res) => {
       if (cardsDeleted > 0) console.log(`🧹 Swept ${cardsDeleted} VIP welcome cards > 24h`);
     } catch (e) { console.error('Welcome cards sweep error:', e.message); }
 
-       await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
+    await db.collection('settings').doc('app').set({ lastCronRun: new Date().toISOString() }, { merge: true });
     if (expiredCount > 0 || reminded > 0) {
       await notifyOps(`⏰ <b>Cron</b>: ${expiredCount} expired • ${reminded} reminder`, { safe: `⏰ Cron: ${expiredCount} expired • ${reminded} reminder` });
     }
