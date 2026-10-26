@@ -273,7 +273,7 @@ const snap = new midtransClient.Snap({
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Render!' });
+  res.json({ status: 'OK', message: 'Aphelion Backend System & Bot is Running Smoothly on Vercel!' });
 });
 
 // ===== 🔑 SELF-SERVICE RECOVERY =====
