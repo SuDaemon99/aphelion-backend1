@@ -558,7 +558,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
+            if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
         const [action, pid] = cb.data.split(':');
         await answerCallbackQuery(cb.id, 'Memproses...');
         if (String(cb.from.id) !== String(process.env.OWNER_TELEGRAM_ID)) {
@@ -576,13 +576,25 @@ app.post('/api/telegram-webhook', async (req, res) => {
             vipGroupId: VIP_GROUP_ID, pushAll: pushAllAdmins, notifyOps
           }, result);
           try {
+            const tokenPreview = (result.tokens || []).map(t => {
+              const shortPkg = t.packageName.split('.').pop();
+              let label = shortPkg;
+              if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 Grab';
+              else if (t.packageName.includes('phantom')) label = '👻 Phantom';
+              return `• ${label}: <code>${t.masked}</code>`;
+            }).join('\n');
             await axios.post(`${TELEGRAM_API}/editMessageText`, {
               chat_id: cb.message.chat.id, message_id: cb.message.message_id,
-              text: `✅ <b>APPROVED</b> oleh @${cb.from.username || 'owner'}\nOrder: ${result.orderId}\nNominal: Rp ${result.amount.toLocaleString('id-ID')}\nUser: @${result.username || '-'} → ACTIVE s/d ${result.expiredAt.toLocaleDateString('id-ID')}`,
+              text: `✅ <b>APPROVED</b> oleh @${cb.from.username || 'owner'}\nOrder: ${result.orderId}\nNominal: Rp ${result.amount.toLocaleString('id-ID')}\nUser: @${result.username || '-'}\n\n<b>${result.tokenCount} token dibuat:</b>\n${tokenPreview}`,
               parse_mode: 'HTML'
             });
           } catch (e) {}
-          await logAudit('owner_tg', 'FINANCE_APPROVE', pid, { orderId: result.orderId, amount: result.amount });
+          await logAudit('owner_tg', 'FINANCE_APPROVE', pid, { 
+            orderId: result.orderId, 
+            amount: result.amount,
+            tokenCount: result.tokenCount,
+            packages: (result.tokens || []).map(t => t.packageName)
+          });
         } else {
           const reason = 'Ditolak owner via Telegram';
           await db.collection('pending_payments').doc(pid).update({ status: 'rejected', rejectedBy: cb.from.username || 'owner', rejectedAt: new Date().toISOString(), reason });
@@ -599,6 +611,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
           await logAudit('owner_tg', 'FINANCE_REJECT', pid, { reason });
         }
         return res.status(200).json({ status: 'ok' });
+      }
       }
 
       if (cb.data === 'trial_claim') {
@@ -1066,7 +1079,8 @@ app.post('/api/get-snap-token', snapLimiter, async (req, res) => {
   }
 });
 
-// C. Webhook Midtrans
+
+// C. Webhook Midtrans — MULTI-TOKEN (1 settlement → N token aktif per package)
 app.post('/api/payment-webhook', async (req, res) => {
   try {
     const notification = req.body;
@@ -1081,81 +1095,116 @@ app.post('/api/payment-webhook', async (req, res) => {
     const uid = String(notification.custom_field1 || '');
     const userEmail = notification.custom_field2;
 
-    if (transactionStatus == 'capture' || transactionStatus == 'settlement') {
-      if (fraudStatus == 'accept' || !fraudStatus) {
-        if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
-        db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
-        const setDocP = await db.collection('settings').doc('app').get();
-        const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
-        const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-        const expiredDate = new Date();
-        expiredDate.setDate(expiredDate.getDate() + planDays);
-
-        let username = null;
-        try {
-          const chatInfo = await db.collection('telegram_chats').doc(uid).get();
-          if (chatInfo.exists) username = chatInfo.data().username || null;
-        } catch (e) { }
-
-        const existingUser = await db.collection('users').doc(uid).get();
-        const isNewUser = !existingUser.exists;
-
-        await db.collection('users').doc(uid).set({
-          uid, username, email: userEmail || 'tidak_ada_email',
-          token: tokenMod, deviceId: existingUser.exists ? existingUser.data().deviceId : null,
-          expiredAt: expiredDate, status: 'ACTIVE',
-          source: 'payment', tier: 'vip',
-          packageName: existingUser.exists ? existingUser.data().packageName : null,
-          remindedH3: false, remindedH1: false,
-          createdAt: existingUser.exists && existingUser.data().createdAt ? existingUser.data().createdAt : new Date().toISOString()
-        });
-
-        try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) { }
-
-        if (isNewUser) {
-          try {
-            const snapT = await db.collection('fcm_tokens').get();
-            const tokens = snapT.docs.map(d => d.data().token).filter(Boolean);
-            if (tokens.length && messaging) {
-              await messaging.sendEachForMulticast({
-                tokens,
-                data: { title: '👥 User Baru!', body: `${username || 'User-' + uid} • Rp ${parseInt(notification.gross_amount).toLocaleString('id-ID')}`, type: 'newuser' }
-              });
-            }
-          } catch (e) { console.error('Push user baru gagal:', e.message); }
-        }
-
-        try {
-          const amount = parseInt(notification.gross_amount) || 0;
-          const dateKey = new Date().toISOString().slice(0, 10);
-          await db.collection('transactions').doc(notification.order_id).set({
-            orderId: notification.order_id, uid, amount, status: transactionStatus,
-            channel: notification.payment_type || 'unknown', email: userEmail || null,
-            mode: MIDTRANS_MODE, paidAt: new Date().toISOString()
-          });
-          await db.collection('finance_daily').doc(dateKey).set({ date: dateKey }, { merge: true });
-          await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
-          await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
-          await notifyOps(`💰 <b>Pembayaran Masuk</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code>`, { safe: `💰 Pembayaran masuk • UID ${uid}`, type: 'pay' });
-          await pushAllAdmins('💰 Donasi Masuk!', `Rp ${amount.toLocaleString('id-ID')} • UID ${uid} • ${planDays} hari`, 'pay');
-        } catch (e) { console.error('Ledger write gagal:', e.message); }
-
-        try {
-          const chatDoc = await db.collection('telegram_chats').doc(uid).get();
-          const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-          let inviteText = '⚠️ Link invite VIP gagal dibuat otomatis.';
-          let inviteMarkup = undefined;
-          try {
-            const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
-            inviteText = '🚪 Ketuk tombol di bawah untuk masuk (link sekali pakai):';
-            inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
-          } catch (invErr) { console.error('Gagal invite VIP:', invErr.message); }
-          const msg = await getTpl('payment_success', { tanggal: expiredDate.toLocaleString('id-ID'), token: tokenMod, invite: inviteText });
-          await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML', ...(inviteMarkup ? { reply_markup: inviteMarkup } : {}) });
-        } catch (err) { console.error("Gagal mengirim DM:", err.message); }
-      }
+    // Hanya proses settlement/capture yang fraud=accept
+    if (!(transactionStatus == 'capture' || transactionStatus == 'settlement')) {
+      return res.status(200).json({ status: 'IGNORED_STATUS' });
     }
-    res.status(200).json({ status: 'OK' });
+    if (fraudStatus && fraudStatus !== 'accept') {
+      return res.status(200).json({ status: 'IGNORED_FRAUD' });
+    }
+    if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
+
+    // 🔒 IDEMPOTENCY: kalau order_id sudah tercatat di transactions, skip (webhook repeat)
+    const existingTx = await db.collection('transactions').doc(notification.order_id).get();
+    if (existingTx.exists) return res.status(200).json({ status: 'ALREADY_PROCESSED' });
+
+    db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
+
+    const setDocP = await db.collection('settings').doc('app').get();
+    const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
+    const amount = parseInt(notification.gross_amount) || 0;
+    const now = new Date();
+    const expiredDate = new Date(now.getTime() + planDays * 86400000);
+
+    // Ambil username Telegram dari chat record
+    let username = null;
+    try {
+      const chatInfo = await db.collection('telegram_chats').doc(uid).get();
+      if (chatInfo.exists) username = chatInfo.data().username || null;
+    } catch (e) { }
+
+    // 🔥 AMBIL SEMUA PACKAGE AKTIF
+    const pkgSnap = await db.collection('packages').where('active', '==', true).get();
+    const activePackages = pkgSnap.docs.map(d => d.data().packageName);
+
+    if (activePackages.length === 0) {
+      console.error('Midtrans webhook: no active packages');
+      return res.status(200).json({ status: 'ERROR_NO_PACKAGES' });
+    }
+
+    // 🔥 GENERATE N TOKEN (1 per package) + LANGSUNG AKTIFKAN (karena sudah settlement)
+    const tokens = [];
+    for (const pkg of activePackages) {
+      const { id, code, masked } = await createPendingLicense(db, {
+        packageName: pkg,
+        durationDays: planDays,
+        createdBy: 'midtrans_auto',
+        source: 'midtrans'
+      });
+      // Langsung activate (Midtrans sudah konfirmasi pembayaran)
+      await db.collection('users').doc(id).update({
+        status: 'ACTIVE',
+        username: username,
+        email: userEmail || null,
+        expiredAt: expiredDate,
+        activatedAt: now.toISOString(),
+        lastLoginAt: null
+      });
+      tokens.push({ code, masked, packageName: pkg, id });
+    }
+
+    // Hapus trial claims user ini (kalau ada)
+    try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) { }
+
+    // Catat 1 transaksi (total amount, metadata jumlah token)
+    const dateKey = now.toISOString().slice(0, 10);
+    try {
+      await db.collection('transactions').doc(notification.order_id).set({
+        orderId: notification.order_id, uid, amount, status: transactionStatus,
+        channel: notification.payment_type || 'unknown', email: userEmail || null,
+        mode: MIDTRANS_MODE, paidAt: now.toISOString(),
+        tokenCount: tokens.length,
+        packages: tokens.map(t => t.packageName)
+      });
+      await db.collection('finance_daily').doc(dateKey).set({ date: dateKey }, { merge: true });
+      await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
+      await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
+      const tokenPreview = tokens.map(t => `${t.packageName.split('.').pop()}: ${t.masked}`).join(' • ');
+      await notifyOps(`💰 <b>Midtrans Settlement</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code> • ${notification.payment_type}\n<b>${tokens.length} token:</b> ${tokenPreview}`, { safe: `💰 Midtrans settlement • UID ${uid} (${tokens.length} token)`, type: 'pay' });
+      await pushAllAdmins('💰 Midtrans Masuk!', `Rp ${amount.toLocaleString('id-ID')} • UID ${uid} • ${tokens.length} token • ${planDays}d`, 'pay');
+    } catch (e) { console.error('Ledger write gagal:', e.message); }
+
+    // DM USER dengan multi-token
+    try {
+      const chatDoc = await db.collection('telegram_chats').doc(uid).get();
+      const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
+
+      const tokenLines = tokens.map(t => {
+        const shortPkg = t.packageName.split('.').pop();
+        let label = `📱 <b>${shortPkg}</b>`;
+        if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 <b>App Grab Driver</b>';
+        else if (t.packageName.includes('phantom')) label = '👻 <b>App Phantom</b>';
+        return `${label}:\n<code>${t.code}</code>`;
+      }).join('\n\n');
+
+      let inviteText = '⚠️ Link invite VIP gagal dibuat otomatis.';
+      let inviteMarkup = undefined;
+      try {
+        const invite = await createInviteLink(VIP_GROUP_ID, { member_limit: 1 });
+        inviteText = '🚪 Ketuk tombol di bawah untuk masuk (link sekali pakai):';
+        inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
+      } catch (invErr) { console.error('Gagal invite VIP:', invErr.message); }
+
+      const msg = await getTpl('payment_success', { 
+        planDays, 
+        tokens: tokenLines,
+        tokens_count: tokens.length,
+        invite: inviteText 
+      });
+      await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML', ...(inviteMarkup ? { reply_markup: inviteMarkup } : {}) });
+    } catch (err) { console.error("Gagal mengirim DM:", err.message); }
+
+    res.status(200).json({ status: 'OK', tokenCount: tokens.length });
   } catch (error) {
     console.error('Webhook Error:', error);
     res.status(500).json({ error: error.message });
