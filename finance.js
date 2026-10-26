@@ -80,7 +80,7 @@ async function activatePaymentUser(db, uid, planDays, channel) {
   return { token: tokenMod, expiredAt: expiredDate, username, isNewUser };
 }
 
-// 🔥 APPROVE PENDING PAYMENT — GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-app)
+// 🔥 APPROVE PENDING PAYMENT — GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-app) + STAMP OWNER TG UID
 async function approvePendingPayment(db, pendingId, byName, editedAmount) {
   const ref = db.collection('pending_payments').doc(pendingId);
   let p = null;
@@ -110,7 +110,7 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
       throw new Error('Tidak ada package aktif di database. Hubungi owner untuk setup packages.');
     }
 
-    // 🔥 GENERATE 1 PENDING LICENSE PER PACKAGE AKTIF (multi-token)
+    // 🔥 GENERATE 1 PENDING LICENSE PER PACKAGE AKTIF (multi-token) + STAMP OWNER TG UID
     const tokens = [];
     for (const pkg of activePackages) {
       const { id, code, masked } = await createPendingLicense(db, {
@@ -119,9 +119,10 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
         createdBy: byName,
         source: 'gopay_proof'
       });
-      // Stamp username Telegram ke doc user biar admin panel kelihatan
+      // Stamp username + OWNER TG UID ke doc user (patokan sync check & admin panel)
       await db.collection('users').doc(id).update({
         username: p.username || null,
+        ownerTgUid: String(p.uid),   // 🔥 BARU: UID Telegram asli pengirim bukti
         source: 'gopay_proof',
         createdBy: byName
       });
@@ -184,7 +185,7 @@ async function finalizeApprovedPayment(db, helpers, r) {
       inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
     } catch (e) { /* abaikan */ }
 
-      const msgText = await getTpl('payment_success', {
+    const msgText = await getTpl('payment_success', {
       planDays: r.planDays || 30,
       tokens: tokenLines || '⚠️ Token tidak tersedia',
       tokens_count: r.tokenCount || (r.tokens ? r.tokens.length : 1),
