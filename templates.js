@@ -130,7 +130,50 @@ Aphelion = <b>Tools Premium</b> untuk:
 👇 <b>KETUK TOMBOL DI BAWAH</b>
 (Otomatis buka chat pribadi bot)`,
 
-  welcome_vip: '🌟 <b>SELAMAT DATANG DI APHELION PRIME!</b>\n\nHalo, <a href="tg://user?id={uid}">{nama}</a>! Selamat bergabung di lingkaran VIP. 🌌\n\nDi sini Anda mendapatkan:\n✅ Akses fitur & konten premium\n✅ Info update & prioritas support\n✅ Komunitas eksklusif\n\nSimpan baik-baik token akses Anda. Jika butuh bantuan, hubungi admin.\n\nNikmati pengalamannya! 🚀\n\n— Manajemen Aphelion',
+    welcome_vip: '🌟 <b>SELAMAT DATANG DI APHELION PRIME!</b>\n\nHalo, <a href="tg://user?id={uid}">{nama}</a>! Selamat bergabung di lingkaran VIP. 🌌\n\nDi sini Anda mendapatkan:\n✅ Akses fitur & konten premium\n✅ Info update & prioritas support\n✅ Komunitas eksklusif\n\nSimpan baik-baik token akses Anda. Jika butuh bantuan, hubungi admin.\n\nNikmati pengalamannya! 🚀\n\n— Manajemen Aphelion',
+
+  // 🌟 BARU: Kartu welcome khusus grup VIP (identitas + masa aktif + lisensi)
+  welcome_vip_card: `🌟 <b>SELAMAT DATANG DI APHELION PRIME • VIP</b>
+
+👋 Halo <b>{firstName}</b>! Selamat bergabung di lingkaran eksklusif.
+
+📋 <b>IDENTITAS MEMBER</b>
+🆔 UID: <code>{uid}</code>
+👤 Telegram: @{username}
+🎉 Nama: <b>{firstName}</b>
+
+💎 <b>KARTU KEANGGOTAAN</b>
+📅 Join grup : {joinDate}
+{expiredLabel}
+⏱️ Durasi    : <b>{planDays} hari</b>
+📱 Lisensi  : {licenseStatus}
+
+🔔 <b>PENGINGAT OTOMATIS</b>
+Bot mengingatkan kamu H-3 & H-1 sebelum
+masa aktif berakhir via chat pribadi.
+
+⚠️ <b>ATURAN BERLAKU</b>
+Saat masa aktif berakhir, bot otomatis
+mengeluarkan kamu dari grup ini.
+Perpanjang kapan saja: ketik <code>/beli</code> di bot.
+
+Selamat menikmati fasilitas VIP! 🌌
+— Manajemen Aphelion`,
+
+  // 🚨 BARU: Reminder H-1 dipost di grup VIP (tag @username)
+  reminder_h1_group: `🚨 <b>PENGINGAT AKHIR</b>
+
+@{username} — masa aktif VIP kamu berakhir <b>besok</b>
+📅 Expired: {tanggal}
+
+Perpanjang hari ini biar gak ke-kick otomatis
+👉 ketik <code>/beli</code> di bot`,
+
+  // 👋 BARU: Pengumuman kick di grup VIP
+  kick_announcement: `👋 <b>@{username}</b> keluar otomatis karena masa aktif berakhir
+📅 Expired: {tanggal}
+
+Pintu VIP terbuka kapan saja — perpanjang via bot. 🌌`,
 
   // 🔥 UPDATED: multi-token format (2 app)
   payment_success: `✅ <b>Pembayaran Terverifikasi</b>
@@ -173,7 +216,10 @@ const VARS = {
   pay_qris: ['price', 'planDays'],
   pay_guide: ['price', 'planDays'],
   welcome_public: ['nama', 'uid', 'username', 'tanggal', 'trialDays', 'price', 'planDays'],
-  welcome_vip: ['nama', 'uid'],
+    welcome_vip: ['nama', 'uid'],
+  welcome_vip_card: ['firstName', 'uid', 'username', 'joinDate', 'expiredLabel', 'planDays', 'licenseStatus'],
+  reminder_h1_group: ['username', 'tanggal'],
+  kick_announcement: ['username', 'tanggal'],
   payment_success: ['planDays', 'tokens', 'tokens_count', 'invite'],
   expired_dm: [],
   reminder_h3: ['tanggal'], reminder_h1: ['tanggal'],
