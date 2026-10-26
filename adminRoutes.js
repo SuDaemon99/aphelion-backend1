@@ -4,7 +4,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { getFirestore } = require('firebase-admin/firestore');
-const { Redis } = require('@upstash/redis'); // 🔥 TAMBAHAN BARU
 const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
@@ -28,11 +27,65 @@ const requireApprover = async (req, res, next) => {
 const db = getFirestore();
 const router = express.Router();
 
-// 🔥 INISIALISASI REDIS ADMIN
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
+const createSafeRedis = () => {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+  
+  let redisBlockedUntil = 0;
+  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
+  
+  try {
+    const { Redis } = require('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+
+    const safeGet = async (key) => {
+      if (Date.now() < redisBlockedUntil) return null;
+      try { return await redis.get(key); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return null;
+      }
+    };
+
+    const safeSet = async (key, value, opts) => {
+      if (Date.now() < redisBlockedUntil) return;
+      try { await redis.set(key, value, opts); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+      }
+    };
+
+    const safeKeys = async (pattern) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try { return await redis.keys(pattern); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return [];
+      }
+    };
+
+    const safeMget = async (...keys) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try { return await redis.mget(...keys); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return [];
+      }
+    };
+
+    return { get: safeGet, set: safeSet, keys: safeKeys, mget: safeMget };
+  } catch (e) {
+    console.error('Redis init error:', e.message);
+    return null;
+  }
+};
+
+const redis = createSafeRedis();
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
@@ -42,7 +95,7 @@ const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
 
 const OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];
 const ADMIN_AVATARS = ['admin_1', 'admin_2', 'admin_3', 'admin_4', 'admin_5', 'admin_6'];
-const REACT_EMOJI = ['👍', '✅', '🔥', '', '😮'];
+const REACT_EMOJI = ['👍', '✅', '🔥', '⭐', '😮'];
 
 const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -537,12 +590,12 @@ router.get('/team/unread', requireAuth, async (req, res) => {
 
     // ===== 🔊 SOUND PRIORITAS (buka 'pay' untuk approver, bukan owner saja) =====
     let sound = null;
-    if (canApprove && types.includes('pay')) sound = 'pay';          // ✅ DIBUKA
+    if (canApprove && types.includes('pay')) sound = 'pay';
     else if (types.includes('critical')) sound = 'critical';
     else if (types.includes('maint')) sound = 'maint';
     else if (types.includes('login')) sound = 'login';
 
-        // ===== 💰 HITUNG PENDING + NOMINAL PERTAMA (untuk TTS app) =====
+    // ===== 💰 HITUNG PENDING + NOMINAL PERTAMA (untuk TTS app) =====
     let financePending = 0;
     let pendingFirstAmount = 0;
     try {
@@ -568,7 +621,7 @@ router.get('/team/unread', requireAuth, async (req, res) => {
       sound, 
       financePending, 
       canApprove,
-      pendingFirstAmount   // 🆕 field baru untuk TTS
+      pendingFirstAmount
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -734,13 +787,15 @@ router.get('/locations', requireAuth, async (req, res) => {
     const dbLocations = snap.docs.map(serializeLocation).filter(Boolean);
     
     let liveLocations = [];
-    try {
+    if (redis) {
+      try {
         const keys = await redis.keys('loc:*');
         if (keys && keys.length > 0) {
           const rawData = await redis.mget(...keys);
           liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
         }
-    } catch (redisErr) { console.error("Redis Read Error:", redisErr.message); }
+      } catch (redisErr) { console.error("Redis Read Error:", redisErr.message); }
+    }
 
     // Merge: Data dari Redis otomatis nimpa data dari Firestore biar lebih akurat
     const redisMap = {};
@@ -777,13 +832,15 @@ router.get('/locations/stats', requireAuth, async (req, res) => {
     const dbLocations = snap.docs.map(d => d.data());
     
     let liveLocations = [];
-    try {
+    if (redis) {
+      try {
         const keys = await redis.keys('loc:*');
         if (keys && keys.length > 0) {
           const rawData = await redis.mget(...keys);
           liveLocations = rawData.filter(Boolean).map(item => typeof item === 'string' ? JSON.parse(item) : item);
         }
-    } catch (e) {}
+      } catch (e) {}
+    }
 
     const redisMap = {};
     liveLocations.forEach(l => { redisMap[l.uid] = l; });
@@ -835,10 +892,12 @@ router.post('/locations/settings', requireAuth, requireOwner, async (req, res) =
 router.get('/locations/:uid', requireAuth, async (req, res) => {
   try {
     let locData = null;
-    try {
-       const r = await redis.get(`loc:${req.params.uid}`);
-       if (r) locData = typeof r === 'string' ? JSON.parse(r) : r;
-    } catch (e) {}
+    if (redis) {
+      try {
+        const r = await redis.get(`loc:${req.params.uid}`);
+        if (r) locData = typeof r === 'string' ? JSON.parse(r) : r;
+      } catch (e) {}
+    }
     
     if (!locData) {
         const d = await db.collection('user_locations').doc(req.params.uid).get();
@@ -880,7 +939,8 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
       paused: true, stoppedBy: req.admin.sub, stoppedAt: ts
     }, { merge: true });
     
-    try {
+    if (redis) {
+      try {
         let liveData = await redis.get(`loc:${uid}`);
         if (liveData) {
             if (typeof liveData === 'string') liveData = JSON.parse(liveData);
@@ -889,7 +949,8 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
             liveData.stoppedAt = ts;
             await redis.set(`loc:${uid}`, JSON.stringify(liveData), { ex: 60 });
         }
-    } catch(e){}
+      } catch(e){}
+    }
 
     await logAudit(req.admin.sub, 'LOCATION_STOP', uid, { reason: req.body.reason || 'Manual stop' });
     await notifyOps(`🛑 <b>Tracking dimatikan</b> oleh ${req.admin.sub}\nUID <code>${uid}</code>`, { safe: `🛑 Tracking ${uid} dimatikan ${req.admin.sub}`, type: 'system' });
