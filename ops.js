@@ -1,40 +1,3 @@
-const axios = require('axios');
-const { getFirestore } = require('firebase-admin/firestore');
-const { getTpl } = require('./templates');
-
-const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
-const OWNER_TELEGRAM_ID = process.env.OWNER_TELEGRAM_ID || null;
-
-const notifyOps = async (full, opts = {}) => {
-  const db = getFirestore();
-  const type = opts.type || (opts.critical ? 'critical' : 'system');
-  try {
-    const exp = new Date(); exp.setDate(exp.getDate() + 180);
-    await db.collection('ops_feed').add({
-      full,
-      safe: opts.safe || full,
-      type,
-      at: new Date().toISOString(),
-      exp
-    });
-  } catch (e) { console.error('ops_feed write gagal:', e.message); }
-
-  if (opts.critical && OWNER_TELEGRAM_ID) {
-    try {
-      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: OWNER_TELEGRAM_ID, text: full, parse_mode: 'HTML' });
-    } catch (e) { console.error('DM kritis gagal:', e.message); }
-  }
-};
-
-// 🔍 DIPINDAH DARI adminRoutes.js biar server.js & bot webhook bisa pakai
-const logAudit = async (admin, action, target = null, meta = {}) => {
-  try {
-    const db = getFirestore();
-    const exp = new Date(); exp.setDate(exp.getDate() + 180);
-    await db.collection('audit_logs').add({ admin: admin || 'system', action, target, meta, at: new Date().toISOString(), exp });
-  } catch (e) { console.error('Audit log gagal:', e.message); }
-};
-
 const runReminders = async () => {
   const db = getFirestore();
   const now = new Date();
@@ -66,5 +29,3 @@ const runReminders = async () => {
   }
   return sent;
 };
-
-module.exports = { notifyOps, runReminders, logAudit };
