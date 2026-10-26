@@ -184,9 +184,10 @@ async function finalizeApprovedPayment(db, helpers, r) {
       inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
     } catch (e) { /* abaikan */ }
 
-    const msgText = await getTpl('payment_success', {
+      const msgText = await getTpl('payment_success', {
       planDays: r.planDays || 30,
       tokens: tokenLines || '⚠️ Token tidak tersedia',
+      tokens_count: r.tokenCount || (r.tokens ? r.tokens.length : 1),
       invite: inviteText
     });
     await sendTG(r.chatId, msgText, { parse_mode: 'HTML', ...(inviteMarkup ? { reply_markup: inviteMarkup } : {}) });
