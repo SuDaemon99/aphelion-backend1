@@ -1151,9 +1151,10 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
     const ids = snap.docs.map(d => d.data().messageId);
     const docRefs = snap.docs.map(d => d.ref);
 
-    let deleted = 0, failed = 0;
+        let deleted = 0, failed = 0;
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100);
+      const refsBatch = docRefs.slice(i, i + 100);
       try {
         await axios.post(`${TELEGRAM_API}/deleteMessages`, { chat_id: gid, message_ids: batch });
         deleted += batch.length;
@@ -1162,12 +1163,12 @@ router.post('/bot/clean', requireAuth, requireOwner, async (req, res) => {
           try { await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: gid, message_id: mid }); deleted++; } catch (e2) { failed++; }
         }
       }
-    }
-
-    for (let i = 0; i < docRefs.length; i += 400) {
-      const batchDB = db.batch();
-      docRefs.slice(i, i + 400).forEach(ref => batchDB.delete(ref));
-      await batchDB.commit();
+      // ✅ Simpan progres per batch: record DB langsung dihapus biar timeout gak mengulang kerja
+      try {
+        const bdb = db.batch();
+        refsBatch.forEach(ref => bdb.delete(ref));
+        await bdb.commit();
+      } catch (e) { console.error('DB batch delete gagal:', e.message); }
     }
 
     await logAudit(req.admin.sub, 'CLEAN_GROUP', target, { deleted, failed });
