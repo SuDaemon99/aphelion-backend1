@@ -1232,6 +1232,51 @@ app.post('/api/payment-webhook', async (req, res) => {
   }
 });
 
+// ===== 🔁 SMART AUTO-REBIND: verifikasi identitas sebelum tolak HWID =====
+const MEMBER_OK = ['creator', 'administrator', 'member'];
+
+const getChatMemberStatus = async (chatId, userId) => {
+  try {
+    const r = await axios.post(`${TELEGRAM_API}/getChatMember`, { chat_id: chatId, user_id: userId });
+    return (r.data.result && r.data.result.status) || null;
+  } catch (e) { return null; }
+};
+
+const verifyIdentityForRebind = async (u, tg, pkg) => {
+  // 1) Username wajib ada & cocok dengan binding lisensi (yang tampil di Admin Panel)
+  if (!tg) return { ok: false, reason: 'no_username' };
+  const bound = String(u.username || '').replace(/^@/, '').toLowerCase();
+  if (!bound || bound !== tg) return { ok: false, reason: 'username_mismatch' };
+
+  // 2) Package wajib cocok dengan doc lisensi (App A ≠ doc App B)
+  if (u.packageName && pkg && u.packageName !== pkg) return { ok: false, reason: 'package_mismatch' };
+
+  // 3) Cooldown 24 jam per doc — anti abuse & anti ping-pong
+  if (u.lastAutoRebindAt) {
+    const last = new Date(u.lastAutoRebindAt).getTime();
+    if (Date.now() - last < 24 * 3600 * 1000) return { ok: false, reason: 'cooldown_24h' };
+  }
+
+  // 4) Cari UID Telegram dari username (collection telegram_chats)
+  let tgUid = null;
+  try {
+    const s = await db.collection('telegram_chats').where('username', '==', tg).limit(1).get();
+    if (!s.empty) tgUid = s.docs[0].id;
+  } catch (e) {}
+  if (!tgUid && /^\d{5,15}$/.test(String(u.uid || ''))) tgUid = String(u.uid);
+  if (!tgUid) return { ok: false, reason: 'tg_uid_not_found' };
+
+  // 5) Cek keanggotaan grup: VIP/Prime untuk member bayar, grup publik untuk trial
+  const vipStatus = await getChatMemberStatus(VIP_GROUP_ID, tgUid);
+  if (vipStatus && MEMBER_OK.includes(vipStatus)) return { ok: true, reason: 'vip_member' };
+  if (u.source === 'trial' || u.tier === 'trial') {
+    const pubStatus = await getChatMemberStatus(PUBLIC_GROUP_ID, tgUid);
+    if (pubStatus && MEMBER_OK.includes(pubStatus)) return { ok: true, reason: 'public_member_trial' };
+  }
+  return { ok: false, reason: 'not_group_member' };
+};
+
+
 // D. LOGIN APP PRODUKSI v2
 const modLoginLimiter = rateLimit({ windowMs: 60 * 1000, max: 20 });
 
@@ -1306,13 +1351,27 @@ const handleModLogin = async (req, res) => {
       if (!bound) await db.collection('users').doc(uid).update({ username: tg });
     }
 
-    if (!u.deviceId) {
+        if (!u.deviceId) {
       await db.collection('users').doc(uid).update({ deviceId, deviceInfo: deviceInfo || null });
     } else if (u.deviceId !== deviceId) {
-      await logAudit('system', 'LOGIN_REJECT_HWID', uid, { deviceId, bound: u.deviceId });
-      await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code>`, { critical: true });
-      await pushAllAdmins('🚨 HWID MISMATCH!', `UID ${uid} device lain`, 'critical');
-      return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Token terikat di perangkat lain.' });
+      // 🔁 Coba SMART AUTO-REBIND sebelum menolak mentah-mentah
+      const chk = await verifyIdentityForRebind(u, tg, pkg);
+      if (chk.ok) {
+        const oldDev = u.deviceId;
+        await db.collection('users').doc(uid).update({
+          deviceId, deviceInfo: deviceInfo || null,
+          lastAutoRebindAt: now.toISOString()
+        });
+        await logAudit('system', 'AUTO_REBIND', uid, { old: oldDev, new: deviceId, pkg: pkg || u.packageName || null, via: chk.reason });
+        await notifyOps(`🔁 <b>AUTO-REBIND DEVICE</b>\n@${tg} • ${pkg || u.packageName || '-'}\nLolos verifikasi: ${chk.reason}\nOld: <code>${oldDev}</code> → New: <code>${deviceId}</code>`, { safe: `🔁 Auto-rebind @${tg} (${chk.reason})` });
+        await pushAllAdmins('🔁 AUTO-REBIND', `@${tg} • ${shortPkg(pkg || u.packageName)} • ${chk.reason}`, 'critical');
+        // lanjut flow login normal — TIDAK return, user langsung masuk
+      } else {
+        await logAudit('system', 'LOGIN_REJECT_HWID', uid, { deviceId, bound: u.deviceId, rebindDitolak: chk.reason });
+        await notifyOps(`🚨 <b>HWID MISMATCH</b>\nUID <code>${uid}</code>\nAuto-rebind ditolak: ${chk.reason}`, { critical: true });
+        await pushAllAdmins('🚨 HWID MISMATCH!', `UID ${uid} device lain`, 'critical');
+        return res.status(403).json({ status: 'HWID_MISMATCH', message: 'Token terikat di perangkat lain.' });
+      }
     }
 
     const patchOk = { lastLoginAt: now.toISOString(), lastLoginIp: ip };
