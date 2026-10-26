@@ -308,9 +308,48 @@ router.post('/users/:uid/extend', requireAuth, async (req, res) => {
 });
 
 router.post('/users/:uid/reset-hwid', requireAuth, async (req, res) => {
-  await db.collection('users').doc(req.params.uid).update({ deviceId: null });
-  await logAudit(req.admin.sub, 'RESET_HWID', req.params.uid);
-  res.json({ status: 'OK' });
+  try {
+    const uid = req.params.uid;
+    const d = await db.collection('users').doc(uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const u = d.data();
+    const tgUsername = u.username ? String(u.username).toLowerCase() : null;
+
+    // Reset di doc yang di-request
+    await db.collection('users').doc(uid).update({ deviceId: null, deviceInfo: null });
+    let resetCount = 1;
+    const resetPackages = [u.packageName || 'unknown'];
+
+    // Kalau user punya username Telegram, reset juga semua doc lain dengan username yang sama
+    // (karena user dengan 2 app = 2 doc, masing-masing deviceId berbeda)
+    if (tgUsername) {
+      const siblings = await db.collection('users')
+        .where('username', '==', tgUsername)
+        .where('status', 'in', ['ACTIVE', 'PENDING', 'EXPIRED'])
+        .get();
+      for (const sib of siblings.docs) {
+        if (sib.id === uid) continue; // sudah di-reset di atas
+        await db.collection('users').doc(sib.id).update({ deviceId: null, deviceInfo: null });
+        resetCount++;
+        resetPackages.push(sib.data().packageName || 'unknown');
+      }
+    }
+
+    await logAudit(req.admin.sub, 'RESET_HWID', uid, { 
+      totalReset: resetCount,
+      packages: resetPackages,
+      telegramUsername: tgUsername
+    });
+    await notifyOps(`🔄 <b>Reset HWID</b> oleh ${req.admin.sub}\nUID <code>${uid}</code> • ${resetCount} device direset`, { 
+      safe: `🔄 Reset HWID ${uid} (${resetCount} device)`, type: 'critical' 
+    });
+
+    res.json({ 
+      status: 'OK', 
+      resetCount, 
+      packages: resetPackages 
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.post('/users/:uid/ban', requireAuth, async (req, res) => {
@@ -1551,15 +1590,27 @@ router.get('/finance/pending', requireAuth, async (req, res) => {
 
 router.post('/finance/pending/:id/approve', requireAuth, requireApprover, async (req, res) => {
   try {
-    const edited = parseInt(req.body.amount) || 0; // 0 = pakai nominal auto-detect
+    const edited = parseInt(req.body.amount) || 0;
     const result = await approvePendingPayment(db, req.params.id, req.admin.sub, edited);
     if (!result.ok) return res.status(409).json({ error: result.error });
     await finalizeApprovedPayment(db, {
       sendTG: sendTG, getTpl, createInviteLink: createInviteLinkLocal,
       vipGroupId: VIP_GROUP_ID, pushAll, notifyOps
     }, result);
-    await logAudit(req.admin.sub, 'FINANCE_APPROVE', req.params.id, { orderId: result.orderId, amount: result.amount, edited: edited > 0 });
-    res.json({ status: 'APPROVED', orderId: result.orderId, amount: result.amount });
+    await logAudit(req.admin.sub, 'FINANCE_APPROVE', req.params.id, { 
+      orderId: result.orderId, 
+      amount: result.amount, 
+      edited: edited > 0,
+      tokenCount: result.tokenCount || result.tokens?.length || 1,
+      packages: (result.tokens || []).map(t => t.packageName)
+    });
+    res.json({ 
+      status: 'APPROVED', 
+      orderId: result.orderId, 
+      amount: result.amount,
+      tokenCount: result.tokenCount || result.tokens?.length || 1,
+      tokens: (result.tokens || []).map(t => ({ masked: t.masked, packageName: t.packageName }))
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1577,7 +1628,7 @@ router.post('/finance/pending/:id/reject', requireAuth, requireApprover, async (
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🧾 FALLBACK: catat manual (tunai/transfer/GoPay yang tidak lewat bot) — langsung POSTED + aktivasi
+// 🧾 FALLBACK: catat manual (tunai/transfer/GoPay yang tidak lewat bot) — multi-token
 router.post('/finance/record-manual', requireAuth, requireApprover, async (req, res) => {
   try {
     const uid = String(req.body.uid || '');
@@ -1590,14 +1641,62 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
     const setDoc = await db.collection('settings').doc('app').get();
     const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
 
+    // Ambil username Telegram
+    let username = null;
+    try {
+      const chatInfo = await db.collection('telegram_chats').doc(uid).get();
+      if (chatInfo.exists) username = chatInfo.data().username || null;
+    } catch (e) {}
+
+    // Ambil semua package aktif
+    const pkgSnap = await db.collection('packages').where('active', '==', true).get();
+    const activePackages = pkgSnap.docs.map(d => d.data().packageName);
+    if (activePackages.length === 0) {
+      return res.status(400).json({ error: 'Tidak ada package aktif di database.' });
+    }
+
+    // Generate 1 token per package + LANGSUNG activate (manual = sudah dikonfirmasi)
+    const tokens = [];
+    for (const pkg of activePackages) {
+      const { id, code, masked } = await createPendingLicense(db, {
+        packageName: pkg,
+        durationDays: planDays,
+        createdBy: req.admin.sub,
+        source: 'manual'
+      });
+      await db.collection('users').doc(id).update({
+        status: 'ACTIVE',
+        username: username,
+        source: 'manual',
+        createdBy: req.admin.sub
+      });
+      tokens.push({ code, masked, packageName: pkg, id });
+    }
+
+    // Catat 1 transaksi
     await recordTransaction(db, { orderId, uid, amount, channel, source: 'manual', createdBy: req.admin.sub, note });
-    const act = await activatePaymentUser(db, uid, planDays, channel);
+
+    // Finalize: DM + invite + push + notify
     await finalizeApprovedPayment(db, {
       sendTG: sendTG, getTpl, createInviteLink: createInviteLinkLocal,
       vipGroupId: VIP_GROUP_ID, pushAll, notifyOps
-    }, { uid, amount, orderId, approvedBy: req.admin.sub, chatId: uid, username: act.username, token: act.token, expiredAt: act.expiredAt });
-    await logAudit(req.admin.sub, 'FINANCE_MANUAL', uid, { orderId, amount, channel });
-    res.json({ status: 'OK', orderId, token: act.token });
+    }, { 
+      uid, amount, orderId, approvedBy: req.admin.sub, 
+      chatId: uid, username, tokens, planDays,
+      tokenCount: tokens.length
+    });
+
+    await logAudit(req.admin.sub, 'FINANCE_MANUAL', uid, { 
+      orderId, amount, channel,
+      tokenCount: tokens.length,
+      packages: tokens.map(t => t.packageName)
+    });
+    res.json({ 
+      status: 'OK', 
+      orderId, 
+      tokenCount: tokens.length,
+      tokens: tokens.map(t => ({ code: t.code, packageName: t.packageName }))
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
