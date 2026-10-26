@@ -4,10 +4,8 @@ const DEFAULT_TPL = {
   pm_redirect: '📩 Silakan buka chat pribadi (PM) dengan bot ini lalu ketik /beli untuk mendapatkan link pembayaran pribadi Anda.',
   beli_maintenance: '🛠️ <b>Maintenance</b>\n\nSistem sedang dalam pemeliharaan. Penjualan dibuka kembali setelah selesai. Terima kasih! 🙏',
 
-  // 🔥 UPDATE: tanpa link web — semua lewat tombol QRIS di bawah
   beli_intro: '🌌 <b>Aphelion Membership Bot</b>\n\nHalo, <b>{nama}</b>!\n\n📌 Status langganan: {status}\n\n💳 <b>CARA BAYAR TERMUDAH:</b>\nKetuk tombol <b>💳 BAYAR VIA QRIS</b> di bawah → gambar QRIS resmi + panduan lengkap muncul langsung di chat ini.\nBayar dari aplikasi apa pun (GoPay, OVO, DANA, ShopeePay, m-banking), lalu kirim screenshot bukti ke sini.\nToken lisensi & invite VIP dikirim otomatis setelah verifikasi.\n\n🎁 Mau coba dulu gratis? Tekan tombol <b>COBA TRIAL GRATIS</b> — {trialDays} hari tanpa bayar.',
 
-  // 🔥 BARU: kartu QRIS (caption foto)
   pay_qris: `💳 <b>PEMBAYARAN VIA QRIS — CEPAT & RESMI</b>
 
 🏪 Merchant : <b>APHELION (MODS & TOOLS)</b>
@@ -31,13 +29,12 @@ const DEFAULT_TPL = {
 🔑 <b>KODE LISENSI TURUN OTOMATIS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ✅ Verifikasi owner/admin ±15 menit
-✅ Bot kirim token lisensi + invite grup VIP ke chat ini
+✅ Bot kirim <b>2 token lisensi</b> (1 per app) + invite grup VIP
 ✅ Masukkan token di layar login app → akses aktif!
 
 ⚠️ Selain merchant di atas = BUKAN Aphelion.
 🚫 Jangan transfer ke rekening/e-wallet pribadi siapapun.`,
 
-  // 🔥 BARU: panduan lengkap bayar → lisensi
   pay_guide: `📖 <b>PANDUAN LENGKAP: BAYAR → LISENSI</b>
 
 <b>TAHAP 1 — BAYAR VIA QRIS</b>
@@ -52,15 +49,17 @@ const DEFAULT_TPL = {
 • Lalu ketik nominalnya, contoh: <code>bayar 10000</code>
 • Bebas urutan: foto dulu atau nominal dulu — bot otomatis menjodohkan (maks jeda 15 menit)
 
-<b>TAHAP 3 — TERIMA KODE LISENSI</b>
+<b>TAHAP 3 — TERIMA 2 KODE LISENSI</b>
 • Owner/admin1 verifikasi bukti (±15 menit)
-• Bot kirim: 🔑 token lisensi + 🚪 tombol invite grup VIP
-• Buka app Aphelion → layar login → isi username TG + token → MASUK
-• Selesai! Akses VIP aktif {planDays} hari
+• Bot kirim <b>2 token</b>:
+  🚗 1 token untuk <b>App Grab Driver</b>
+  👻 1 token untuk <b>App Phantom</b>
+• Buka masing-masing app → layar login → isi username TG + token → MASUK
+• Selesai! Akses VIP aktif {planDays} hari di kedua app
 
 💡 <b>TIPS & ATURAN</b>
-• 1 token = 1 perangkat setelah login pertama
-• Screenshot token untuk backup pribadi
+• 1 token = 1 perangkat per app setelah login pertama
+• Screenshot <b>kedua token</b> untuk backup pribadi
 • Token hilang / ganti HP? Ketuk 🔑 di layar login → pemulihan mandiri
 • Bukti editan/palsu = blacklist permanen tanpa refund
 • Nominal di atas minimal = dianggap donasi apresiasi dev 💜`,
@@ -132,7 +131,24 @@ Aphelion = <b>Tools Premium</b> untuk:
 (Otomatis buka chat pribadi bot)`,
 
   welcome_vip: '🌟 <b>SELAMAT DATANG DI APHELION PRIME!</b>\n\nHalo, <a href="tg://user?id={uid}">{nama}</a>! Selamat bergabung di lingkaran VIP. 🌌\n\nDi sini Anda mendapatkan:\n✅ Akses fitur & konten premium\n✅ Info update & prioritas support\n✅ Komunitas eksklusif\n\nSimpan baik-baik token akses Anda. Jika butuh bantuan, hubungi admin.\n\nNikmati pengalamannya! 🚀\n\n— Manajemen Aphelion',
-  payment_success: '✅ <b>Pembayaran Terverifikasi</b>\n\nTerima kasih! Langganan VIP Anda aktif sampai <b>{tanggal}</b>.\n\n🔑 <b>Token akses Anda:</b>\n<code>{token}</code>\n\n{invite}\n\n⚠️ Token bersifat pribadi & terikat satu perangkat setelah aktivasi pertama. Jangan bagikan ke siapa pun.',
+
+  // 🔥 UPDATED: multi-token format (2 app)
+  payment_success: `✅ <b>Pembayaran Terverifikasi</b>
+
+Terima kasih! Langganan VIP Anda aktif <b>{planDays} hari</b> mulai login pertama di masing-masing app.
+
+🔑 <b>KODE LISENSI ANDA ({tokens_count} token):</b>
+
+{tokens}
+
+{invite}
+
+⚠️ <b>ATURAN PENTING:</b>
+• 1 kode = 1 perangkat per app (setelah login pertama)
+• Simpan <b>kedua kode</b> dengan screenshot
+• Jangan bagikan ke siapa pun
+• Token hilang? Ketuk 🔑 di layar login → pemulihan mandiri`,
+
   expired_dm: '⏳ <b>MASA AKTIF BERAKHIR</b>\n\nLangganan VIP Anda telah berakhir hari ini. Akses grup & fitur premium dinonaktifkan.\n\nIngin bergabung lagi? Ketik /beli untuk perpanjang. Sampai jumpa di dalam! 🌌',
   reminder_h3: '⏰ <b>PENGINGAT RAMAH</b>\n\nHalo! Langganan VIP Anda akan berakhir dalam <b>3 hari</b> ({tanggal}).\n\nPerpanjang sekarang agar tetap nyaman di grup VIP tanpa jeda:\n👉 ketik /beli di chat ini.\n\nTerima kasih! 🌌',
   reminder_h1: '🚨 <b>PEMBERITAHUAN TERAKHIR</b>\n\nLangganan VIP Anda berakhir <b>besok/hari ini</b> ({tanggal}). Setelah itu Anda otomatis dikeluarkan dari grup VIP.\n\n👉 Ketik /beli untuk perpanjang sekarang. Sampai jumpa di dalam! 🌌',
@@ -158,7 +174,8 @@ const VARS = {
   pay_guide: ['price', 'planDays'],
   welcome_public: ['nama', 'uid', 'username', 'tanggal', 'trialDays', 'price', 'planDays'],
   welcome_vip: ['nama', 'uid'],
-  payment_success: ['tanggal', 'token', 'invite'], expired_dm: [],
+  payment_success: ['planDays', 'tokens', 'tokens_count', 'invite'],
+  expired_dm: [],
   reminder_h3: ['tanggal'], reminder_h1: ['tanggal'],
   maintenance_on: ['durasi'], maintenance_off: [], settings_info: ['harga', 'hari'],
   broadcast_kop: ['text'], ban_dm: ['alasan'], resend_dm: ['token'],
