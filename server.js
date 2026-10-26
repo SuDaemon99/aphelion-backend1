@@ -19,10 +19,10 @@ const createSafeRedis = () => {
   if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
     return null;
   }
-  
+
   let redisBlockedUntil = 0;
   const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
-  
+
   try {
     const { Redis } = require('@upstash/redis');
     const redis = new Redis({
@@ -36,7 +36,7 @@ const createSafeRedis = () => {
         return await redis.get(key);
       } catch (err) {
         if (isQuotaError(err)) {
-          redisBlockedUntil = Date.now() + 3600000; // cooldown 1 jam
+          redisBlockedUntil = Date.now() + 3600000;
           console.error('🔴 Redis quota exceeded, cooldown 1 jam');
         }
         return null;
@@ -78,7 +78,7 @@ const parseAmount = (text) => {
   return null;
 };
 
-// 🧠 DETEKSI CHANNEL DARI TEKS USER (gopay/ovo/shopeepay/dana/bank dll)
+// 🧠 DETEKSI CHANNEL DARI TEKS USER
 const detectChannel = (text) => {
   const t = String(text || '').toLowerCase();
   if (t.includes('shopeepay') || t.includes('shopee') || t.includes('spay')) return 'shopeepay';
@@ -222,7 +222,7 @@ const finalizeProof = async (uid, data) => {
   return ref.id;
 };
 
-// ===== 💳 KARTU QRIS (pengganti halaman web) =====
+// ===== 💳 KARTU QRIS =====
 const sendQrisMessage = async (chatId) => {
   const setDoc = await db.collection('settings').doc('app').get();
   const st = setDoc.exists ? setDoc.data() : {};
@@ -360,21 +360,21 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   }
 };
 
-// ===== 📍 LOCATION PING (CONDITIONAL - bisa dimatikan via DISABLE_PING env) =====
+// ===== 📍 LOCATION PING (CONDITIONAL) =====
 const DISABLE_PING = process.env.DISABLE_PING === 'true';
 
 if (!DISABLE_PING) {
   const { ipKeyGenerator } = require('express-rate-limit');
-  const pingLimiter = rateLimit({ 
-    windowMs: 2 * 1000, 
-    max: 1, 
-    keyGenerator: (req) => req.body?.jwt || ipKeyGenerator(req.ip) 
+  const pingLimiter = rateLimit({
+    windowMs: 2 * 1000,
+    max: 1,
+    keyGenerator: (req) => req.body?.jwt || ipKeyGenerator(req.ip)
   });
 
   app.post('/api/user/ping', pingLimiter, async (req, res) => {
     try {
       const { jwt: jwtToken, deviceId, lat, lng, accuracy, speed, bearing, battery, netType, appState, consent, paused } = req.body || {};
-      
+
       if (!jwtToken) return res.status(401).json({ error: 'JWT Token wajib' });
       if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
@@ -386,15 +386,15 @@ if (!DISABLE_PING) {
       }
 
       const uid = decoded.uid;
-      
+
       if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
       if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
       if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
-      
+
       if (paused === true) {
         if (redis) {
-          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
-          catch(e){ console.error("Redis paused error:", e.message); }
+          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); }
+          catch (e) { console.error("Redis paused error:", e.message); }
         }
         return res.status(200).json({ status: 'PAUSED' });
       }
@@ -403,13 +403,13 @@ if (!DISABLE_PING) {
       const point = {
         uid, lat, lng, accuracy: typeof accuracy === 'number' ? accuracy : null,
         speed: typeof speed === 'number' ? speed : null, bearing: typeof bearing === 'number' ? bearing : null,
-        battery: typeof battery === 'number' ? battery : null, netType: netType || null, 
+        battery: typeof battery === 'number' ? battery : null, netType: netType || null,
         appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
       };
 
       if (redis) {
-        try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); } 
-        catch(redisErr) { console.error("Redis loc error:", redisErr.message); }
+        try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); }
+        catch (redisErr) { console.error("Redis loc error:", redisErr.message); }
       }
 
       try {
@@ -420,10 +420,10 @@ if (!DISABLE_PING) {
             lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
           });
           if (redis) {
-            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); 
+            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
           }
         }
-      } catch (dbErr) { 
+      } catch (dbErr) {
         console.error('DB write error:', dbErr.message);
       }
 
@@ -470,7 +470,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      // ===== 💳 QRIS & PANDUAN (pengganti halaman web) =====
+      // ===== 💳 QRIS & PANDUAN =====
       if (cb.data === 'pay_qris') {
         await answerCallbackQuery(cb.id, 'Menyiapkan QRIS...');
         await sendQrisMessage(cb.message.chat.id);
@@ -558,7 +558,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-            if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
+      // ===== 💰 APPROVE / REJECT PAYMENT (MULTI-TOKEN) =====
+      if (cb.data && (cb.data.startsWith('pay_approve:') || cb.data.startsWith('pay_reject:'))) {
         const [action, pid] = cb.data.split(':');
         await answerCallbackQuery(cb.id, 'Memproses...');
         if (String(cb.from.id) !== String(process.env.OWNER_TELEGRAM_ID)) {
@@ -577,8 +578,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
           }, result);
           try {
             const tokenPreview = (result.tokens || []).map(t => {
-              const shortPkg = t.packageName.split('.').pop();
-              let label = shortPkg;
+              const shortPkg2 = t.packageName.split('.').pop();
+              let label = shortPkg2;
               if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 Grab';
               else if (t.packageName.includes('phantom')) label = '👻 Phantom';
               return `• ${label}: <code>${t.masked}</code>`;
@@ -589,8 +590,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
               parse_mode: 'HTML'
             });
           } catch (e) {}
-          await logAudit('owner_tg', 'FINANCE_APPROVE', pid, { 
-            orderId: result.orderId, 
+          await logAudit('owner_tg', 'FINANCE_APPROVE', pid, {
+            orderId: result.orderId,
             amount: result.amount,
             tokenCount: result.tokenCount,
             packages: (result.tokens || []).map(t => t.packageName)
@@ -611,7 +612,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
           await logAudit('owner_tg', 'FINANCE_REJECT', pid, { reason });
         }
         return res.status(200).json({ status: 'ok' });
-      }
       }
 
       if (cb.data === 'trial_claim') {
@@ -661,7 +661,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
           return res.status(200).json({ status: 'ok' });
         }
       }
-      
+
       // 🔑 DEEP-LINK: Lupa Token / Ganti HP
       if (msg.chat.type === 'private' && (text.startsWith('/start reset_') || text === '/pulihkan' || text.startsWith('/pulihkan '))) {
         await handleResetEntry(msg);
@@ -672,48 +672,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
       if (msg.chat.type === 'private' && text.startsWith('/start panduan_')) {
         const trialSet = await trial.getTrialSettings(db);
         const trialDays = trialSet.days || 7;
-        
-        const panduan = `📖 <b>CARA MULAI APHELION</b>
-<i>3 Langkah Mudah</i>
 
-━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>1️⃣ PILIH PAKET</b>
-
-• Trial: Klik tombol 🎁 di welcome message
-• VIP: Klik tombol 💳 di welcome message
-
-Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>2️⃣ AKTIVASI DI APP</b>
-
-• Buka aplikasi Aphelion
-• Masuk ke menu <b>Login/Aktivasi</b>
-• Paste kode lisensi dari bot
-• Klik tombol <b>"Aktivasi"</b>
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>3️⃣ SELESAI! 🎉</b>
-
-✅ Semua fitur premium langsung aktif
-✅ Trial: ${trialDays} hari
-✅ VIP: 30 hari (bisa diperpanjang)
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 <b>TIPS PENTING</b>
-
-📸 Screenshot kode lisensi untuk backup
-🔒 1 kode = 1 device (anti-joki)
-⚠️ Jangan share kode ke siapapun
-🆘 Ada masalah? Ketik <code>/help</code> di chat ini
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-🚀 <b>Siap mulai? Pilih paket kamu sekarang!</b>`;
+        const panduan = `📖 <b>CARA MULAI APHELION</b>\n<i>3 Langkah Mudah</i>\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n<b>1️⃣ PILIH PAKET</b>\n\n• Trial: Klik tombol 🎁 di welcome message\n• VIP: Klik tombol 💳 di welcome message\n\nBot akan kirim <b>kode lisensi otomatis</b> ke chat ini.\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n<b>2️⃣ AKTIVASI DI APP</b>\n\n• Buka aplikasi Aphelion\n• Masuk ke menu <b>Login/Aktivasi</b>\n• Paste kode lisensi dari bot\n• Klik tombol <b>"Aktivasi"</b>\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n<b>3️⃣ SELESAI! 🎉</b>\n\n✅ Semua fitur premium langsung aktif\n✅ Trial: ${trialDays} hari\n✅ VIP: 30 hari (bisa diperpanjang)\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n💡 <b>TIPS PENTING</b>\n\n📸 Screenshot kode lisensi untuk backup\n🔒 1 kode = 1 device (anti-joki)\n⚠️ Jangan share kode ke siapapun\n🆘 Ada masalah? Ketik <code>/help</code> di chat ini\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🚀 <b>Siap mulai? Pilih paket kamu sekarang!</b>`;
 
         const markup = {
           inline_keyboard: [
@@ -727,9 +687,9 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
           ]
         };
 
-        await sendTelegramMessage(msg.chat.id, panduan, { 
-          parse_mode: 'HTML', 
-          reply_markup: markup 
+        await sendTelegramMessage(msg.chat.id, panduan, {
+          parse_mode: 'HTML',
+          reply_markup: markup
         });
         return res.status(200).json({ status: 'ok' });
       }
@@ -810,16 +770,14 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
       const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
 
-      // ===== 🛠 /setqris VIA TEKS (owner kirim teks dulu, foto menyusul) =====
+      // ===== 🛠 /setqris VIA TEKS =====
       if (isBotAdmin && (text === '/setqris' || text.startsWith('/setqris '))) {
-        // Jalur A: reply ke foto QRIS
         if (msg.reply_to_message && msg.reply_to_message.photo) {
           const fid = msg.reply_to_message.photo[msg.reply_to_message.photo.length - 1].file_id;
           await db.collection('settings').doc('app').set({ qrisFileId: fid, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
           await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan (via reply)! Otomatis dipakai di menu pembayaran semua user.');
           return res.status(200).json({ status: 'ok' });
         }
-        // Jalur B: teks dulu → foto berikutnya otomatis jadi QRIS
         await db.collection('admin_flags').doc(uid).set({ awaitQris: true, at: new Date().toISOString() });
         await sendTelegramMessage(msg.chat.id, '📤 <b>Mode QRIS aktif:</b> kirim FOTO QRIS sekarang (tanpa caption juga boleh).', { parse_mode: 'HTML' });
         return res.status(200).json({ status: 'ok' });
@@ -877,14 +835,12 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
       const isAdm = (uid === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(uid);
 
-      // 🖼 /setqris via caption (owner kirim foto + caption /setqris)
       if (isAdm && caption.trim().startsWith('/setqris')) {
         await db.collection('settings').doc('app').set({ qrisFileId: fileId, qrisUpdatedAt: new Date().toISOString() }, { merge: true });
         await sendTelegramMessage(msg.chat.id, '✅ Gambar QRIS tersimpan (via caption)! Otomatis dipakai di menu pembayaran semua user.');
         return res.status(200).json({ status: 'ok' });
       }
 
-      // 🖼 /setqris via flag (owner kirim /setqris dulu, lalu foto tanpa caption)
       if (isAdm) {
         const flagDoc = await db.collection('admin_flags').doc(uid).get().catch(() => null);
         if (flagDoc && flagDoc.exists && flagDoc.data().awaitQris) {
@@ -898,7 +854,6 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
       const base = { username: msg.from.username || null, firstName: msg.from.first_name || null, chatId: msg.chat.id };
       const amount = parseAmount(caption);
 
-      // C1: foto + caption nominal → deteksi channel atau tanyakan
       if (amount) {
         const ch = detectChannel(caption);
         if (ch) {
@@ -911,7 +866,6 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
         return res.status(200).json({ status: 'ok' });
       }
 
-      // C2: foto menyusul setelah nominal → jodohkan
       const pRef = proofRef(uid);
       const pDoc = await pRef.get();
       if (pDoc.exists && pDoc.data().amount && (Date.now() - new Date(pDoc.data().updatedAt || 0).getTime()) < PROOF_TTL_MS) {
@@ -929,98 +883,33 @@ Bot akan kirim <b>kode lisensi otomatis</b> ke chat ini.
         return res.status(200).json({ status: 'ok' });
       }
 
-      // C3: foto dulu, nominal menyusul
       await pRef.set({ uid, fileId, caption, username: base.username, firstName: base.firstName, chatId: base.chatId, amount: null, updatedAt: new Date().toISOString() });
       await sendTelegramMessage(msg.chat.id, '📸 Foto bukti disimpan!\nSekarang ketik nominal + aplikasi (opsional), contoh:\n<code>bayar 20000 shopeepay</code>', { parse_mode: 'HTML' });
       return res.status(200).json({ status: 'ok' });
     }
 
-    // ===== 🎉 WELCOME MESSAGE (PSYCHOLOGY-OPTIMIZED) =====
+    // ===== 🎉 WELCOME MESSAGE =====
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
-      const isVip = String(chatId) === String(VIP_GROUP_ID);
 
       for (const member of update.message.new_chat_members) {
         if (!member.is_bot) {
           const uid = String(member.id);
           const username = member.username || '-';
           const firstName = member.first_name || 'Teman';
-          const tanggal = new Date().toLocaleDateString('id-ID', { 
-            day: 'numeric', month: 'long', year: 'numeric' 
+          const tanggal = new Date().toLocaleDateString('id-ID', {
+            day: 'numeric', month: 'long', year: 'numeric'
           });
-          
+
           const setDoc = await db.collection('settings').doc('app').get();
           const price = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
           const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
-          
+
           const trialSet = await trial.getTrialSettings(db);
           const trialDays = trialSet.days || 7;
 
-          const pesan = `👋 Halo <b>${escapeHtml(firstName)}</b>! Selamat datang di komunitas Aphelion
-
-📋 <b>PROFIL KAMU</b>
-🆔 UID: <code>${uid}</code>
-👤 Username: @${escapeHtml(username)}
-📅 Bergabung: ${tanggal}
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-🏠 <b>APA ITU APHELION?</b>
-
-Aphelion = <b>Tools Premium</b> untuk:
-🛵 Driver Ojol (Grab, Gojek, dll)
-🎮 Mobile Gamer
-📍 Fake GPS & Location Spoofing
-🔧 Produktivitas & Automation
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-🚀 <b>APHELION VIP = AKSES PENUH</b>
-
-✅ Unlock semua fitur premium
-✅ Update prioritas & beta access
-✅ Support langsung developer
-✅ Bebas iklan & watermark
-✅ Anti-banned system
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-🎁 <b>PILIH JALAN MASUK</b>
-
-<b>1️⃣ TRIAL GRATIS ${trialDays} HARI</b>
-   → 1x seumur hidup per device
-   → Full akses, tanpa batas
-   → Coba dulu sebelum commit
-
-<b>2️⃣ DONASI VIP (Mulai Rp ${price.toLocaleString('id-ID')})</b>
-   → Akses ${planDays} hari penuh
-   → Donasi lebih = apresiasi dev
-   → Semua nominal = akses sama
-   → Pembayaran QRIS / GoPay / ShopeePay / OVO / DANA / Bank
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>PERINGATAN KEAMANAN</b>
-
-🚫 Admin & bot <b>TIDAK PERNAH</b>:
-   • Japri / chat personal duluan
-   • Minta password / OTP / token
-   • Minta transfer ke rekening pribadi
-
-✅ <b>ADMIN RESMI</b> (selain ini = PENIPU):
-   👑 @Mr_PH0B05 (Owner)
-   🛡️ @Draven_89 (Admin)
-   🛡️ @MrDeimos823 (Admin)
-
-💳 <b>PEMBAYARAN RESMI</b>:
-   • QRIS Merchant (semua e-wallet & bank)
-   • Token dikirim otomatis setelah verifikasi
-
-━━━━━━━━━━━━━━━━━━━━━━━
-
-👇 <b>KETUK TOMBOL DI BAWAH</b>
-(Otomatis buka chat pribadi bot)`;
+          const pesan = `👋 Halo <b>${escapeHtml(firstName)}</b>! Selamat datang di komunitas Aphelion\n\n📋 <b>PROFIL KAMU</b>\n🆔 UID: <code>${uid}</code>\n👤 Username: @${escapeHtml(username)}\n📅 Bergabung: ${tanggal}\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🏠 <b>APA ITU APHELION?</b>\n\nAphelion = <b>Tools Premium</b> untuk:\n🛵 Driver Ojol (Grab, Gojek, dll)\n🎮 Mobile Gamer\n📍 Fake GPS & Location Spoofing\n🔧 Produktivitas & Automation\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🚀 <b>APHELION VIP = AKSES PENUH</b>\n\n✅ Unlock semua fitur premium\n✅ Update prioritas & beta access\n✅ Support langsung developer\n✅ Bebas iklan & watermark\n✅ Anti-banned system\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n🎁 <b>PILIH JALAN MASUK</b>\n\n<b>1️⃣ TRIAL GRATIS ${trialDays} HARI</b>\n   → 1x seumur hidup per device\n   → Full akses, tanpa batas\n   → Coba dulu sebelum commit\n\n<b>2️⃣ DONASI VIP (Mulai Rp ${price.toLocaleString('id-ID')})</b>\n   → Akses ${planDays} hari penuh\n   → Donasi lebih = apresiasi dev\n   → Semua nominal = akses sama\n   → Pembayaran QRIS / GoPay / ShopeePay / OVO / DANA / Bank\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ <b>PERINGATAN KEAMANAN</b>\n\n🚫 Admin & bot <b>TIDAK PERNAH</b>:\n   • Japri / chat personal duluan\n   • Minta password / OTP / token\n   • Minta transfer ke rekening pribadi\n\n✅ <b>ADMIN RESMI</b> (selain ini = PENIPU):\n   👑 @Mr_PH0B05 (Owner)\n   🛡️ @Draven_89 (Admin)\n   🛡️ @MrDeimos823 (Admin)\n\n💳 <b>PEMBAYARAN RESMI</b>:\n   • QRIS Merchant (semua e-wallet & bank)\n   • Token dikirim otomatis setelah verifikasi\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>KETUK TOMBOL DI BAWAH</b>\n(Otomatis buka chat pribadi bot)`;
 
           const markup = {
             inline_keyboard: [
@@ -1037,10 +926,10 @@ Aphelion = <b>Tools Premium</b> untuk:
             ]
           };
 
-          await sendTelegramMessage(chatId, pesan, { 
-            parse_mode: 'HTML', 
+          await sendTelegramMessage(chatId, pesan, {
+            parse_mode: 'HTML',
             reply_markup: markup,
-            disable_web_page_preview: true 
+            disable_web_page_preview: true
           });
         }
       }
@@ -1079,7 +968,6 @@ app.post('/api/get-snap-token', snapLimiter, async (req, res) => {
   }
 });
 
-
 // C. Webhook Midtrans — MULTI-TOKEN (1 settlement → N token aktif per package)
 app.post('/api/payment-webhook', async (req, res) => {
   try {
@@ -1095,7 +983,6 @@ app.post('/api/payment-webhook', async (req, res) => {
     const uid = String(notification.custom_field1 || '');
     const userEmail = notification.custom_field2;
 
-    // Hanya proses settlement/capture yang fraud=accept
     if (!(transactionStatus == 'capture' || transactionStatus == 'settlement')) {
       return res.status(200).json({ status: 'IGNORED_STATUS' });
     }
@@ -1104,7 +991,7 @@ app.post('/api/payment-webhook', async (req, res) => {
     }
     if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
 
-    // 🔒 IDEMPOTENCY: kalau order_id sudah tercatat di transactions, skip (webhook repeat)
+    // 🔒 IDEMPOTENCY: kalau order_id sudah tercatat, skip (webhook repeat)
     const existingTx = await db.collection('transactions').doc(notification.order_id).get();
     if (existingTx.exists) return res.status(200).json({ status: 'ALREADY_PROCESSED' });
 
@@ -1116,7 +1003,6 @@ app.post('/api/payment-webhook', async (req, res) => {
     const now = new Date();
     const expiredDate = new Date(now.getTime() + planDays * 86400000);
 
-    // Ambil username Telegram dari chat record
     let username = null;
     try {
       const chatInfo = await db.collection('telegram_chats').doc(uid).get();
@@ -1132,7 +1018,7 @@ app.post('/api/payment-webhook', async (req, res) => {
       return res.status(200).json({ status: 'ERROR_NO_PACKAGES' });
     }
 
-    // 🔥 GENERATE N TOKEN (1 per package) + LANGSUNG AKTIFKAN (karena sudah settlement)
+    // 🔥 GENERATE N TOKEN + LANGSUNG AKTIFKAN
     const tokens = [];
     for (const pkg of activePackages) {
       const { id, code, masked } = await createPendingLicense(db, {
@@ -1141,7 +1027,6 @@ app.post('/api/payment-webhook', async (req, res) => {
         createdBy: 'midtrans_auto',
         source: 'midtrans'
       });
-      // Langsung activate (Midtrans sudah konfirmasi pembayaran)
       await db.collection('users').doc(id).update({
         status: 'ACTIVE',
         username: username,
@@ -1153,10 +1038,8 @@ app.post('/api/payment-webhook', async (req, res) => {
       tokens.push({ code, masked, packageName: pkg, id });
     }
 
-    // Hapus trial claims user ini (kalau ada)
     try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) { }
 
-    // Catat 1 transaksi (total amount, metadata jumlah token)
     const dateKey = now.toISOString().slice(0, 10);
     try {
       await db.collection('transactions').doc(notification.order_id).set({
@@ -1174,14 +1057,13 @@ app.post('/api/payment-webhook', async (req, res) => {
       await pushAllAdmins('💰 Midtrans Masuk!', `Rp ${amount.toLocaleString('id-ID')} • UID ${uid} • ${tokens.length} token • ${planDays}d`, 'pay');
     } catch (e) { console.error('Ledger write gagal:', e.message); }
 
-    // DM USER dengan multi-token
     try {
       const chatDoc = await db.collection('telegram_chats').doc(uid).get();
       const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
 
       const tokenLines = tokens.map(t => {
-        const shortPkg = t.packageName.split('.').pop();
-        let label = `📱 <b>${shortPkg}</b>`;
+        const shortPkg3 = t.packageName.split('.').pop();
+        let label = `📱 <b>${shortPkg3}</b>`;
         if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 <b>App Grab Driver</b>';
         else if (t.packageName.includes('phantom')) label = '👻 <b>App Phantom</b>';
         return `${label}:\n<code>${t.code}</code>`;
@@ -1195,11 +1077,11 @@ app.post('/api/payment-webhook', async (req, res) => {
         inviteMarkup = { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.invite_link }]] };
       } catch (invErr) { console.error('Gagal invite VIP:', invErr.message); }
 
-      const msg = await getTpl('payment_success', { 
-        planDays, 
+      const msg = await getTpl('payment_success', {
+        planDays,
         tokens: tokenLines,
         tokens_count: tokens.length,
-        invite: inviteText 
+        invite: inviteText
       });
       await sendTelegramMessage(chatId, msg, { parse_mode: 'HTML', ...(inviteMarkup ? { reply_markup: inviteMarkup } : {}) });
     } catch (err) { console.error("Gagal mengirim DM:", err.message); }
@@ -1309,10 +1191,10 @@ const handleModLogin = async (req, res) => {
     };
     const jwtToken = jwt.sign(jwtPayload, JWT_USER_SECRET, { expiresIn: '30d' });
 
-    res.status(200).json({ 
-      status: 'ACTIVE', 
-      firstLogin: false, 
-      message: 'Otentikasi Berhasil!', 
+    res.status(200).json({
+      status: 'ACTIVE',
+      firstLogin: false,
+      message: 'Otentikasi Berhasil!',
       expiredAt: u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null,
       jwt: jwtToken
     });
