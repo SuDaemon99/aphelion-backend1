@@ -888,7 +888,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.status(200).json({ status: 'ok' });
     }
 
-    // ===== 🎉 WELCOME MESSAGE — VIP (kartu member) + PUBLIK (upsell) =====
+        // ===== 🎉 WELCOME MESSAGE — VIP (kartu member) + PUBLIK (upsell) =====
     if (update.message && update.message.new_chat_members) {
       const msg = update.message;
       const chatId = msg.chat.id;
@@ -900,6 +900,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
         const uid = String(member.id);
         const username = member.username || '-';
         const firstName = member.first_name || 'Teman';
+        let vipCardSent = false; // flag: kartu VIP berhasil dikirim?
 
         // 📒 REGISTRY IDENTITAS ASLI (patokan sync check): dari event Telegram, anti-typo
         try {
@@ -911,18 +912,25 @@ app.post('/api/telegram-webhook', async (req, res) => {
           }, { merge: true });
         } catch (e) { /* abaikan */ }
 
-        // ===== 🌟 GRUP VIP: Kartu keanggotaan otomatis =====
+        // ===== 🌟 GRUP VIP: Coba kirim kartu keanggotaan otomatis =====
         if (isVip && username && username !== '-') {
           try {
+            // 🔥 FIX #1: Query 1x tanpa composite index (filter status di memory)
             const userSnap = await db.collection('users')
               .where('username', '==', String(username).toLowerCase())
-              .limit(1).get();
+              .limit(10).get();
 
             if (!userSnap.empty) {
-              const uDoc = userSnap.docs[0];
-              const u = uDoc.data();
+              // Cari doc dengan status ACTIVE/PENDING (filter di memory, bukan di Firestore)
+              const activeDocs = userSnap.docs.filter(d => {
+                const st = d.data().status;
+                return st === 'ACTIVE' || st === 'PENDING';
+              });
 
-              if (u.status === 'ACTIVE' || u.status === 'PENDING') {
+              if (activeDocs.length > 0) {
+                const uDoc = activeDocs[0];
+                const u = uDoc.data();
+
                 const setDoc = await db.collection('settings').doc('app').get();
                 const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
                 const joinDate = new Date().toLocaleString('id-ID', {
@@ -939,13 +947,9 @@ app.post('/api/telegram-webhook', async (req, res) => {
                   expiredLabel = `⏳ Aktif s/d : <b>${expStr}</b>`;
                 }
 
-                // Cek lisensi per-package
-                const allDocs = await db.collection('users')
-                  .where('username', '==', String(username).toLowerCase())
-                  .where('status', 'in', ['ACTIVE', 'PENDING'])
-                  .get();
+                // 🔥 FIX #2: License map dari activeDocs (sudah di-filter), tidak perlu query kedua
                 const licenseMap = {};
-                allDocs.docs.forEach(d => {
+                activeDocs.forEach(d => {
                   const pkg = d.data().packageName;
                   if (pkg) licenseMap[pkg] = d.data().status === 'ACTIVE' ? '✅' : '⏳';
                 });
@@ -975,14 +979,23 @@ app.post('/api/telegram-webhook', async (req, res) => {
                     username: String(username).toLowerCase(),
                     createdAt: new Date().toISOString()
                   }).catch(() => {});
+                  vipCardSent = true; // 🔥 FIX #3: flag success
+                  console.log(`✅ VIP welcome card sent for @${username}`);
                 }
               }
             }
           } catch (e) {
             console.error('VIP welcome card error:', e.message);
+            // Jangan continue — biarkan fallback ke welcome standar
           }
-          continue; // skip welcome publik untuk grup VIP
+
+          // 🔥 FIX #3: Hanya skip welcome standar kalau kartu VIP BERHASIL dikirim
+          if (vipCardSent) continue;
+          // Kalau gagal/user tidak ketemu/status tidak aktif → fall through ke welcome standar
+          console.log(`⚠️ VIP member @${username} belum terdaftar/belum aktif, kirim welcome standar (upsell)`);
         }
+
+        // ===== 📢 WELCOME STANDAR (untuk PUBLIK atau VIP yang belum terdaftar) =====
 
         // ===== 📢 GRUP PUBLIK: Welcome lama (upsell) =====
         const tanggal = new Date().toLocaleDateString('id-ID', {
