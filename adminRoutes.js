@@ -10,6 +10,8 @@ const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
 const trial = require('./trial');
 // ✅ FIX #1: Hapus dead import activatePaymentUser
 const { recordTransaction, approvePendingPayment, finalizeApprovedPayment } = require('./finance');
+// 🏪 MODUL RESELLER (logika terpusat)
+const resellerMod = require('./reseller');
 
 const createInviteLinkLocal = async (chatId, options = {}) => {
   const r = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: chatId, ...options });
@@ -172,6 +174,18 @@ const resolveTelegramUid = async (docId, u) => {
   return null;
 };
 
+// 🏪 RESELLER GUARDS (delegate ke reseller.js)
+const canManageUser = (req, u) => resellerMod.canManageUser(req.admin, u);
+const denyReseller = (req, res, next) => {
+  if (req.admin.role === 'reseller') return res.status(403).json({ error: 'Fitur ini khusus internal owner/admin.' });
+  next();
+};
+// Gate manajemen reseller: OWNER + ADMIN (reseller ditolak)
+const requireStaff = (req, res, next) => {
+  if (req.admin.role === 'reseller') return res.status(403).json({ error: 'Khusus owner & admin.' });
+  next();
+};
+
 const requireAuth = async (req, res, next) => {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -183,6 +197,13 @@ const requireAuth = async (req, res, next) => {
     const doc = await db.collection('admin_accounts').doc(payload.sub).get();
     if (!doc.exists || doc.data().active !== true) return res.status(401).json({ error: 'Akun nonaktif. Sesi berakhir.' });
     if ((payload.ep || 0) !== (doc.data().epoch || 0)) return res.status(401).json({ error: 'Sesi berakhir. Login ulang.' });
+    // 🏪 Putus sesi reseller yang expiry di tengah jalan
+    if (payload.role === 'reseller') {
+      const rAcc = await resellerMod.getResellerAccount(db, payload.sub);
+      if (!resellerMod.isResellerActive(rAcc)) {
+        return res.status(403).json({ error: 'Masa aktif reseller habis. Hubungi owner/admin untuk perpanjang.' });
+      }
+    }
     req.admin = payload;
     next();
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -204,6 +225,15 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
     if (!doc.exists) return res.status(401).json({ error: 'Kredensial salah' });
     const acc = doc.data();
     if (!acc.active) return res.status(403).json({ error: 'Akun nonaktif' });
+    // 🏪 Tolak reseller yang langganannya habis
+    if (acc.role === 'reseller') {
+      const rAcc = await resellerMod.getResellerAccount(db, uname);
+      if (!resellerMod.isResellerActive(rAcc)) {
+        const expStr = rAcc && rAcc.resellerExpiry
+          ? rAcc.resellerExpiry.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }) : '-';
+        return res.status(403).json({ error: `Masa aktif reseller berakhir ${expStr}. Hubungi owner/admin untuk perpanjang.` });
+      }
+    }
     if (acc.lockedUntil && acc.lockedUntil.toDate && acc.lockedUntil.toDate() > new Date()) {
       return res.status(423).json({ error: 'Akun terkunci 15 menit (5x gagal). Coba lagi nanti.' });
     }
@@ -219,13 +249,22 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
     const token = jwt.sign({ sub: uname, role: acc.role, ep: acc.epoch || 0 }, JWT_SECRET, { expiresIn: '12h' });
     await logAudit(uname, 'LOGIN');
     await notifyOps(`🔐 <b>Login</b>: ${uname} (${acc.role})`, { safe: `🔐 Login: ${uname}` });
-    res.json({ token, role: acc.role, username: uname });
+    res.json({
+      token, role: acc.role, username: uname,
+      brandName: acc.role === 'reseller' ? (acc.brandName || uname) : null,
+      resellerExpiry: acc.resellerExpiry ? (acc.resellerExpiry.toDate ? acc.resellerExpiry.toDate().toISOString() : acc.resellerExpiry) : null
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.get('/auth/me', requireAuth, async (req, res) => {
   const d = await db.collection('admin_accounts').doc(req.admin.sub).get();
-  res.json({ username: req.admin.sub, role: req.admin.role, avatar: d.exists ? (d.data().avatar || null) : null });
+  res.json({
+    username: req.admin.sub, role: req.admin.role, avatar: d.exists ? (d.data().avatar || null) : null,
+    brandName: d.exists ? (d.data().brandName || null) : null,
+    resellerExpiry: d.exists && d.data().resellerExpiry
+      ? (d.data().resellerExpiry.toDate ? d.data().resellerExpiry.toDate().toISOString() : d.data().resellerExpiry) : null
+  });
 });
 
 router.post('/auth/avatar', requireAuth, async (req, res) => {
@@ -250,6 +289,21 @@ router.post('/auth/change-password', requireAuth, async (req, res) => {
 });
 
 router.get('/dashboard/stats', requireAuth, async (req, res) => {
+  // 🏪 DASHBOARD RESELLER: brand sendiri + stats member sendiri
+  if (req.admin.role === 'reseller') {
+    try {
+      const [stats, acc] = await Promise.all([
+        resellerMod.getResellerStats(db, req.admin.sub),
+        resellerMod.getResellerAccount(db, req.admin.sub)
+      ]);
+      return res.json({
+        scoped: 'reseller',
+        brandName: acc ? acc.brandName : req.admin.sub,
+        resellerExpiry: acc && acc.resellerExpiry ? acc.resellerExpiry.toISOString() : null,
+        users: stats
+      });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
   try {
     const cnt = async (st) => (await db.collection('users').where('status', '==', st).count().get()).data().count;
     const [active, expired, banned] = await Promise.all([cnt('ACTIVE'), cnt('EXPIRED'), cnt('BANNED')]);
@@ -286,6 +340,11 @@ router.get('/users', requireAuth, async (req, res) => {
   try {
     const { status, q, cursor } = req.query;
     const limit = 20;
+    // 🏪 RESELLER: hanya member yang dia generate
+    if (req.admin.role === 'reseller') {
+      const rows = await resellerMod.listResellerMembers(db, req.admin.sub, { status: status || null, q: q || null });
+      return res.json({ users: rows.map(r => serializeUser(r.id, r.u)), nextCursor: null, scoped: 'reseller' });
+    }
     if (q) {
       const qq = String(q).trim();
       if (/^\d{5,15}$/.test(qq)) {
@@ -321,7 +380,7 @@ router.get('/users', requireAuth, async (req, res) => {
 });
 
 // ================= ✏️ EDIT USERNAME TELEGRAM (sinkron semua doc user) =================
-router.post('/users/:uid/edit-username', requireAuth, async (req, res) => {
+router.post('/users/:uid/edit-username', requireAuth, denyReseller, async (req, res) => {
   try {
     const uid = req.params.uid;
     const newU = String(req.body.newUsername || '').trim().replace(/^@/, '').toLowerCase();
@@ -417,7 +476,7 @@ router.get('/users/sync-check', requireAuth, async (req, res) => {
 });
 
 // 🔄 AUTO-FIX: samakan username doc dengan username asli dari registry
-router.post('/users/:uid/sync-username', requireAuth, async (req, res) => {
+router.post('/users/:uid/sync-username', requireAuth, denyReseller, async (req, res) => {
   try {
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
@@ -456,7 +515,9 @@ router.post('/users/:uid/sync-username', requireAuth, async (req, res) => {
 router.get('/users/:uid', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
-  res.json(serializeUser(d.id, d.data()));
+  const u = d.data();
+  if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
+  res.json(serializeUser(d.id, u));
 });
 
 router.post('/users/:uid/extend', requireAuth, async (req, res) => {
@@ -464,7 +525,9 @@ router.post('/users/:uid/extend', requireAuth, async (req, res) => {
     const days = parseInt(req.body.days) || 30;
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
-    const u = d.data(); const now = new Date();
+    const u = d.data();
+    if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
+    const now = new Date();
     const base = (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > now) ? u.expiredAt.toDate() : now;
     const newExp = new Date(base.getTime() + days * 86400000);
     // ✅ FIX #5: JANGAN auto-unban user BANNED/REVOKED — hanya update expiredAt + flag reminder
@@ -482,6 +545,7 @@ router.post('/users/:uid/reset-hwid', requireAuth, async (req, res) => {
     const d = await db.collection('users').doc(uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
     const u = d.data();
+    if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
     const tgUsername = u.username ? String(u.username).toLowerCase() : null;
 
     // Reset di doc yang di-request
@@ -526,10 +590,12 @@ router.post('/users/:uid/ban', requireAuth, async (req, res) => {
     const reason = req.body.reason || 'Pelanggaran aturan';
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const u = d.data();
+    if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
     await d.ref.update({ status: 'BANNED' });
 
     // ✅ FIX #6: Resolve UID Telegram yang benar sebelum kick & DM
-    const tgUid = await resolveTelegramUid(req.params.uid, d.data());
+    const tgUid = await resolveTelegramUid(req.params.uid, u);
     if (tgUid) {
       try { await kickFromGroup(tgUid); } catch (e) { console.error('Kick gagal:', e.message); }
       const chatDoc = await db.collection('telegram_chats').doc(tgUid).get();
@@ -550,6 +616,7 @@ router.post('/users/:uid/unban', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
   const u = d.data();
+  if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
   const st = (u.expiredAt && u.expiredAt.toDate() > new Date()) ? 'ACTIVE' : 'EXPIRED';
   await db.collection('users').doc(req.params.uid).update({ status: st });
   await logAudit(req.admin.sub, 'UNBAN', req.params.uid, { newStatus: st });
@@ -561,8 +628,11 @@ router.post('/users/:uid/kick', requireAuth, async (req, res) => {
   try {
     // ✅ FIX #7: Resolve UID Telegram dulu, baru kick
     const d = await db.collection('users').doc(req.params.uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    const u = d.data();
+    if (!canManageUser(req, u)) return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
     const tgUid = d.exists
-      ? await resolveTelegramUid(req.params.uid, d.data())
+      ? await resolveTelegramUid(req.params.uid, u)
       : (/^\d{5,15}$/.test(req.params.uid) ? req.params.uid : null);
     if (!tgUid) return res.status(404).json({ error: 'UID Telegram tidak ditemukan untuk user ini' });
     await kickFromGroup(tgUid);
@@ -571,7 +641,7 @@ router.post('/users/:uid/kick', requireAuth, async (req, res) => {
   } catch (e) { return res.status(500).json({ error: 'Kick gagal: ' + e.message }); }
 });
 
-router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
+router.post('/users/:uid/resend-token', requireAuth, denyReseller, async (req, res) => {
   try {
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
@@ -593,7 +663,7 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/finance/summary', requireAuth, requireApprover, async (req, res) => {
+router.get('/finance/summary', requireAuth, requireApprover, denyReseller, async (req, res) => {
   try {
     const range = req.query.range || '7d';
     const days = range === 'today' ? 1 : range === '30d' ? 30 : 7;
@@ -607,7 +677,7 @@ router.get('/finance/summary', requireAuth, requireApprover, async (req, res) =>
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/transactions', requireAuth, requireApprover, async (req, res) => {
+router.get('/transactions', requireAuth, requireApprover, denyReseller, async (req, res) => {
   const limit = 20;
   let ref = db.collection('transactions').orderBy('paidAt', 'desc').limit(limit);
   if (req.query.cursor) ref = ref.startAfter(String(req.query.cursor));
@@ -668,7 +738,7 @@ router.post('/audit-logs/purge', requireAuth, requireOwner, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/feed', requireAuth, async (req, res) => {
+router.get('/feed', requireAuth, denyReseller, async (req, res) => {
   try {
     const limit = 30;
     let ref = db.collection('ops_feed').orderBy('at', 'desc').limit(limit);
@@ -684,12 +754,12 @@ router.get('/feed', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.post('/feed/seen', requireAuth, async (req, res) => {
+router.post('/feed/seen', requireAuth, denyReseller, async (req, res) => {
   await db.collection('team_meta').doc(req.admin.sub).set({ lastFeedSeen: new Date().toISOString() }, { merge: true });
   res.json({ status: 'OK' });
 });
 
-router.get('/team/chat', requireAuth, async (req, res) => {
+router.get('/team/chat', requireAuth, denyReseller, async (req, res) => {
   const limit = 50;
   let ref = db.collection('team_chat').orderBy('at', 'desc').limit(limit);
   if (req.query.cursor) ref = ref.startAfter(String(req.query.cursor));
@@ -702,7 +772,7 @@ router.get('/team/chat', requireAuth, async (req, res) => {
   res.json({ logs, nextCursor: last ? last.data().at : null, pinned });
 });
 
-router.post('/team/chat', requireAuth, async (req, res) => {
+router.post('/team/chat', requireAuth, denyReseller, async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Text wajib' });
   if (text.length > 500) return res.status(400).json({ error: 'Maksimal 500 karakter' });
@@ -737,12 +807,16 @@ router.post('/team/chat', requireAuth, async (req, res) => {
   res.json({ status: 'OK' });
 });
 
-router.post('/team/chat/seen', requireAuth, async (req, res) => {
+router.post('/team/chat/seen', requireAuth, denyReseller, async (req, res) => {
   await db.collection('team_meta').doc(req.admin.sub).set({ lastChatRead: new Date().toISOString() }, { merge: true });
   res.json({ status: 'OK' });
 });
 
-router.get('/team/reads', requireAuth, async (req, res) => {
+router.get('/team/reads', requireAuth, denyReseller, async (req, res) => {
+  // 🏪 Reseller: kasih kosong biar polling app tidak 403
+  if (req.admin.role === 'reseller') {
+    return res.json({ chat: 0, feed: 0, sound: null, financePending: 0, canApprove: false, pendingFirstAmount: 0 });
+  }
   try {
     const accs = await db.collection('admin_accounts').get();
     const metas = await db.collection('team_meta').get();
@@ -754,7 +828,7 @@ router.get('/team/reads', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.post('/team/chat/:id/react', requireAuth, async (req, res) => {
+router.post('/team/chat/:id/react', requireAuth, denyReseller, async (req, res) => {
   try {
     const emoji = String(req.body.emoji || '');
     if (!REACT_EMOJI.includes(emoji)) return res.status(400).json({ error: 'Emoji tidak didukung' });
@@ -799,6 +873,10 @@ router.post('/team/chat/:id/delete', requireAuth, async (req, res) => {
 });
 
 router.get('/team/unread', requireAuth, async (req, res) => {
+  // 🏪 Reseller: polling tetap OK tapi kosong
+  if (req.admin.role === 'reseller') {
+    return res.json({ chat: 0, feed: 0, sound: null, financePending: 0, canApprove: false, pendingFirstAmount: 0 });
+  }
   try {
     const meta = await db.collection('team_meta').doc(req.admin.sub).get();
     const lastChat = meta.exists && meta.data().lastChatRead ? meta.data().lastChatRead : '1970-01-01T00:00:00Z';
@@ -1011,7 +1089,7 @@ const serializeLocation = (d) => {
 };
 
 // 🔥 TAMPILKAN LOKASI (GABUNGAN DATA OFFLINE DARI DB & DATA LIVE DARI REDIS)
-router.get('/locations', requireAuth, async (req, res) => {
+router.get('/locations', requireAuth, denyReseller, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
     const dbLocations = snap.docs.map(serializeLocation).filter(Boolean);
@@ -1056,7 +1134,7 @@ router.get('/locations', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.get('/locations/stats', requireAuth, async (req, res) => {
+router.get('/locations/stats', requireAuth, denyReseller, async (req, res) => {
   try {
     const snap = await db.collection('user_locations').limit(500).get();
     const dbLocations = snap.docs.map(d => d.data());
@@ -1188,24 +1266,28 @@ router.post('/locations/:uid/stop', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ================= ADMIN ACCOUNTS [OWNER] =================
+// ================= ADMIN ACCOUNTS =================
 router.get('/admins', requireAuth, requireOwner, async (req, res) => {
   const snap = await db.collection('admin_accounts').get();
   res.json({ admins: snap.docs.map(x => { const a = x.data(); return { username: a.username, role: a.role, active: a.active, lastLoginAt: a.lastLoginAt, avatar: a.avatar || null }; }) });
 });
 
+// 🏪 CREATE ADMIN / RESELLER (owner-only)
 router.post('/admins', requireAuth, requireOwner, async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password || password.length < 8) return res.status(400).json({ error: 'Username & password (min 8) wajib' });
   const uname = String(username).toLowerCase();
   const ex = await db.collection('admin_accounts').doc(uname).get();
   if (ex.exists) return res.status(409).json({ error: 'Username sudah ada' });
+  const role = req.body.role === 'reseller' ? 'reseller' : 'admin';
   await db.collection('admin_accounts').doc(uname).set({
-    username: uname, passHash: await bcrypt.hash(password, 10), role: 'admin', active: true,
-    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null, epoch: 0, avatar: null
+    username: uname, passHash: await bcrypt.hash(password, 10), role, active: true,
+    createdAt: new Date().toISOString(), lastLoginAt: null, failCount: 0, lockedUntil: null, epoch: 0, avatar: null,
+    brandName: role === 'reseller' ? String(req.body.brandName || username).slice(0, 40) : null,
+    resellerExpiry: role === 'reseller' ? new Date(Date.now() + 30 * 86400000) : null
   });
-  await logAudit(req.admin.sub, 'ADMIN_CREATE', uname);
-  await notifyOps(`👥 <b>Admin baru</b>: ${uname} dibuat oleh ${req.admin.sub}`, { safe: `👥 Admin baru: ${uname}` });
+  await logAudit(req.admin.sub, 'ADMIN_CREATE', uname, { role });
+  await notifyOps(`👥 <b>${role === 'reseller' ? 'Reseller' : 'Admin'} baru</b>: ${uname} dibuat oleh ${req.admin.sub}`, { safe: `👥 ${role} baru: ${uname}` });
   res.json({ status: 'CREATED' });
 });
 
@@ -1457,6 +1539,7 @@ const AI_MANUAL = `STACK & ARSITEKTUR APHELION (WAJIB JADI ACUAN):
 - Cron: scheduler eksternal memanggil GET /api/cron/check-expired (sweep expired + reminder H-3/H-1 + watchdog).
 - App admin: Android Compose + FCM push. App user: mod Android, verify token + binding HWID + username Telegram + package name.
 - Arcade: shooter internal admin (leaderboard + raid boss mingguan 100K HP).
+- Role admin: owner (full), admin (operasional), reseller (scoped ke member yg dia generate, langganan bulanan ke owner, durasi token terkunci planDays).
 - Bisnis: langganan VIP (harga & planDays di settings), grup Telegram VIP + publik.`;
 
 const aiSystemPrompt = (admin) => `Kamu APHELION AI, chief-of-staff digital ekosistem Aphelion. Lawan bicara: ${admin.sub} (role: ${admin.role}).
@@ -1567,7 +1650,7 @@ const execTool = async (name, args, role) => {
   }
 };
 
-router.post('/ai/ask', aiLimiter, requireAuth, async (req, res) => {
+router.post('/ai/ask', aiLimiter, requireAuth, denyReseller, async (req, res) => {
   try {
     const q = String(req.body.q || '').trim();
     if (!q) return res.status(400).json({ error: 'Pertanyaan kosong' });
@@ -1630,7 +1713,7 @@ router.get('/packages', requireAuth, async (req, res) => {
   res.json({ packages: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
 });
 
-router.post('/packages', requireAuth, async (req, res) => {
+router.post('/packages', requireAuth, requireOwner, async (req, res) => {
   const packageName = String(req.body.packageName || '').trim();
   const appName = String(req.body.appName || '').trim() || packageName;
   if (!/^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$/.test(packageName)) {
@@ -1644,7 +1727,7 @@ router.post('/packages', requireAuth, async (req, res) => {
   res.json({ status: 'CREATED', id: ref.id });
 });
 
-router.put('/packages/:id', requireAuth, async (req, res) => {
+router.put('/packages/:id', requireAuth, requireOwner, async (req, res) => {
   const d = await db.collection('packages').doc(req.params.id).get();
   if (!d.exists) return res.status(404).json({ error: 'Package tidak ditemukan' });
   const patch = {};
@@ -1673,7 +1756,12 @@ router.delete('/packages/:id', requireAuth, requireOwner, async (req, res) => {
 const genLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
   const packageName = String(req.body.packageName || '').trim();
-  const days = parseInt(req.body.durationDays) || 30;
+  // 🏪 Reseller terkunci ke planDays global; owner/admin bebas pilih
+  let days = parseInt(req.body.durationDays) || 30;
+  if (req.admin.role === 'reseller') {
+    const setD = await db.collection('settings').doc('app').get();
+    days = (setD.exists && setD.data().planDays) ? parseInt(setD.data().planDays) : 30;
+  }
   if (days < 1 || days > 3650) return res.status(400).json({ error: 'Durasi wajar: 1–3650 hari' });
   const pkg = await db.collection('packages').where('packageName', '==', packageName).where('active', '==', true).limit(1).get();
   if (pkg.empty) return res.status(400).json({ error: 'Package tidak terdaftar / nonaktif' });
@@ -1683,7 +1771,7 @@ router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
   res.json({ status: 'CREATED', id, code, masked, packageName, durationDays: days });
 });
 
-router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
+router.post('/users/:uid/edit-duration', requireAuth, denyReseller, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
   const u = d.data();
@@ -1708,7 +1796,7 @@ router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
   res.json({ status: 'OK', expiredAt: newExp.toISOString() });
 });
 
-router.post('/users/:uid/revoke', requireAuth, async (req, res) => {
+router.post('/users/:uid/revoke', requireAuth, denyReseller, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
   await d.ref.update({ status: 'REVOKED' });
@@ -1772,7 +1860,7 @@ router.post('/users/purge-pending', requireAuth, requireOwner, async (req, res) 
 });
 
 // ================= 💰 FINANCE: PENDING APPROVAL + MANUAL [APPROVER] =================
-router.get('/finance/pending', requireAuth, async (req, res) => {
+router.get('/finance/pending', requireAuth, denyReseller, async (req, res) => {
   try {
     const snap = await db.collection('pending_payments').where('status', '==', 'pending').limit(50).get();
     const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
@@ -1984,6 +2072,39 @@ router.post('/users/repair-null-expiry', requireAuth, requireOwner, async (req, 
     await logAudit(req.admin.sub, 'REPAIR_NULL_EXPIRY', null, { fixed });
     await notifyOps(`🛠 <b>Reparasi expiredAt null</b>: ${fixed} user diperbaiki`, { safe: `🛠 Repair expiry: ${fixed} user`, type: 'critical' });
     res.json({ status: 'OK', fixed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ================= 🏪 MANAJEMEN RESELLER [OWNER + ADMIN] =================
+router.post('/admins/:username/set-reseller-expiry', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const r = await resellerMod.extendReseller(db, req.params.username, req.body.months, req.admin.sub);
+    if (!r.ok) return res.status(404).json({ error: r.error });
+    res.json({ status: 'OK', resellerExpiry: r.resellerExpiry.toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/resellers', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const snap = await db.collection('admin_accounts').where('role', '==', 'reseller').get();
+    res.json({ resellers: snap.docs.map(x => { const a = x.data(); return {
+      username: a.username, brandName: a.brandName || null, active: a.active === true,
+      resellerExpiry: a.resellerExpiry ? (a.resellerExpiry.toDate ? a.resellerExpiry.toDate().toISOString() : a.resellerExpiry) : null,
+      lastLoginAt: a.lastLoginAt || null
+    }; }) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Brand = identitas kontrak → tetap owner-only
+router.post('/admins/:username/set-brand', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const brandName = String(req.body.brandName || '').trim();
+    if (!brandName || brandName.length > 40) return res.status(400).json({ error: 'Brand name wajib (maks 40 karakter)' });
+    const t = await db.collection('admin_accounts').doc(req.params.username).get();
+    if (!t.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
+    await t.ref.update({ brandName });
+    await logAudit(req.admin.sub, 'RESELLER_BRAND', req.params.username, { brandName });
+    res.json({ status: 'OK', brandName });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
