@@ -1199,22 +1199,31 @@ app.post('/api/payment-webhook', async (req, res) => {
 
     try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) { }
 
-    const dateKey = now.toISOString().slice(0, 10);
-    try {
-      await db.collection('transactions').doc(notification.order_id).set({
-        orderId: notification.order_id, uid, amount, status: transactionStatus,
-        channel: notification.payment_type || 'unknown', email: userEmail || null,
-        mode: MIDTRANS_MODE, paidAt: now.toISOString(),
-        tokenCount: tokens.length,
-        packages: tokens.map(t => t.packageName)
-      });
-      await db.collection('finance_daily').doc(dateKey).set({ date: dateKey }, { merge: true });
-      await db.collection('finance_daily').doc(dateKey).update({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) });
-      await db.collection('finance_total').doc('all').set({ gross: FieldValue.increment(amount), count: FieldValue.increment(1) }, { merge: true });
-      const tokenPreview = tokens.map(t => `${t.packageName.split('.').pop()}: ${t.masked}`).join(' • ');
-      await notifyOps(`💰 <b>Midtrans Settlement</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code> • ${notification.payment_type}\n<b>${tokens.length} token:</b> ${tokenPreview}`, { safe: `💰 Midtrans settlement • UID ${uid} (${tokens.length} token)`, type: 'pay' });
-      await pushAllAdmins('💰 Midtrans Masuk!', `Rp ${amount.toLocaleString('id-ID')} • UID ${uid} • ${tokens.length} token • ${planDays}d`, 'pay');
-    } catch (e) { console.error('Ledger write gagal:', e.message); }
+// ✅ GANTI: pakai recordTransaction yang sudah atomik
+try {
+  const { recordTransaction } = require('./finance');
+  await recordTransaction(db, {
+    orderId: notification.order_id,
+    uid,
+    amount,
+    status: transactionStatus,
+    channel: notification.payment_type || 'unknown',
+    mode: MIDTRANS_MODE,
+    paidAt: now.toISOString(),
+    email: userEmail || null,
+    source: 'midtrans',
+    createdBy: 'midtrans_webhook'
+  });
+  const tokenPreview = tokens.map(t => `${t.packageName.split('.').pop()}: ${t.masked}`).join(' • ');
+  await notifyOps(`💰 <b>Midtrans Settlement</b>\nRp ${amount.toLocaleString('id-ID')} • UID <code>${uid}</code> • ${notification.payment_type}\n<b>${tokens.length} token:</b> ${tokenPreview}`, { safe: `💰 Midtrans settlement • UID ${uid} (${tokens.length} token)`, type: 'pay' });
+  await pushAllAdmins('💰 Midtrans Masuk!', `Rp ${amount.toLocaleString('id-ID')} • UID ${uid} • ${tokens.length} token • ${planDays}d`, 'pay');
+} catch (e) { 
+  console.error('Ledger write gagal:', e.message);
+  // Kalau error "OrderId sudah tercatat", artinya webhook duplicate → return OK
+  if (e.message.includes('OrderId sudah tercatat')) {
+    return res.status(200).json({ status: 'ALREADY_PROCESSED' });
+  }
+}
 
     try {
       const chatDoc = await db.collection('telegram_chats').doc(uid).get();
@@ -1453,34 +1462,55 @@ app.get('/api/cron/check-expired', async (req, res) => {
     const snapshot = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', now).get();
     let expiredCount = 0;
     for (const doc of snapshot.docs) {
-      const uid = doc.id;
-      const u = doc.data();
-      await db.collection('users').doc(uid).update({ status: 'EXPIRED' });
-      expiredCount++;
-      const chatDoc = await db.collection('telegram_chats').doc(uid).get();
-      const chatId = chatDoc.exists ? chatDoc.data().chatId : uid;
-      try {
-        if (u.tier === 'trial' || u.source === 'trial') {
-          await sendTelegramMessage(chatId, await getTpl('trial_expired', { nama: u.username || 'Teman' }), { parse_mode: 'HTML' });
-        } else {
-          try { await kickFromGroup(uid); } catch (e) {}
-          await sendTelegramMessage(chatId, await getTpl('expired_dm'), { parse_mode: 'HTML' });
+  const uid = doc.id;
+  const u = doc.data();
+  await db.collection('users').doc(uid).update({ status: 'EXPIRED' });
+  expiredCount++;
+  
+  // ✅ FIX: Resolve UID Telegram yang benar (prioritas: ownerTgUid > doc.id numerik > cari dari username)
+  let tgUid = null;
+  if (u.ownerTgUid && /^\d{5,15}$/.test(String(u.ownerTgUid))) {
+    tgUid = String(u.ownerTgUid);
+  } else if (/^\d{5,15}$/.test(uid)) {
+    tgUid = uid;
+  } else if (u.username) {
+    try {
+      const snap = await db.collection('telegram_chats')
+        .where('username', '==', String(u.username).toLowerCase())
+        .limit(1)
+        .get();
+      if (!snap.empty) tgUid = snap.docs[0].id;
+    } catch (e) {}
+  }
+  
+  if (tgUid) {
+    const chatDoc = await db.collection('telegram_chats').doc(tgUid).get();
+    const chatId = chatDoc.exists ? chatDoc.data().chatId : tgUid;
+    try {
+      if (u.tier === 'trial' || u.source === 'trial') {
+        await sendTelegramMessage(chatId, await getTpl('trial_expired', { nama: u.username || 'Teman' }), { parse_mode: 'HTML' });
+      } else {
+        try { await kickFromGroup(tgUid); } catch (e) { console.error(`Kick gagal untuk ${tgUid}:`, e.message); }
+        await sendTelegramMessage(chatId, await getTpl('expired_dm'), { parse_mode: 'HTML' });
 
-          // 📢 Post pengumuman kick di grup VIP
-          if (u.username) {
-            try {
-              const expLabel = u.expiredAt && u.expiredAt.toDate
-                ? u.expiredAt.toDate().toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' })
-                : 'hari ini';
-              await sendTelegramMessage(VIP_GROUP_ID, await getTpl('kick_announcement', {
-                username: escapeHtml(u.username),
-                tanggal: expLabel
-              }), { parse_mode: 'HTML' });
-            } catch (e) { console.error('Kick announcement error:', e.message); }
-          }
+        // 📢 Post pengumuman kick di grup VIP
+        if (u.username) {
+          try {
+            const expLabel = u.expiredAt && u.expiredAt.toDate
+              ? u.expiredAt.toDate().toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' })
+              : 'hari ini';
+            await sendTelegramMessage(VIP_GROUP_ID, await getTpl('kick_announcement', {
+              username: escapeHtml(u.username),
+              tanggal: expLabel
+            }), { parse_mode: 'HTML' });
+          } catch (e) { console.error('Kick announcement error:', e.message); }
         }
-      } catch (err) { console.error(`Gagal DM user ${uid}:`, err.message); }
-    }
+      }
+    } catch (err) { console.error(`Gagal DM user ${uid} (tgUid: ${tgUid}):`, err.message); }
+  } else {
+    console.warn(`⚠️ Tidak bisa resolve UID Telegram untuk user ${uid} (source: ${u.source})`);
+  }
+}
     let reminded = 0;
     try { reminded = await runReminders(); } catch (e) { console.error('Reminders gagal:', e.message); }
 
