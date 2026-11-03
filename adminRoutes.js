@@ -1819,7 +1819,7 @@ router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, r
   res.json({ token: d.data().token || null });
 });
 
-// 🗑 DELETE USER (Owner: semua user, Reseller: hanya PENDING milik mereka)
+// 🗑 DELETE USER (Owner: semua user, Reseller: user yang dia generate sendiri)
 router.delete('/users/:uid', requireAuth, async (req, res) => {
   try {
     const uid = req.params.uid;
@@ -1827,16 +1827,14 @@ router.delete('/users/:uid', requireAuth, async (req, res) => {
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
     const u = d.data();
     
-    // 🏪 RESELLER: hanya bisa hapus PENDING yang mereka generate
+    // 🏪 RESELLER: bisa hapus user berstatus APA SAJA, ASALKAN dia yang generate
     if (req.admin.role === 'reseller') {
-      if (u.status !== 'PENDING') {
-        return res.status(403).json({ error: 'Reseller hanya bisa hapus user berstatus PENDING.' });
-      }
+      // 🔒 KEAMANAN: Cek apakah user ini benar-benar dibuat oleh reseller yang sedang login
       if ((u.createdBy || null) !== req.admin.sub) {
         return res.status(403).json({ error: 'Anda hanya bisa hapus member yang Anda generate sendiri.' });
       }
     } else if (req.admin.role !== 'owner') {
-      return res.status(403).json({ error: 'Hanya owner yang bisa hapus user aktif.' });
+      return res.status(403).json({ error: 'Hanya owner & reseller (untuk member sendiri) yang bisa hapus user.' });
     }
 
     // Best-effort: bersihkan data turunan biar tidak jadi sampah
