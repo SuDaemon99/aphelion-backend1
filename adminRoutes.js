@@ -1963,4 +1963,28 @@ router.post('/finance/transactions/:id/purge', requireAuth, requireOwner, async 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 🛠 REPARASI: user ACTIVE dengan expiredAt null (sisa bug record-manual lama)
+router.post('/users/repair-null-expiry', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const snap = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '==', null).limit(500).get();
+    const now = new Date();
+    const batch = db.batch();
+    let fixed = 0;
+    for (const d of snap.docs) {
+      const u = d.data();
+      const days = parseInt(u.durationDays) || 30;
+      const base = u.activatedAt ? new Date(u.activatedAt)
+                 : u.createdAt ? new Date(u.createdAt)   // createdAt = ISO string
+                 : now;
+      const exp = new Date(base.getTime() + days * 86400000);
+      batch.update(d.ref, { expiredAt: exp, repairedAt: now.toISOString() });
+      fixed++;
+    }
+    if (fixed) await batch.commit();
+    await logAudit(req.admin.sub, 'REPAIR_NULL_EXPIRY', null, { fixed });
+    await notifyOps(`🛠 <b>Reparasi expiredAt null</b>: ${fixed} user diperbaiki`, { safe: `🛠 Repair expiry: ${fixed} user`, type: 'critical' });
+    res.json({ status: 'OK', fixed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
