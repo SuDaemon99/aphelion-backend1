@@ -37,6 +37,7 @@ const logAudit = async (admin, action, target = null, meta = {}) => {
   } catch (e) { console.error('Audit log gagal:', e.message); }
 };
 
+// ✅ PATCH: Resolve UID Telegram yang benar + graceful handling chat hilang + stop retry-spam 400
 const runReminders = async () => {
   const db = getFirestore();
   const now = new Date();
@@ -49,20 +50,59 @@ const runReminders = async () => {
   let sent = 0;
   for (const doc of snap.docs) {
     const u = doc.data();
-    const chatDoc = await db.collection('telegram_chats').doc(doc.id).get();
-    if (!chatDoc.exists && (u.source === 'manual' || u.source === 'license')) continue;
+
+    // ✅ FIX IDENTITAS: resolve UID Telegram (ownerTgUid > doc.id numerik > username lookup)
+    let tgUid = null;
+    if (u.ownerTgUid && /^\d{5,15}$/.test(String(u.ownerTgUid))) {
+      tgUid = String(u.ownerTgUid);
+    } else if (/^\d{5,15}$/.test(doc.id)) {
+      tgUid = doc.id;
+    } else if (u.username) {
+      try {
+        const s = await db.collection('telegram_chats')
+          .where('username', '==', String(u.username).toLowerCase())
+          .limit(1)
+          .get();
+        if (!s.empty) tgUid = s.docs[0].id;
+      } catch (e) { /* abaikan */ }
+    }
+
+    const chatDoc = tgUid
+      ? await db.collection('telegram_chats').doc(tgUid).get().catch(() => null)
+      : null;
+
+    // ✅ GRACEFUL: chat tidak terjangkau → tandai biar tidak retry-spam setiap cron
+    if (!chatDoc || !chatDoc.exists) {
+      if (u.source === 'manual' || u.source === 'license') continue;
+      await db.collection('users').doc(doc.id).update({
+        remindedH3: true,
+        remindedH1: true
+      }).catch(() => {});
+      console.warn(`⚠️ Reminder skip (chat tidak ditemukan): uid=${doc.id} source=${u.source}`);
+      continue;
+    }
+    const chatId = chatDoc.data().chatId || tgUid;
+
     const daysLeft = Math.ceil((u.expiredAt.toDate() - now) / 86400000);
     const dateStr = u.expiredAt.toDate().toLocaleString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
-    const chatId = chatDoc.exists ? chatDoc.data().chatId : doc.id;
+
     try {
       if (daysLeft === 3 && !u.remindedH3) {
         // H-3: DM pribadi saja
-        await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, parse_mode: 'HTML', text: await getTpl('reminder_h3', { tanggal: dateStr }) });
+        await axios.post(`${TELEGRAM_API}/sendMessage`, {
+          chat_id: chatId,
+          parse_mode: 'HTML',
+          text: await getTpl('reminder_h3', { tanggal: dateStr })
+        });
         await db.collection('users').doc(doc.id).update({ remindedH3: true });
         sent++;
       } else if (daysLeft === 1 && !u.remindedH1) {
         // H-1: DM pribadi
-        await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatId, parse_mode: 'HTML', text: await getTpl('reminder_h1', { tanggal: dateStr }) });
+        await axios.post(`${TELEGRAM_API}/sendMessage`, {
+          chat_id: chatId,
+          parse_mode: 'HTML',
+          text: await getTpl('reminder_h1', { tanggal: dateStr })
+        });
 
         // 🚨 Tag @username di grup VIP untuk H-1
         if (u.username && VIP_GROUP_ID) {
@@ -82,7 +122,18 @@ const runReminders = async () => {
         await db.collection('users').doc(doc.id).update({ remindedH1: true });
         sent++;
       }
-    } catch (e) { console.error('Reminder gagal:', e.message); }
+    } catch (e) {
+      console.error('Reminder gagal:', e.message);
+      // ✅ STOP RETRY-SPAM: kalau Telegram balasin 400 (chat hilang / bot diblokir user),
+      // tandai supaya user ini tidak di-retry terus setiap cron jalan
+      if (e.response && e.response.status === 400) {
+        await db.collection('users').doc(doc.id).update({
+          remindedH3: true,
+          remindedH1: true
+        }).catch(() => {});
+        console.warn(`⚠️ User ${doc.id} ditandai skip reminder (chat tidak valid)`);
+      }
+    }
   }
   return sent;
 };
