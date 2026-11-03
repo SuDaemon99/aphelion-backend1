@@ -1813,13 +1813,25 @@ router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, r
   res.json({ token: d.data().token || null });
 });
 
-// ================= 🗑 DELETE USER & PURGE PENDING [OWNER] =================
-router.delete('/users/:uid', requireAuth, requireOwner, async (req, res) => {
+// 🗑 DELETE USER (Owner: semua user, Reseller: hanya PENDING milik mereka)
+router.delete('/users/:uid', requireAuth, async (req, res) => {
   try {
     const uid = req.params.uid;
     const d = await db.collection('users').doc(uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
     const u = d.data();
+    
+    // 🏪 RESELLER: hanya bisa hapus PENDING yang mereka generate
+    if (req.admin.role === 'reseller') {
+      if (u.status !== 'PENDING') {
+        return res.status(403).json({ error: 'Reseller hanya bisa hapus user berstatus PENDING.' });
+      }
+      if ((u.createdBy || null) !== req.admin.sub) {
+        return res.status(403).json({ error: 'Anda hanya bisa hapus member yang Anda generate sendiri.' });
+      }
+    } else if (req.admin.role !== 'owner') {
+      return res.status(403).json({ error: 'Hanya owner yang bisa hapus user aktif.' });
+    }
 
     // Best-effort: bersihkan data turunan biar tidak jadi sampah
     try { await db.collection('trial_claims').doc(uid).delete(); } catch (e) {}
