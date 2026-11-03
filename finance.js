@@ -9,7 +9,9 @@ async function recordTransaction(db, tx) {
   const {
     orderId, uid, amount, channel = 'gopay', mode = 'production',
     paidAt = new Date().toISOString(), source = 'manual',
-    note = null, createdBy = null, status = 'settlement', email = null
+    note = null, createdBy = null, status = 'settlement', email = null,
+    tokenCount = null,  // ✅ BARU: jumlah token yang dibuat
+    packages = null     // ✅ BARU: array package name
   } = tx;
   if (!orderId) throw new Error('orderId wajib');
   if (!amount || amount <= 0) throw new Error('amount wajib > 0');
@@ -30,6 +32,8 @@ async function recordTransaction(db, tx) {
     t.set(txRef, {
       orderId, uid: uid || null, amount, status, channel, mode,
       email, note, source, createdBy, paidAt,
+      tokenCount: tokenCount || null,  // ✅ BARU: disimpan di jurnal
+      packages: packages || null,      // ✅ BARU: disimpan di jurnal
       createdAt: new Date().toISOString()
     });
 
@@ -50,6 +54,7 @@ async function recordTransaction(db, tx) {
 }
 
 // 🔥 AKTIVASI USER SETELAH PAYMENT DISAHKAN (untuk Midtrans webhook — flow lama 1 token)
+// ⚠️ LEGACY: tidak dipakai lagi di adminRoutes.js, dipertahankan untuk backward compat
 async function activatePaymentUser(db, uid, planDays, channel) {
   const tokenMod = 'APHELION-' + crypto.randomBytes(4).toString('hex').toUpperCase();
   const expiredDate = new Date();
@@ -81,6 +86,7 @@ async function activatePaymentUser(db, uid, planDays, channel) {
 }
 
 // 🔥 APPROVE PENDING PAYMENT — GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-app) + STAMP OWNER TG UID
+// Catatan: Token PENDING akan di-activate saat user login pertama di app produksi (flow by design)
 async function approvePendingPayment(db, pendingId, byName, editedAmount) {
   const ref = db.collection('pending_payments').doc(pendingId);
   let p = null;
@@ -120,6 +126,7 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
         source: 'gopay_proof'
       });
       // Stamp username + OWNER TG UID ke doc user (patokan sync check & admin panel)
+      // Status tetap PENDING → akan di-activate saat user login pertama kali
       await db.collection('users').doc(id).update({
         username: p.username || null,
         ownerTgUid: String(p.uid),   // 🔥 BARU: UID Telegram asli pengirim bukti
@@ -132,7 +139,9 @@ async function approvePendingPayment(db, pendingId, byName, editedAmount) {
     // Catat 1 transaksi (total amount, dengan metadata jumlah token)
     await recordTransaction(db, {
       orderId, uid: p.uid, amount, channel: p.channel || 'gopay',
-      source: 'gopay_proof', createdBy: byName, note: p.caption || null
+      source: 'gopay_proof', createdBy: byName, note: p.caption || null,
+      tokenCount: tokens.length,                    // ✅ BARU: metadata token
+      packages: tokens.map(t => t.packageName)      // ✅ BARU: metadata package
     });
 
     await ref.update({
