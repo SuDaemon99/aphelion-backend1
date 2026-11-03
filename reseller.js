@@ -34,27 +34,34 @@ function canManageUser(admin, userDoc) {
   return (userDoc.createdBy || null) === admin.sub;
 }
 
-// ===== PERPANJANG DURASI RESELLER (owner & admin — layaknya extend member) =====
+// ===== PERPANJANG / KURANGI DURASI RESELLER (owner & admin — layaknya extend member) =====
 async function extendReseller(db, username, months, byName) {
   const d = await db.collection('admin_accounts').doc(username).get();
   if (!d.exists) return { ok: false, error: 'Akun tidak ditemukan' };
   const a = d.data();
   if (a.role !== 'reseller') return { ok: false, error: 'Akun ini bukan reseller' };
 
-  const m = Math.max(1, Math.min(24, parseInt(months) || 1));
+  // ✅ FIX: Support nilai negatif (kurangi) dan positif (tambah), range -120 sampai +120 bulan
+  const m = Math.max(-120, Math.min(120, parseInt(months) || 1));
   const cur = a.resellerExpiry
     ? (a.resellerExpiry.toDate ? a.resellerExpiry.toDate() : new Date(a.resellerExpiry))
     : null;
-  // Perpanjang DI ATAS sisa aktif (telat 1-2 hari tidak hanguskan sisa)
+  
+  // Perpanjang / Kurangi DI ATAS sisa aktif (telat 1-2 hari tidak hanguskan sisa)
   const base = (cur && cur > new Date()) ? cur : new Date();
   const exp = new Date(base.getTime() + m * 30 * 86400000);
 
   await d.ref.update({ resellerExpiry: exp, active: true });
-  await logAudit(byName, 'RESELLER_EXTEND', username, { months: m, until: exp.toISOString() });
+  
+  const action = m > 0 ? 'diperpanjang' : 'dikurangi';
+  const sign = m > 0 ? '+' : '';
+  
+  await logAudit(byName, 'RESELLER_EXTEND', username, { months: m, until: exp.toISOString(), action });
   await notifyOps(
-    `🏪 <b>Reseller diperpanjang</b>: ${username} +${m} bln (s/d ${exp.toLocaleDateString('id-ID')}) oleh ${byName}`,
-    { safe: `🏪 Reseller ${username} +${m} bln oleh ${byName}`, type: 'critical' }
+    `🏪 <b>Reseller ${action}</b>: ${username} ${sign}${m} bln (s/d ${exp.toLocaleDateString('id-ID')}) oleh ${byName}`,
+    { safe: `🏪 Reseller ${username} ${sign}${m} bln oleh ${byName}`, type: 'critical' }
   );
+  
   return { ok: true, resellerExpiry: exp };
 }
 
