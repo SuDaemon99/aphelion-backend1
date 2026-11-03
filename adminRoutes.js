@@ -302,13 +302,21 @@ router.get('/users', requireAuth, async (req, res) => {
         .sort((a, b) => (b.u.expiredAt && b.u.expiredAt.toMillis ? b.u.expiredAt.toMillis() : 0) - (a.u.expiredAt && a.u.expiredAt.toMillis ? a.u.expiredAt.toMillis() : 0));
       return res.json({ users: sorted.map(x => serializeUser(x.id, x.u)), nextCursor: null });
     }
-    // ✅ FIX #4: createdAt disimpan sebagai STRING ISO → cursor harus string, bukan Timestamp dari expiredAt
+    
+    // ✅ FIX #4 REVISI: field cursor = createdAt (benar), tapi TIPE tetap NUMBER millis
+    // biar app Android (Long.parseLong) tidak NumberFormatException. Tanpa update app!
     let ref = db.collection('users').orderBy('createdAt', 'asc').limit(limit);
-    if (cursor) ref = ref.startAfter(String(cursor));
+    if (cursor) {
+      const ms = parseInt(cursor);
+      if (!isNaN(ms)) ref = ref.startAfter(new Date(ms).toISOString());
+    }
     const snap = await ref.get();
     const users = snap.docs.map(x => serializeUser(x.id, x.data()));
     const last = snap.docs[snap.docs.length - 1];
-    res.json({ users, nextCursor: last ? (last.data().createdAt || null) : null });
+    res.json({
+      users,
+      nextCursor: last && last.data().createdAt ? new Date(last.data().createdAt).getTime() : null
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
