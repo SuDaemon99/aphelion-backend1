@@ -8,7 +8,8 @@ const { notifyOps, runReminders, logAudit } = require('./ops');
 const { createPendingLicense, maskToken } = require('./licenses');
 const { getTpl, DEFAULT_TPL, VARS } = require('./templates');
 const trial = require('./trial');
-const { recordTransaction, activatePaymentUser, approvePendingPayment, finalizeApprovedPayment } = require('./finance');
+// ✅ FIX #1: Hapus dead import activatePaymentUser
+const { recordTransaction, approvePendingPayment, finalizeApprovedPayment } = require('./finance');
 
 const createInviteLinkLocal = async (chatId, options = {}) => {
   const r = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: chatId, ...options });
@@ -90,7 +91,8 @@ const redis = createSafeRedis();
 const JWT_SECRET = process.env.JWT_SECRET;
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const VIP_GROUP_ID = process.env.VIP_GROUP_ID || '-1004477570254';
-const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || null;
+// ✅ SINKRON dengan server.js: default public group sama
+const PUBLIC_GROUP_ID = process.env.PUBLIC_GROUP_ID || '-1003951848425';
 const ALL_GROUPS = [PUBLIC_GROUP_ID, VIP_GROUP_ID].filter(Boolean);
 
 const OWNER_AVATARS = ['owner_1', 'owner_2', 'owner_3', 'owner_4', 'owner_5', 'owner_6'];
@@ -146,6 +148,28 @@ const liveHumans = async (gid) => {
 const kickFromGroup = async (userId) => {
   await axios.post(`${TELEGRAM_API}/banChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
   await axios.post(`${TELEGRAM_API}/unbanChatMember`, { chat_id: VIP_GROUP_ID, user_id: userId });
+};
+
+// ✅ FIX #3 (HELPER BARU): Resolve UID Telegram asli dari doc user
+// Prioritas: ownerTgUid > doc.id numerik (legacy) > cari via username di telegram_chats
+const resolveTelegramUid = async (docId, u) => {
+  const data = u || null;
+  if (data && data.ownerTgUid && /^\d{5,15}$/.test(String(data.ownerTgUid))) {
+    return String(data.ownerTgUid);
+  }
+  if (/^\d{5,15}$/.test(String(docId))) {
+    return String(docId);
+  }
+  if (data && data.username) {
+    try {
+      const s = await db.collection('telegram_chats')
+        .where('username', '==', String(data.username).toLowerCase())
+        .limit(1)
+        .get();
+      if (!s.empty) return s.docs[0].id;
+    } catch (e) {}
+  }
+  return null;
 };
 
 const requireAuth = async (req, res, next) => {
@@ -278,12 +302,13 @@ router.get('/users', requireAuth, async (req, res) => {
         .sort((a, b) => (b.u.expiredAt && b.u.expiredAt.toMillis ? b.u.expiredAt.toMillis() : 0) - (a.u.expiredAt && a.u.expiredAt.toMillis ? a.u.expiredAt.toMillis() : 0));
       return res.json({ users: sorted.map(x => serializeUser(x.id, x.u)), nextCursor: null });
     }
+    // ✅ FIX #4: createdAt disimpan sebagai STRING ISO → cursor harus string, bukan Timestamp dari expiredAt
     let ref = db.collection('users').orderBy('createdAt', 'asc').limit(limit);
-    if (cursor) ref = ref.startAfter(new Date(parseInt(cursor)));
+    if (cursor) ref = ref.startAfter(String(cursor));
     const snap = await ref.get();
     const users = snap.docs.map(x => serializeUser(x.id, x.data()));
     const last = snap.docs[snap.docs.length - 1];
-    res.json({ users, nextCursor: last && last.data().expiredAt ? last.data().expiredAt.toMillis() : null });
+    res.json({ users, nextCursor: last ? (last.data().createdAt || null) : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -434,9 +459,12 @@ router.post('/users/:uid/extend', requireAuth, async (req, res) => {
     const u = d.data(); const now = new Date();
     const base = (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > now) ? u.expiredAt.toDate() : now;
     const newExp = new Date(base.getTime() + days * 86400000);
-    await db.collection('users').doc(req.params.uid).update({ expiredAt: newExp, status: 'ACTIVE', remindedH3: false, remindedH1: false });
-    await logAudit(req.admin.sub, 'EXTEND', req.params.uid, { days });
-    res.json({ status: 'OK', expiredAt: newExp.toISOString() });
+    // ✅ FIX #5: JANGAN auto-unban user BANNED/REVOKED — hanya update expiredAt + flag reminder
+    const patch = { expiredAt: newExp, remindedH3: false, remindedH1: false };
+    if (u.status !== 'BANNED' && u.status !== 'REVOKED') patch.status = 'ACTIVE';
+    await db.collection('users').doc(req.params.uid).update(patch);
+    await logAudit(req.admin.sub, 'EXTEND', req.params.uid, { days, statusAfter: patch.status || u.status });
+    res.json({ status: 'OK', expiredAt: newExp.toISOString(), userStatus: patch.status || u.status });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -488,15 +516,25 @@ router.post('/users/:uid/reset-hwid', requireAuth, async (req, res) => {
 router.post('/users/:uid/ban', requireAuth, async (req, res) => {
   try {
     const reason = req.body.reason || 'Pelanggaran aturan';
-    await db.collection('users').doc(req.params.uid).update({ status: 'BANNED' });
-    try { await kickFromGroup(req.params.uid); } catch (e) { console.error('Kick gagal:', e.message); }
-    const chatDoc = await db.collection('telegram_chats').doc(req.params.uid).get();
-    if (chatDoc.exists) {
-      try { await sendTG(chatDoc.data().chatId, await getTpl('ban_dm', { alasan: escapeHtml(reason) }), { parse_mode: 'HTML' }); } catch (e) {}
+    const d = await db.collection('users').doc(req.params.uid).get();
+    if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
+    await d.ref.update({ status: 'BANNED' });
+
+    // ✅ FIX #6: Resolve UID Telegram yang benar sebelum kick & DM
+    const tgUid = await resolveTelegramUid(req.params.uid, d.data());
+    if (tgUid) {
+      try { await kickFromGroup(tgUid); } catch (e) { console.error('Kick gagal:', e.message); }
+      const chatDoc = await db.collection('telegram_chats').doc(tgUid).get();
+      if (chatDoc.exists) {
+        try { await sendTG(chatDoc.data().chatId, await getTpl('ban_dm', { alasan: escapeHtml(reason) }), { parse_mode: 'HTML' }); } catch (e) {}
+      }
+    } else {
+      console.warn(`⚠️ UID Telegram tidak bisa diresolve untuk ban ${req.params.uid}`);
     }
-    await logAudit(req.admin.sub, 'BAN', req.params.uid, { reason });
+
+    await logAudit(req.admin.sub, 'BAN', req.params.uid, { reason, tgUid });
     await notifyOps(`🚫 <b>BAN</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code> — ${reason}`, { safe: `🚫 BAN oleh ${req.admin.sub} • UID ${req.params.uid}`, critical: true });
-    res.json({ status: 'BANNED' });
+    res.json({ status: 'BANNED', tgUid });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -512,9 +550,17 @@ router.post('/users/:uid/unban', requireAuth, async (req, res) => {
 });
 
 router.post('/users/:uid/kick', requireAuth, async (req, res) => {
-  try { await kickFromGroup(req.params.uid); } catch (e) { return res.status(500).json({ error: 'Kick gagal: ' + e.message }); }
-  await logAudit(req.admin.sub, 'KICK', req.params.uid);
-  res.json({ status: 'KICKED' });
+  try {
+    // ✅ FIX #7: Resolve UID Telegram dulu, baru kick
+    const d = await db.collection('users').doc(req.params.uid).get();
+    const tgUid = d.exists
+      ? await resolveTelegramUid(req.params.uid, d.data())
+      : (/^\d{5,15}$/.test(req.params.uid) ? req.params.uid : null);
+    if (!tgUid) return res.status(404).json({ error: 'UID Telegram tidak ditemukan untuk user ini' });
+    await kickFromGroup(tgUid);
+    await logAudit(req.admin.sub, 'KICK', req.params.uid, { tgUid });
+    res.json({ status: 'KICKED', tgUid });
+  } catch (e) { return res.status(500).json({ error: 'Kick gagal: ' + e.message }); }
 });
 
 router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
@@ -522,17 +568,19 @@ router.post('/users/:uid/resend-token', requireAuth, async (req, res) => {
     const d = await db.collection('users').doc(req.params.uid).get();
     if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
     const u = d.data();
-    const chatDoc0 = await db.collection('telegram_chats').doc(req.params.uid).get();
-    if (!chatDoc0.exists && (u.source === 'manual' || u.source === 'bot' || u.source === 'license')) {
+    // ✅ FIX #8: Resolve UID Telegram dulu untuk lookup chat
+    const tgUid = await resolveTelegramUid(req.params.uid, u);
+    const chatDoc0 = tgUid ? await db.collection('telegram_chats').doc(tgUid).get() : null;
+    if ((!chatDoc0 || !chatDoc0.exists) && (u.source === 'manual' || u.source === 'bot' || u.source === 'license')) {
       return res.status(400).json({ error: 'User belum pernah chat ke bot. Owner bisa pakai Reveal Token lalu japri manual.' });
     }
-    const chatId = chatDoc0.exists ? chatDoc0.data().chatId : req.params.uid;
+    const chatId = (chatDoc0 && chatDoc0.exists) ? chatDoc0.data().chatId : (tgUid || req.params.uid);
     const invite = await axios.post(`${TELEGRAM_API}/createChatInviteLink`, { chat_id: VIP_GROUP_ID, member_limit: 1 });
     await sendTG(chatId, await getTpl('resend_dm', { token: u.token }), {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🚪 MASUK GRUP VIP', url: invite.data.result.invite_link }]] }
     });
-    await logAudit(req.admin.sub, 'RESEND_TOKEN', req.params.uid);
+    await logAudit(req.admin.sub, 'RESEND_TOKEN', req.params.uid, { tgUid });
     res.json({ status: 'SENT' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -881,7 +929,9 @@ router.post('/cron/run', requireAuth, requireOwner, async (req, res) => {
   let n = 0;
   for (const doc of snap.docs) {
     await db.collection('users').doc(doc.id).update({ status: 'EXPIRED' });
-    try { await kickFromGroup(doc.id); } catch (e) {}
+    // ✅ FIX #9: Kick pakai UID Telegram yang benar (sinkron dengan cron server.js)
+    const tgUid = await resolveTelegramUid(doc.id, doc.data());
+    if (tgUid) { try { await kickFromGroup(tgUid); } catch (e) {} }
     n++;
   }
   let reminded = 0;
@@ -1176,9 +1226,13 @@ router.post('/admins/:username/deactivate', requireAuth, requireOwner, async (re
   res.json({ status: 'OK' });
 });
 
-router.post('/admins/:username/activate', requireAuth, async (req, res) => {
+// ✅ FIX #10: Activate akun = aksi sensitif → wajib OWNER (sebelumnya cuma requireAuth!)
+router.post('/admins/:username/activate', requireAuth, requireOwner, async (req, res) => {
+  const t = await db.collection('admin_accounts').doc(req.params.username).get();
+  if (!t.exists) return res.status(404).json({ error: 'Tidak ditemukan' });
   await db.collection('admin_accounts').doc(req.params.username).update({ active: true });
   await logAudit(req.admin.sub, 'ADMIN_ACTIVATE', req.params.username);
+  await notifyOps(`✅ <b>Admin diaktifkan</b>: ${req.params.username} oleh ${req.admin.sub}`, { safe: `✅ Admin aktif: ${req.params.username}`, critical: true });
   res.json({ status: 'OK' });
 });
 
@@ -1413,10 +1467,10 @@ const AI_TOOLS = [
   { type: 'function', function: { name: 'users_overview', description: 'Statistik user: aktif/expired/banned/pending, user baru 7 hari, 10 user segera expired.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'search_user', description: 'Cari user by UID/username (data ter-mask).', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } },
   { type: 'function', function: { name: 'user_timeline', description: 'Profil ter-mask + riwayat transaksi satu user.', parameters: { type: 'object', properties: { uid: { type: 'string' } }, required: ['uid'] } } },
-  { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet per hari N hari terakhir + total keseluruhan.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'transactions_last', description: '[OWNER] N transaksi terakhir (max 20).', parameters: { type: 'object', properties: { limit: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'audit_search', description: '[OWNER] Cari audit log by admin/aksi/rentang hari.', parameters: { type: 'object', properties: { admin: { type: 'string' }, action: { type: 'string' }, days: { type: 'integer' } } } } },
-  { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim (digest).', parameters: { type: 'object', properties: { n: { type: 'integer' } } } } },
+  { type: 'function', function: { name: 'finance_range', description: '[OWNER] Omzet per hari N hari terakhir + total keseluruhan.', parameters: { type: 'object', properties: { days: { type: 'integer' } } } },
+  { type: 'function', function: { name: 'transactions_last', description: '[OWNER] N transaksi terakhir (max 20).', parameters: { type: 'object', properties: { limit: { type: 'integer' } } } },
+  { type: 'function', function: { name: 'audit_search', description: '[OWNER] Cari audit log by admin/aksi/rentang hari.', parameters: { type: 'object', properties: { admin: { type: 'string' }, action: { type: 'string' }, days: { type: 'integer' } } } },
+  { type: 'function', function: { name: 'team_chat_last', description: 'N pesan terakhir chat tim (digest).', parameters: { type: 'object', properties: { n: { type: 'integer' } } } },
   { type: 'function', function: { name: 'templates_list', description: 'Semua template pesan bot (review/rewrite).', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'arcade_status', description: 'Raid boss mingguan + top 5 leaderboard.', parameters: { type: 'object', properties: {} } } }
 ];
@@ -1774,6 +1828,9 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
     const orderId = 'MAN-' + Date.now();
     const setDoc = await db.collection('settings').doc('app').get();
     const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
+    // ✅ FIX #11: ReferenceError fix — `now` wajib dideclare sebelum dipakai
+    const now = new Date();
+    const expiredDate = new Date(now.getTime() + planDays * 86400000);
 
     // Ambil username Telegram
     let username = null;
@@ -1790,30 +1847,32 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
     }
 
     // Generate 1 token per package + LANGSUNG activate (manual = sudah dikonfirmasi) + stamp ownerTgUid
-const tokens = [];
-const expiredDate = new Date(now.getTime() + planDays * 86400000); // ✅ TAMBAH: hitung tanggal expired
+    const tokens = [];
+    for (const pkg of activePackages) {
+      const { id, code, masked } = await createPendingLicense(db, {
+        packageName: pkg,
+        durationDays: planDays,
+        createdBy: req.admin.sub,
+        source: 'manual'
+      });
+      await db.collection('users').doc(id).update({
+        status: 'ACTIVE',
+        username: username,
+        ownerTgUid: uid,
+        source: 'manual',
+        createdBy: req.admin.sub,
+        expiredAt: expiredDate,        // ✅ FIX BUG #1: tanggal expired
+        activatedAt: now.toISOString() // ✅ FIX BUG #1: waktu aktivasi
+      });
+      tokens.push({ code, masked, packageName: pkg, id });
+    }
 
-for (const pkg of activePackages) {
-  const { id, code, masked } = await createPendingLicense(db, {
-    packageName: pkg,
-    durationDays: planDays,
-    createdBy: req.admin.sub,
-    source: 'manual'
-  });
-  await db.collection('users').doc(id).update({
-    status: 'ACTIVE',
-    username: username,
-    ownerTgUid: uid,
-    source: 'manual',
-    createdBy: req.admin.sub,
-    expiredAt: expiredDate,        // ✅ TAMBAH: tanggal expired
-    activatedAt: now.toISOString() // ✅ TAMBAH: waktu aktivasi
-  });
-  tokens.push({ code, masked, packageName: pkg, id });
-}
-
-    // Catat 1 transaksi
-    await recordTransaction(db, { orderId, uid, amount, channel, source: 'manual', createdBy: req.admin.sub, note });
+    // Catat 1 transaksi (tokenCount/packages ikut dikirim — tercatat setelah patch finance.js diterapkan)
+    await recordTransaction(db, {
+      orderId, uid, amount, channel, source: 'manual', createdBy: req.admin.sub, note,
+      tokenCount: tokens.length,
+      packages: tokens.map(t => t.packageName)
+    });
 
     // Finalize: DM + invite + push + notify
     await finalizeApprovedPayment(db, {
