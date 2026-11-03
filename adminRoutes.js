@@ -1771,10 +1771,16 @@ router.post('/licenses/generate', requireAuth, genLimiter, async (req, res) => {
   res.json({ status: 'CREATED', id, code, masked, packageName, durationDays: days });
 });
 
-router.post('/users/:uid/edit-duration', requireAuth, denyReseller, async (req, res) => {
+router.post('/users/:uid/edit-duration', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
   const u = d.data();
+
+  // ✅ TAMBAH INI: Reseller hanya bisa edit member yang dia generate sendiri
+  if (!canManageUser(req, u)) {
+    return res.status(403).json({ error: 'Reseller hanya bisa mengelola member yang Anda generate sendiri.' });
+  }
+
   const oldExp = u.expiredAt && u.expiredAt.toDate ? u.expiredAt.toDate().toISOString() : null;
   let newExp;
   if (req.body.mode === 'set') {
