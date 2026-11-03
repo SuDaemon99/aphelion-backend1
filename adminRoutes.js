@@ -1790,23 +1790,27 @@ router.post('/finance/record-manual', requireAuth, requireApprover, async (req, 
     }
 
     // Generate 1 token per package + LANGSUNG activate (manual = sudah dikonfirmasi) + stamp ownerTgUid
-    const tokens = [];
-    for (const pkg of activePackages) {
-      const { id, code, masked } = await createPendingLicense(db, {
-        packageName: pkg,
-        durationDays: planDays,
-        createdBy: req.admin.sub,
-        source: 'manual'
-      });
-      await db.collection('users').doc(id).update({
-        status: 'ACTIVE',
-        username: username,
-        ownerTgUid: uid,   // 🔥 BARU: UID Telegram asli (patokan sync check)
-        source: 'manual',
-        createdBy: req.admin.sub
-      });
-      tokens.push({ code, masked, packageName: pkg, id });
-    }
+const tokens = [];
+const expiredDate = new Date(now.getTime() + planDays * 86400000); // ✅ TAMBAH: hitung tanggal expired
+
+for (const pkg of activePackages) {
+  const { id, code, masked } = await createPendingLicense(db, {
+    packageName: pkg,
+    durationDays: planDays,
+    createdBy: req.admin.sub,
+    source: 'manual'
+  });
+  await db.collection('users').doc(id).update({
+    status: 'ACTIVE',
+    username: username,
+    ownerTgUid: uid,
+    source: 'manual',
+    createdBy: req.admin.sub,
+    expiredAt: expiredDate,        // ✅ TAMBAH: tanggal expired
+    activatedAt: now.toISOString() // ✅ TAMBAH: waktu aktivasi
+  });
+  tokens.push({ code, masked, packageName: pkg, id });
+}
 
     // Catat 1 transaksi
     await recordTransaction(db, { orderId, uid, amount, channel, source: 'manual', createdBy: req.admin.sub, note });
