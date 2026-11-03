@@ -1153,10 +1153,6 @@ app.post('/api/payment-webhook', async (req, res) => {
     }
     if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
 
-    // 🔒 IDEMPOTENCY: kalau order_id sudah tercatat, skip (webhook repeat)
-    const existingTx = await db.collection('transactions').doc(notification.order_id).get();
-    if (existingTx.exists) return res.status(200).json({ status: 'ALREADY_PROCESSED' });
-
     db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
 
     const setDocP = await db.collection('settings').doc('app').get();
