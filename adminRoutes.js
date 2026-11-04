@@ -1811,11 +1811,20 @@ router.post('/users/:uid/revoke', requireAuth, denyReseller, async (req, res) =>
   res.json({ status: 'REVOKED' });
 });
 
-router.post('/users/:uid/reveal-token', requireAuth, requireOwner, async (req, res) => {
+router.post('/users/:uid/reveal-token', requireAuth, async (req, res) => {
   const d = await db.collection('users').doc(req.params.uid).get();
   if (!d.exists) return res.status(404).json({ error: 'User tidak ditemukan' });
-  await logAudit(req.admin.sub, 'TOKEN_REVEAL', req.params.uid);
-  await notifyOps(`👁 <b>Token dibuka</b> oleh ${req.admin.sub}: UID ${req.params.uid}`, { safe: `👁 Token reveal oleh ${req.admin.sub}`, critical: true });
+  const u = d.data();
+
+  // 🏪 RESELLER: hanya bisa reveal token member yang mereka generate sendiri
+  if (req.admin.role === 'reseller') {
+    if ((u.createdBy || null) !== req.admin.sub) {
+      return res.status(403).json({ error: 'Anda hanya bisa lihat token member yang Anda generate sendiri.' });
+    }
+  }
+
+  await logAudit(req.admin.sub, 'TOKEN_REVEAL', req.params.uid, { role: req.admin.role });
+  await notifyOps(`👁 <b>Token dibuka</b> oleh ${req.admin.sub}\nUID <code>${req.params.uid}</code>`, { safe: `👁 Token reveal oleh ${req.admin.sub}`, critical: true });
   res.json({ token: d.data().token || null });
 });
 
