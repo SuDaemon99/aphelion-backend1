@@ -1574,3 +1574,11 @@ app.get('/api/cron/check-expired', async (req, res) => {
 app.use('/api/admin', require('./adminRoutes'));
 
 module.exports = app;
+
+// ===== FIX BUAT VPS / DOCKER =====
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Aphelion backend listening on port ${PORT}`);
+  });
+}
