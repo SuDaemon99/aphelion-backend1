@@ -758,7 +758,43 @@ if (msg.chat.type === 'private' && (text === '/start' || text.startsWith('/start
     });
   } else {
     // /start trial, /start trial_123, /trial, /trial <something>
+    // 🔥 PROSES TRIAL + UPSELL VIP
     await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
+    
+    // 🔥 BONUS: Kirim upsell VIP 1.5 detik setelah trial success (biar UX smooth)
+    setTimeout(async () => {
+      try {
+        const setDoc2 = await db.collection('settings').doc('app').get();
+        const price = (setDoc2.exists && setDoc2.data().price) ? parseInt(setDoc2.data().price) : 10000;
+        const planDays = (setDoc2.exists && setDoc2.data().planDays) ? parseInt(setDoc2.data().planDays) : 30;
+        
+        const pesan = `━━━━━━━━━━━━━━━━━━━━━━━
+
+💎 <b>MAU AKSES LEBIH LAMA?</b>
+
+Trial cuma sebentar. Upgrade ke VIP buat:
+✅ Akses <b>${planDays} hari</b> penuh
+✅ Semua fitur premium
+✅ Support prioritas
+✅ Update eksklusif
+
+Mulai dari <b>Rp ${price.toLocaleString('id-ID')}</b> aja!
+
+👇 Klik di bawah buat lanjut VIP`;
+        
+        const markup = {
+          inline_keyboard: [
+            [{ text: '💳 UPGRADE KE VIP', callback_data: 'pay_qris' }]
+          ]
+        };
+        
+        await sendTelegramMessage(msg.chat.id, pesan, {
+          parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
+        });
+      } catch (e) { 
+        console.error('Upsell message error:', e.message); 
+      }
+    }, 1500);
   }
   return res.status(200).json({ status: 'ok' });
 }
@@ -810,67 +846,11 @@ if (msg.chat.type === 'private' && (text.startsWith('/start beli') || text === '
   return res.status(200).json({ status: 'ok' });
 }
 
-      if (text === '/trial' || text.startsWith('/trial ')) {
-        if (msg.chat.type === 'private') {
-          await db.collection('telegram_chats').doc(uid).set({
-            chatId: msg.chat.id, username: msg.from.username || null,
-            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
-          }, { merge: true });
-          await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
-        } else {
-          await sendTelegramMessage(msg.chat.id, '📩 Ketik /trial di chat pribadi bot untuk klaim trial.');
-        }
-        return res.status(200).json({ status: 'ok' });
-      }
-
-      if (text.startsWith('/start') || text.startsWith('/beli')) {
-        if (msg.chat.type !== 'private') {
-          await sendTelegramMessage(msg.chat.id, await getTpl('pm_redirect'));
-        } else {
-          await db.collection('telegram_chats').doc(uid).set({
-            chatId: msg.chat.id, username: msg.from.username || null,
-            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
-          }, { merge: true });
-
-          const setDoc2 = await db.collection('settings').doc('app').get();
-          if (setDoc2.exists && setDoc2.data().maintenance === true) {
-            await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
-            return res.status(200).json({ status: 'ok' });
-          }
-
-          let statusText = '🔴 Belum ada langganan aktif';
-          try {
-            const uDoc = await db.collection('users').doc(uid).get();
-            if (uDoc.exists) {
-              const u = uDoc.data();
-              if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
-              else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
-                statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
-              else statusText = '🟠 Langganan kedaluwarsa';
-            }
-          } catch (e) { }
-
-          const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
-          const trialSet = await trial.getTrialSettings(db);
-          const pesan = await getTpl('beli_intro', {
-            nama: escapeHtml(msg.from.first_name),
-            status: statusText,
-            link: payLink,
-            trialDays: trialSet.days
-          });
-
-          const markup = {
-            inline_keyboard: [
-              [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
-              [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
-            ]
-          };
-
-          await sendTelegramMessage(msg.chat.id, pesan, {
-            parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
-          });
-        }
-      }
+      // 🚨 REDIRECT GRUP: Kalau user ketik command di grup, suruh ke PM
+if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.chat.type !== 'private') {
+  await sendTelegramMessage(msg.chat.id, await getTpl('pm_redirect'));
+  return res.status(200).json({ status: 'ok' });
+}
 
       const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
