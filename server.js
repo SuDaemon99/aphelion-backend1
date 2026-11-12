@@ -988,14 +988,16 @@ if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.
         let vipCardSent = false; // flag: kartu VIP berhasil dikirim?
 
         // 📒 REGISTRY IDENTITAS ASLI (patokan sync check): dari event Telegram, anti-typo
-        try {
-          await db.collection('tg_registry').doc(uid).set({
-            username: username !== '-' ? String(username).toLowerCase() : null,
-            firstName,
-            src: isVip ? 'vip' : 'public',
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
-        } catch (e) { /* abaikan */ }
+try {
+  const joinedAtIso = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString();
+  await db.collection('tg_registry').doc(uid).set({
+    username: username !== '-' ? String(username).toLowerCase() : null,
+    firstName,
+    src: isVip ? 'vip' : 'public',
+    joinedAt: joinedAtIso,          // ✅ waktu join akurat, tersimpan permanen
+    updatedAt: joinedAtIso          // ✅ konsisten sama joinedAt
+  }, { merge: true });
+} catch (e) { /* abaikan */ }
 
         // ===== 🌟 GRUP VIP: Coba kirim kartu keanggotaan otomatis =====
         if (isVip && username && username !== '-') {
@@ -1018,10 +1020,12 @@ if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.
 
                 const setDoc = await db.collection('settings').doc('app').get();
                 const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
-                const joinDate = new Date().toLocaleString('id-ID', {
-                  day: 'numeric', month: 'short', year: 'numeric',
-                  hour: '2-digit', minute: '2-digit', hour12: false
-                });
+                // ✅ BARU — waktu event JOIN dari Telegram (msg.date = UNIX timestamp sisi Telegram, akurat detik)
+const joinedAt = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000);
+const joinDate = joinedAt.toLocaleString('id-ID', {
+  day: '2-digit', month: '2-digit', year: 'numeric',
+  hour: '2-digit', minute: '2-digit', hour12: false
+});
 
                 let expiredLabel = '⏳ Aktif s/d : <b>mulai dihitung saat login pertama di app</b>';
                 if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate) {
@@ -1083,9 +1087,12 @@ if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.
         // ===== 📢 WELCOME STANDAR (untuk PUBLIK atau VIP yang belum terdaftar) =====
 
         // ===== 📢 GRUP PUBLIK: Welcome lama (upsell) =====
-        const tanggal = new Date().toLocaleDateString('id-ID', {
-          day: 'numeric', month: 'long', year: 'numeric'
-        });
+        // ✅ BARU — pakai joinedAt yang udah dihitung di FIX #1 (kalau lu taruh perhitungannya di atas loop)
+// Atau hitung ulang di sini biar self-contained:
+const joinedAtPub = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000);
+const tanggal = joinedAtPub.toLocaleDateString('id-ID', {
+  day: '2-digit', month: '2-digit', year: 'numeric'
+});
 
         const setDoc = await db.collection('settings').doc('app').get();
         const price = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
