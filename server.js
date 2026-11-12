@@ -710,16 +710,105 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      if (text.startsWith('/start trial') || text === '/start trial') {
-        if (msg.chat.type === 'private') {
-          await db.collection('telegram_chats').doc(uid).set({
-            chatId: msg.chat.id, username: msg.from.username || null,
-            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
-          }, { merge: true });
-          await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
-        }
-        return res.status(200).json({ status: 'ok' });
+      // 🎁 DEEP-LINK: Trial Claim (match: /start, /start trial, /start trial_123456)
+if (msg.chat.type === 'private' && (text === '/start' || text.startsWith('/start trial') || text === '/trial' || text.startsWith('/trial '))) {
+  await db.collection('telegram_chats').doc(uid).set({
+    chatId: msg.chat.id, username: msg.from.username || null,
+    firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+  }, { merge: true });
+  
+  // Kalau cuma /start biasa (tanpa parameter), tampilkan menu
+  if (text === '/start') {
+    const setDoc2 = await db.collection('settings').doc('app').get();
+    if (setDoc2.exists && setDoc2.data().maintenance === true) {
+      await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
+      return res.status(200).json({ status: 'ok' });
+    }
+
+    let statusText = '🔴 Belum ada langganan aktif';
+    try {
+      const uDoc = await db.collection('users').doc(uid).get();
+      if (uDoc.exists) {
+        const u = uDoc.data();
+        if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
+        else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
+          statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
+        else statusText = '🟠 Langganan kedaluwarsa';
       }
+    } catch (e) { }
+
+    const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
+    const trialSet = await trial.getTrialSettings(db);
+    const pesan = await getTpl('beli_intro', {
+      nama: escapeHtml(msg.from.first_name),
+      status: statusText,
+      link: payLink,
+      trialDays: trialSet.days
+    });
+
+    const markup = {
+      inline_keyboard: [
+        [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
+        [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
+      ]
+    };
+
+    await sendTelegramMessage(msg.chat.id, pesan, {
+      parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
+    });
+  } else {
+    // /start trial, /start trial_123, /trial, /trial <something>
+    await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
+  }
+  return res.status(200).json({ status: 'ok' });
+}
+
+// 💳 DEEP-LINK: Beli / Donasi VIP (match: /start beli, /start beli_123456, /beli)
+if (msg.chat.type === 'private' && (text.startsWith('/start beli') || text === '/beli' || text.startsWith('/beli '))) {
+  await db.collection('telegram_chats').doc(uid).set({
+    chatId: msg.chat.id, username: msg.from.username || null,
+    firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+  }, { merge: true });
+
+  const setDoc2 = await db.collection('settings').doc('app').get();
+  if (setDoc2.exists && setDoc2.data().maintenance === true) {
+    await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
+    return res.status(200).json({ status: 'ok' });
+  }
+
+  let statusText = '🔴 Belum ada langganan aktif';
+  try {
+    const uDoc = await db.collection('users').doc(uid).get();
+    if (uDoc.exists) {
+      const u = uDoc.data();
+      if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
+      else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
+        statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
+      else statusText = '🟠 Langganan kedaluwarsa';
+    }
+  } catch (e) { }
+
+  const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
+  const trialSet = await trial.getTrialSettings(db);
+  const pesan = await getTpl('beli_intro', {
+    nama: escapeHtml(msg.from.first_name),
+    status: statusText,
+    link: payLink,
+    trialDays: trialSet.days
+  });
+
+  const markup = {
+    inline_keyboard: [
+      [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
+      [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
+    ]
+  };
+
+  await sendTelegramMessage(msg.chat.id, pesan, {
+    parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
+  });
+  return res.status(200).json({ status: 'ok' });
+}
 
       if (text === '/trial' || text.startsWith('/trial ')) {
         if (msg.chat.type === 'private') {
