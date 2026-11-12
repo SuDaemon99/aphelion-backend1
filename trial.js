@@ -6,7 +6,7 @@ const DEFAULT_TRIAL = {
   enabled: false,
   days: 7,
   dailyCap: 20,
-  package: 'com.deimos.phantom',
+  package: 'com.deimos.phantom',  // legacy fallback
   pushNotify: false,
   requirePublicMember: true
 };
@@ -91,7 +91,7 @@ async function isMemberOfPublicGroup(telegramApi, uid, publicGroupId) {
   } catch (e) { return false; }
 }
 
-// ===== CORE: CLAIM TRIAL (dipanggil dari webhook) =====
+// ===== 🔥 CORE: CLAIM TRIAL — SEKARANG GENERATE 1 TOKEN PER PACKAGE AKTIF =====
 async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupId, source = 'bot' }) {
   const settings = await getTrialSettings(db);
 
@@ -119,48 +119,67 @@ async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupI
   const todayCount = counterDoc.exists ? (counterDoc.data().count || 0) : 0;
   if (todayCount >= settings.dailyCap) return { ok: false, code: 'QUOTA_FULL' };
 
-  // 6. Cek package aktif
+  // 🔥 6. AMBIL SEMUA PACKAGE AKTIF (Phantom + Grab + lainnya)
   const pkgSnap = await db.collection('packages')
-    .where('packageName', '==', settings.package)
-    .where('active', '==', true).limit(1).get();
+    .where('active', '==', true)
+    .get();
+
   if (pkgSnap.empty) return { ok: false, code: 'PACKAGE_INVALID' };
 
-  // 7. Bikin token PENDING
-  const { id, code, masked } = await createPendingLicense(db, {
-    packageName: settings.package,
-    durationDays: settings.days,
-    createdBy: `trial:${source}`,
-    source: 'trial'
-  });
+  const activePackages = pkgSnap.docs.map(d => d.data().packageName);
 
-  // 8. Catat claim (per UID)
+  // 🔥 7. GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-token)
+  const tokens = [];
+  for (const pkg of activePackages) {
+    const { id, code, masked } = await createPendingLicense(db, {
+      packageName: pkg,
+      durationDays: settings.days,
+      createdBy: `trial:${source}`,
+      source: 'trial'
+    });
+
+    // Stamp username & source ke doc user per-package
+    await db.collection('users').doc(id).update({
+      username: telegramUsername || null,
+      source: 'trial',
+      createdBy: `trial:${source}`
+    });
+
+    tokens.push({ code, masked, packageName: pkg, id });
+  }
+
+  // 8. Catat claim (per UID) — 1 claim = dapat semua token
   const now = new Date().toISOString();
   await db.collection('trial_claims').doc(uid).set({
     uid,
     telegramUsername: telegramUsername || null,
-    tokenRef: id,
-    packageName: settings.package,
+    tokenRef: tokens[0].id,
+    packageName: activePackages.join(','),  // semua package
     durationDays: settings.days,
     claimedAt: now,
     activatedAt: null,
     deviceId: null,
-    status: 'CLAIMED'
+    status: 'CLAIMED',
+    tokenCount: tokens.length,
+    allPackages: activePackages
   });
 
-  // 9. Update/bikin user doc dengan tier trial
+  // 9. Update user doc utama (pakai package pertama sebagai primary)
   await db.collection('users').doc(uid).set({
     uid,
     username: telegramUsername || null,
     source: 'trial',
     tier: 'trial',
-    packageName: settings.package,
+    packageName: activePackages[0],
     durationDays: settings.days,
     status: 'PENDING',
     deviceId: null,
     createdBy: `trial:${source}`,
     createdAt: now,
     remindedH3: false,
-    remindedH1: false
+    remindedH1: false,
+    tokenCount: tokens.length,
+    allPackages: activePackages
   }, { merge: true });
 
   // 10. Increment counter + alert kuota 80%
@@ -172,16 +191,35 @@ async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupI
     );
   }
 
-  // 11. Audit + feed
+  // 11. Audit + feed (tampilkan semua package)
+  const pkgSummary = activePackages.map(p => p.split('.').pop()).join(' + ');
+
   await logAudit('system', 'TRIAL_CLAIM', uid, {
-    username: telegramUsername, package: settings.package, days: settings.days, source
+    username: telegramUsername,
+    packages: activePackages,
+    tokenCount: tokens.length,
+    days: settings.days,
+    source
   });
+
   await notifyOps(
-    `🎁 <b>TRIAL CLAIM</b>\n@${telegramUsername || uid} • ${settings.package} • ${settings.days}d`,
-    { safe: `🎁 Trial: @${telegramUsername || uid}`, type: 'system' }
+    `🎁 <b>TRIAL CLAIM</b>\n@${telegramUsername || uid} • ${tokens.length} token (${pkgSummary}) • ${settings.days}d`,
+    { safe: `🎁 Trial: @${telegramUsername || uid} (${tokens.length} token)`, type: 'system' }
   );
 
-  return { ok: true, code, masked, id, days: settings.days, package: settings.package };
+  // 🔥 Return multi-token + backward compat (field 'code' & 'package' untuk handler lama)
+  return {
+    ok: true,
+    tokens,                          // array semua token
+    token: tokens[0].code,           // backward compat (token pertama)
+    code: tokens[0].code,            // backward compat
+    id: tokens[0].id,                // backward compat
+    masked: tokens[0].masked,        // backward compat
+    days: settings.days,
+    package: activePackages[0],      // backward compat (package pertama)
+    packages: activePackages,        // array semua package
+    tokenCount: tokens.length
+  };
 }
 
 module.exports = {
