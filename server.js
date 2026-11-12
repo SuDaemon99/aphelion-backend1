@@ -326,7 +326,7 @@ const handleResetEntry = async (msg) => {
     { parse_mode: 'HTML', reply_markup: kb });
 };
 
-// ===== 🎁 HANDLER CLAIM TRIAL =====
+// ===== 🎁 HANDLER CLAIM TRIAL (MULTI-TOKEN) =====
 const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   try {
     const result = await trial.claimTrial(db, {
@@ -348,12 +348,28 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
       return;
     }
 
-    await sendTelegramMessage(chatId, await getTpl('trial_success', {
-      nama: escapeHtml(firstName || telegramUsername || 'Teman'),
-      token: result.code,
-      hari: result.days,
-      package: result.package
-    }), { parse_mode: 'HTML' });
+    // 🔥 FORMAT MULTI-TOKEN UNTUK PESAN
+    const tokenLines = (result.tokens || []).map(t => {
+      const shortPkg = t.packageName.split('.').pop();
+      let label = `📱 <b>${shortPkg}</b>`;
+      if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 <b>App Grab Driver</b>';
+      else if (t.packageName.includes('phantom')) label = '👻 <b>App Phantom</b>';
+      return `${label}:\n<code>${t.code}</code>`;
+    }).join('\n\n');
+
+    const pesan = `🎁 <b>TRIAL AKTIF!</b>
+
+Hai <b>${escapeHtml(firstName || telegramUsername || 'Teman')}</b>! Token trial Anda siap:
+
+${tokenLines}
+
+⏳ Berlaku <b>${result.days} hari</b> (mulai saat login pertama)
+
+⚠️ Kode ini rahasia — 1 akun = 1 perangkat per app. Jangan dibagikan.
+
+📸 Screenshot token untuk backup!`;
+
+    await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
   } catch (e) {
     console.error('Trial claim error:', e.message);
     try { await sendTelegramMessage(chatId, '⚠️ Terjadi kesalahan. Coba lagi sebentar.'); } catch (err) {}
