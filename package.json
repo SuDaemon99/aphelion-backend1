@@ -2,13 +2,13 @@
   "name": "aphelion-backend",
   "version": "1.0.0",
   "description": "Aphelion Backend System",
-  "main": "start.js",
+  "main": "server.js",
   "engines": {
     "node": "22.x"
   },
   "scripts": {
-    "start": "node start.js",
-    "dev": "node start.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.31.0",
