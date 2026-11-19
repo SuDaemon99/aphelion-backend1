@@ -220,7 +220,29 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'Username & password wajib' });
-    const uname = String(username).toLowerCase();
+        const uname = String(username).toLowerCase();
+
+    // 🔥 EMERGENCY BYPASS: kalau password darurat cocok, skip Firestore entirely
+    if (process.env.EMERGENCY_ADMIN_USER && 
+        uname === String(process.env.EMERGENCY_ADMIN_USER).toLowerCase() &&
+        password === process.env.EMERGENCY_ADMIN_PASS) {
+      console.warn('🚨 EMERGENCY LOGIN by', uname, '(Firestore bypass)');
+      const token = jwt.sign({ 
+        sub: uname, 
+        role: 'owner', 
+        ep: Date.now()
+      }, JWT_SECRET, { expiresIn: '6h' });
+      
+      return res.json({
+        token, 
+        role: 'owner', 
+        username: uname,
+        brandName: null,
+        resellerExpiry: null,
+        emergencyMode: true
+      });
+    }
+
     const doc = await db.collection('admin_accounts').doc(uname).get();
     if (!doc.exists) return res.status(401).json({ error: 'Kredensial salah' });
     const acc = doc.data();
