@@ -1,7 +1,6 @@
 const { FieldValue } = require('firebase-admin/firestore');
-const { createPendingLicense, genLicenseCode, maskToken } = require('./licenses');
+const { createPendingLicense } = require('./licenses');
 const { logAudit, notifyOps } = require('./ops');
-const { enqueue } = require('./fallback');
 
 const DEFAULT_TRIAL = {
   enabled: false,
@@ -92,70 +91,81 @@ async function isMemberOfPublicGroup(telegramApi, uid, publicGroupId) {
   } catch (e) { return false; }
 }
 
-// ===== 🔥 CORE: CLAIM TRIAL (dengan fallback Redis queue untuk kuota Firestore habis) =====
-async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupId, source = 'bot' }, redis) {
+// ===== 🔥 CORE: CLAIM TRIAL — SEKARANG GENERATE 1 TOKEN PER PACKAGE AKTIF =====
+async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupId, source = 'bot' }) {
   const settings = await getTrialSettings(db);
 
   // 1. Saklar OFF
   if (!settings.enabled) return { ok: false, code: 'DISABLED' };
 
-  // 2. Gerbang: wajib member grup publik (READ-only, aman dari quota)
+  // 2. Gerbang: wajib member grup publik
   if (settings.requirePublicMember) {
     const ok = await isMemberOfPublicGroup(telegramApi, uid, publicGroupId);
     if (!ok) return { ok: false, code: 'NOT_MEMBER' };
   }
 
-  // 3. Pernah claim (1 UID seumur hidup) — READ-only
+  // 3. Pernah claim (1 UID seumur hidup)
   if (await checkUserEverClaimed(db, uid)) return { ok: false, code: 'USED' };
 
-  // 4. Burst detection (5 claim dalam 10 menit = gelombang farming) — READ-only
+  // 4. Burst detection (5 claim dalam 10 menit = gelombang farming)
   const burst = await checkBurst(db, 10, 5);
   if (burst) {
     await notifyOps(`🚨 <b>BURST TRIAL</b>\n≥5 claim dalam 10 menit — kemungkinan farming. Cek audit.`, { critical: true, safe: '🚨 Burst trial terdeteksi' });
   }
 
-  // 5. Kuota harian — cap pakai MAX(Redis, Firestore) biar akurat saat fallback aktif
+  // 5. Kuota harian
   const key = todayKey();
-  const redisCount = redis ? (parseInt(await redis.get(`trial:count:${key}`)) || 0) : 0;
-  let fsCount = 0;
-  try {
-    const counterDoc = await db.collection('trial_counters').doc(key).get();
-    fsCount = counterDoc.exists ? (counterDoc.data().count || 0) : 0;
-  } catch (e) { /* Firestore mungkin penuh, andalkan Redis */ }
-  const todayCount = Math.max(redisCount, fsCount);
+  const counterDoc = await db.collection('trial_counters').doc(key).get();
+  const todayCount = counterDoc.exists ? (counterDoc.data().count || 0) : 0;
   if (todayCount >= settings.dailyCap) return { ok: false, code: 'QUOTA_FULL' };
 
-  // 6. Ambil package aktif — READ-only
-  const pkgSnap = await db.collection('packages').where('active', '==', true).get();
+  // 🔥 6. AMBIL SEMUA PACKAGE AKTIF (Phantom + Grab + lainnya)
+  const pkgSnap = await db.collection('packages')
+    .where('active', '==', true)
+    .get();
+
   if (pkgSnap.empty) return { ok: false, code: 'PACKAGE_INVALID' };
+
   const activePackages = pkgSnap.docs.map(d => d.data().packageName);
 
-  // 🔥 7. PRE-GEN ID + CODE DI MEMORI (TANPA Firestore!)
-  // Ini yang bikin user TETAP dapat token meskipun Firestore kuota habis
-  const planned = activePackages.map(pkg => ({
-    pkg,
-    id: db.collection('users').doc().id,   // pre-gen ID Firestore (idempoten)
-    code: genLicenseCode()                   // code lahir di memori (crypto.randomBytes)
-  }));
+  // 🔥 7. GENERATE 1 TOKEN PER PACKAGE AKTIF (multi-token)
+  const tokens = [];
+  for (const pkg of activePackages) {
+    const { id, code, masked } = await createPendingLicense(db, {
+      packageName: pkg,
+      durationDays: settings.days,
+      createdBy: `trial:${source}`,
+      source: 'trial'
+    });
 
+    // Stamp username & source ke doc user per-package
+    await db.collection('users').doc(id).update({
+      username: telegramUsername || null,
+      source: 'trial',
+      createdBy: `trial:${source}`
+    });
+
+    tokens.push({ code, masked, packageName: pkg, id });
+  }
+
+  // 8. Catat claim (per UID) — 1 claim = dapat semua token
   const now = new Date().toISOString();
-
-  // Siapkan data untuk fallback queue (payload idempoten)
-  const trialClaimData = {
+  await db.collection('trial_claims').doc(uid).set({
     uid,
     telegramUsername: telegramUsername || null,
-    tokenRef: planned[0].id,
-    packageName: activePackages.join(','),
+    tokenRef: tokens[0].id,
+    packageName: activePackages.join(','),  // semua package
     durationDays: settings.days,
     claimedAt: now,
     activatedAt: null,
     deviceId: null,
     status: 'CLAIMED',
-    tokenCount: planned.length,
+    tokenCount: tokens.length,
     allPackages: activePackages
-  };
+  });
 
-  const trialUserData = {
+  // 9. Update user doc utama (pakai package pertama sebagai primary)
+  await db.collection('users').doc(uid).set({
     uid,
     username: telegramUsername || null,
     source: 'trial',
@@ -168,102 +178,46 @@ async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupI
     createdAt: now,
     remindedH3: false,
     remindedH1: false,
-    tokenCount: planned.length,
+    tokenCount: tokens.length,
     allPackages: activePackages
-  };
+  }, { merge: true });
 
-  // 🔥 8. Coba persist SEMUA ke Firestore. Kalau RESOURCE_EXHAUSTED → enqueue Redis, user tetap dapat token.
-  let deferred = false;
-  try {
-    // 8a. Buat 1 token per package (pakai docId pre-gen)
-    for (const p of planned) {
-      await createPendingLicense(db, {
-        packageName: p.pkg,
-        durationDays: settings.days,
-        createdBy: `trial:${source}`,
-        source: 'trial',
-        docId: p.id,
-        code: p.code,
-        username: telegramUsername || null
-      });
-    }
-
-    // 8b. Catat claim per UID
-    await db.collection('trial_claims').doc(uid).set(trialClaimData);
-
-    // 8c. Update user doc utama
-    await db.collection('users').doc(uid).set(trialUserData, { merge: true });
-
-    // 8d. Increment counter
-    await db.collection('trial_counters').doc(key).set({ count: FieldValue.increment(1), date: key }, { merge: true });
-    if (redis) await redis.incr(`trial:count:${key}`);
-
-  } catch (err) {
-    if (/RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message || '')) {
-      // 🔥 FIRESTORE KUOTA HABIS → push payload ke Redis queue, user TETAP dapat token
-      deferred = true;
-      if (redis) {
-        for (const p of planned) {
-          await enqueue(redis, {
-            op: 'license',
-            dedupeId: p.id,
-            docId: p.id,
-            code: p.code,
-            packageName: p.pkg,
-            durationDays: settings.days,
-            createdBy: `trial:${source}`,
-            source: 'trial',
-            username: telegramUsername || null
-          });
-        }
-        await enqueue(redis, { op: 'trial_claim', dedupeId: `claim:${uid}`, uid, data: trialClaimData });
-        await enqueue(redis, { op: 'trial_user',  dedupeId: `user:${uid}`,  uid, data: trialUserData });
-        await enqueue(redis, { op: 'counter',     dedupeId: `cnt:${uid}`,   key });
-        await redis.incr(`trial:count:${key}`);   // Redis = otoritas cap (anti dobel claim)
-      }
-      console.warn(`🟡 Trial claim ${uid} DEFERRED ke Redis queue (Firestore quota)`);
-    } else {
-      // Error non-quota (network, dll) — tetap dilempar
-      throw err;
-    }
+  // 10. Increment counter + alert kuota 80%
+  const newCount = await incrementClaimCounter(db);
+  if (newCount === Math.floor(settings.dailyCap * 0.8)) {
+    await notifyOps(
+      `⚠️ <b>Kuota trial 80%</b>: ${newCount}/${settings.dailyCap} terpakai hari ini`,
+      { critical: true, safe: `⚠️ Kuota trial ${newCount}/${settings.dailyCap}` }
+    );
   }
 
-  // 9. Audit + feed (best-effort, non-kritis)
-  try {
-    const pkgSummary = activePackages.map(p => p.split('.').pop()).join(' + ');
-    await logAudit('system', 'TRIAL_CLAIM', uid, {
-      username: telegramUsername,
-      packages: activePackages,
-      tokenCount: planned.length,
-      days: settings.days,
-      source,
-      deferred
-    });
-    await notifyOps(
-      `🎁 <b>TRIAL CLAIM</b>${deferred ? ' (PENDING SYNC)' : ''}\n@${telegramUsername || uid} • ${planned.length} token (${pkgSummary}) • ${settings.days}d`,
-      { safe: `🎁 Trial: @${telegramUsername || uid}${deferred ? ' [DEFERRED]' : ''}`, type: 'system' }
-    );
-  } catch (e) { /* abaikan */ }
+  // 11. Audit + feed (tampilkan semua package)
+  const pkgSummary = activePackages.map(p => p.split('.').pop()).join(' + ');
 
-  // 10. Return multi-token + backward compat
-  const tokens = planned.map(p => ({
-    code: p.code,
-    masked: maskToken(p.code),
-    packageName: p.pkg,
-    id: p.id
-  }));
+  await logAudit('system', 'TRIAL_CLAIM', uid, {
+    username: telegramUsername,
+    packages: activePackages,
+    tokenCount: tokens.length,
+    days: settings.days,
+    source
+  });
 
+  await notifyOps(
+    `🎁 <b>TRIAL CLAIM</b>\n@${telegramUsername || uid} • ${tokens.length} token (${pkgSummary}) • ${settings.days}d`,
+    { safe: `🎁 Trial: @${telegramUsername || uid} (${tokens.length} token)`, type: 'system' }
+  );
+
+  // 🔥 Return multi-token + backward compat (field 'code' & 'package' untuk handler lama)
   return {
     ok: true,
-    deferred,                           // 🔥 flag: true = data masih di queue Redis, belum di Firestore
-    tokens,
-    token: tokens[0].code,              // backward compat
-    code: tokens[0].code,               // backward compat
-    id: tokens[0].id,                   // backward compat
-    masked: tokens[0].masked,           // backward compat
+    tokens,                          // array semua token
+    token: tokens[0].code,           // backward compat (token pertama)
+    code: tokens[0].code,            // backward compat
+    id: tokens[0].id,                // backward compat
+    masked: tokens[0].masked,        // backward compat
     days: settings.days,
-    package: activePackages[0],         // backward compat
-    packages: activePackages,
+    package: activePackages[0],      // backward compat (package pertama)
+    packages: activePackages,        // array semua package
     tokenCount: tokens.length
   };
 }
@@ -271,4 +225,4 @@ async function claimTrial(db, { uid, telegramUsername, telegramApi, publicGroupI
 module.exports = {
   DEFAULT_TRIAL, getTrialSettings, checkTrialDevice, markTrialActivated,
   claimTrial, checkUserEverClaimed
-};
+}; INI FILE APA?
