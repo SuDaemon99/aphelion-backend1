@@ -30,64 +30,7 @@ const requireApprover = async (req, res, next) => {
 const db = getFirestore();
 const router = express.Router();
 
-// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
-const createSafeRedis = () => {
-  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-    return null;
-  }
-  
-  let redisBlockedUntil = 0;
-  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
-  
-  try {
-    const { Redis } = require('@upstash/redis');
-    const redis = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
-
-    const safeGet = async (key) => {
-      if (Date.now() < redisBlockedUntil) return null;
-      try { return await redis.get(key); } 
-      catch (err) {
-        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
-        return null;
-      }
-    };
-
-    const safeSet = async (key, value, opts) => {
-      if (Date.now() < redisBlockedUntil) return;
-      try { await redis.set(key, value, opts); } 
-      catch (err) {
-        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
-      }
-    };
-
-    const safeKeys = async (pattern) => {
-      if (Date.now() < redisBlockedUntil) return [];
-      try { return await redis.keys(pattern); } 
-      catch (err) {
-        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
-        return [];
-      }
-    };
-
-    const safeMget = async (...keys) => {
-      if (Date.now() < redisBlockedUntil) return [];
-      try { return await redis.mget(...keys); } 
-      catch (err) {
-        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
-        return [];
-      }
-    };
-
-    return { get: safeGet, set: safeSet, keys: safeKeys, mget: safeMget };
-  } catch (e) {
-    console.error('Redis init error:', e.message);
-    return null;
-  }
-};
-
+const { createSafeRedis } = require('./redisClient');
 const redis = createSafeRedis();
 
 const JWT_SECRET = process.env.JWT_SECRET;
