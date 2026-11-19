@@ -382,7 +382,7 @@ const DISABLE_PING = process.env.DISABLE_PING === 'true';
 if (!DISABLE_PING) {
   const { ipKeyGenerator } = require('express-rate-limit');
   const pingLimiter = rateLimit({
-    windowMs: 2 * 1000,
+    windowMs:2 * 1000,
     max: 1,
     keyGenerator: (req) => req.body?.jwt || ipKeyGenerator(req.ip)
   });
@@ -395,22 +395,18 @@ if (!DISABLE_PING) {
       if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
       let decoded;
-      try {
-        decoded = jwt.verify(jwtToken, JWT_USER_SECRET);
-      } catch (e) {
-        return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid atau kedaluwarsa' });
-      }
+      try { decoded = jwt.verify(jwtToken, JWT_USER_SECRET); } 
+      catch (e) { return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid' }); }
 
       const uid = decoded.uid;
-
       if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
       if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
       if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
 
       if (paused === true) {
         if (redis) {
-          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); }
-          catch (e) { console.error("Redis paused error:", e.message); }
+          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
+          catch (e) { /* abaikan */ }
         }
         return res.status(200).json({ status: 'PAUSED' });
       }
@@ -423,24 +419,22 @@ if (!DISABLE_PING) {
         appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
       };
 
+      // 🔥 OPTIMASI: Hanya tulis ke Firestore MAKSIMAL 1x per 5 menit, DAN hanya jika Redis sehat.
       if (redis) {
-        try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); }
-        catch (redisErr) { console.error("Redis loc error:", redisErr.message); }
-      }
-
-      try {
-        const lastDbWrite = redis ? await redis.get(`last_db_write:${uid}`) : null;
-        if (!lastDbWrite) {
-          await db.collection('user_locations').doc(uid).set(point, { merge: true });
-          await db.collection('location_history').doc(uid).collection('points').add({
-            lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
-          });
-          if (redis) {
-            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
+        try {
+          const lastDbWrite = await redis.get(`last_db_write:${uid}`);
+          if (!lastDbWrite) {
+            // 1 Write saja (merge), HAPUS location_history dari sini untuk hemat kuota
+            await safeFirestoreWrite(() => db.collection('user_locations').doc(uid).set(point, { merge: true }));
+            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); // 5 menit
           }
+          // Simpan lokasi real-time di Redis (murah & cepat)
+          await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 });
+        } catch (redisErr) {
+          // 🔥 CIRCUIT BREAKER FALLBACK: Jika Redis error, JANGAN tulis ke Firestore. 
+          // Biarkan aplikasi tetap dapat 200 OK agar tidak hang.
+          console.error("Redis loc error (fallback to silent OK):", redisErr.message);
         }
-      } catch (dbErr) {
-        console.error('DB write error:', dbErr.message);
       }
 
       res.status(200).json({ status: 'OK', ts: now.toISOString(), pingInterval: 60 });
@@ -449,6 +443,7 @@ if (!DISABLE_PING) {
       res.status(500).json({ error: e.message });
     }
   });
+}
 } else {
   console.log('🔴 Location ping endpoint disabled (DISABLE_PING=true)');
 }
