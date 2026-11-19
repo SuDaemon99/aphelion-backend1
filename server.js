@@ -13,56 +13,19 @@ const { getTpl } = require('./templates');
 const trial = require('./trial');
 
 const { approvePendingPayment, finalizeApprovedPayment } = require('./finance');
-
-// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
-const createSafeRedis = () => {
-  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-    return null;
-  }
-
-  let redisBlockedUntil = 0;
-  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
-
-  try {
-    const { Redis } = require('@upstash/redis');
-    const redis = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
-
-    const safeGet = async (key) => {
-      if (Date.now() < redisBlockedUntil) return null;
-      try {
-        return await redis.get(key);
-      } catch (err) {
-        if (isQuotaError(err)) {
-          redisBlockedUntil = Date.now() + 3600000;
-          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
-        }
-        return null;
-      }
-    };
-
-    const safeSet = async (key, value, opts) => {
-      if (Date.now() < redisBlockedUntil) return;
-      try {
-        await redis.set(key, value, opts);
-      } catch (err) {
-        if (isQuotaError(err)) {
-          redisBlockedUntil = Date.now() + 3600000;
-          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
-        }
-      }
-    };
-
-    return { get: safeGet, set: safeSet };
-  } catch (e) {
-    console.error('Redis init error:', e.message);
-    return null;
-  }
-};
+const { createSafeRedis } = require('./redisClient');
+const { drain } = require('./fallback');
+const { genLicenseCode, maskToken } = require('./licenses');
 
 const redis = createSafeRedis();
+
+// 🔥 HANDLER REGISTRY untuk drain fallback queue (Redis → Firestore)
+const FALLBACK_HANDLERS = {
+  license:     (db, p) => createPendingLicense(db, { packageName: p.packageName, durationDays: p.durationDays, createdBy: p.createdBy, source: p.source, docId: p.docId, code: p.code, username: p.username }),
+  trial_claim: (db, p) => db.collection('trial_claims').doc(p.uid).set(p.data),
+  trial_user:  (db, p) => db.collection('users').doc(p.uid).set(p.data, { merge: true }),
+  counter:     (db, p) => db.collection('trial_counters').doc(p.key).set({ count: FieldValue.increment(1), date: p.key }, { merge: true }),
+};
 
 // 💰 Parse nominal dari caption
 const parseAmount = (text) => {
@@ -329,12 +292,12 @@ const handleResetEntry = async (msg) => {
 // ===== 🎁 HANDLER CLAIM TRIAL (MULTI-TOKEN) =====
 const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   try {
-    const result = await trial.claimTrial(db, {
+       const result = await trial.claimTrial(db, {
       uid, telegramUsername,
       telegramApi: TELEGRAM_API,
       publicGroupId: PUBLIC_GROUP_ID,
       source: 'bot'
-    });
+    }, redis);
 
     if (!result.ok) {
       const tplKey = {
@@ -364,6 +327,7 @@ Hai <b>${escapeHtml(firstName || telegramUsername || 'Teman')}</b>! Token trial 
 ${tokenLines}
 
 ⏳ Berlaku <b>${result.days} hari</b> (mulai saat login pertama)
+${result.deferred ? '\n\n⏳ <i>Sistem sedang sinkron penuh — token akan aktif penuh di database dalam ≤1 jam.</i>' : ''}
 
 ⚠️ Kode ini rahasia — 1 akun = 1 perangkat per app. Jangan dibagikan.
 
@@ -1540,10 +1504,29 @@ app.post('/api/mod/check', checkLimiter, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 🔁 FLUSH FALLBACK QUEUE: Redis → Firestore (aman dipanggil berkala, idempoten)
+app.get('/api/cron/sync-fallback', async (req, res) => {
+  try {
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).send('Unauthorized');
+    const r = await drain(redis, db, FALLBACK_HANDLERS);
+    res.json({ status: 'OK', ...r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 👀 PANTAU ukuran antrean fallback (debug endpoint)
+app.get('/api/fallback-status', async (req, res) => {
+  const q = redis ? await redis.llen('fb:queue') : -1;
+  const d = redis ? await redis.scard('fb:done')  : -1;
+  res.json({ queue: q, done: d });
+});
+
+
 // E. Cron
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).send('Unauthorized');
+    // 🔥 AUTO-FLUSH fallback queue tiap cron tick (biar data di Redis masuk Firestore saat kuota pulih)
+    try { await drain(redis, db, FALLBACK_HANDLERS); } catch (e) { console.error('drain error:', e.message); }
     const now = new Date();
     const snapshot = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', now).get();
     let expiredCount = 0;
