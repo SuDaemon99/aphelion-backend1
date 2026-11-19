@@ -8,44 +8,61 @@ const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { notifyOps, runReminders, logAudit } = require('./ops');
-const { createPendingLicense, genLicenseCode, maskToken } = require('./licenses');
+const { createPendingLicense } = require('./licenses');
 const { getTpl } = require('./templates');
 const trial = require('./trial');
 
 const { approvePendingPayment, finalizeApprovedPayment } = require('./finance');
-const { createSafeRedis } = require('./redisClient');
-const { drain } = require('./fallback');
+
+// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
+const createSafeRedis = () => {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+
+  let redisBlockedUntil = 0;
+  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
+
+  try {
+    const { Redis } = require('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+
+    const safeGet = async (key) => {
+      if (Date.now() < redisBlockedUntil) return null;
+      try {
+        return await redis.get(key);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+        return null;
+      }
+    };
+
+    const safeSet = async (key, value, opts) => {
+      if (Date.now() < redisBlockedUntil) return;
+      try {
+        await redis.set(key, value, opts);
+      } catch (err) {
+        if (isQuotaError(err)) {
+          redisBlockedUntil = Date.now() + 3600000;
+          console.error('🔴 Redis quota exceeded, cooldown 1 jam');
+        }
+      }
+    };
+
+    return { get: safeGet, set: safeSet };
+  } catch (e) {
+    console.error('Redis init error:', e.message);
+    return null;
+  }
+};
 
 const redis = createSafeRedis();
-
-// 🔥 CIRCUIT BREAKER FIRESTORE (fail-fast saat kuota habis, biar server nggak hang 10 menit)
-let firestoreBlockedUntil = 0;
-const COOLDOWN_MS = 5 * 60 * 1000; // 5 menit
-
-const safeFirestoreWrite = async (writeOperation) => {
-  if (Date.now() < firestoreBlockedUntil) {
-    console.warn("⚠️ Firestore write skipped: circuit breaker ACTIVE (quota cooldown)");
-    return { success: false, reason: "quota_cooldown" };
-  }
-  try {
-    return await writeOperation();
-  } catch (err) {
-    if (/RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message || '')) {
-      console.error("🚨 Firestore QUOTA EXHAUSTED! Activating 5-min circuit breaker.");
-      firestoreBlockedUntil = Date.now() + COOLDOWN_MS;
-      return { success: false, reason: "quota_exceeded" };
-    }
-    throw err;
-  }
-};
-
-// 🔥 HANDLER REGISTRY untuk drain fallback queue (Redis → Firestore)
-const FALLBACK_HANDLERS = {
-  license:     (db, p) => createPendingLicense(db, { packageName: p.packageName, durationDays: p.durationDays, createdBy: p.createdBy, source: p.source, docId: p.docId, code: p.code, username: p.username }),
-  trial_claim: (db, p) => db.collection('trial_claims').doc(p.uid).set(p.data),
-  trial_user:  (db, p) => db.collection('users').doc(p.uid).set(p.data, { merge: true }),
-  counter:     (db, p) => db.collection('trial_counters').doc(p.key).set({ count: FieldValue.increment(1), date: p.key }, { merge: true }),
-};
 
 // 💰 Parse nominal dari caption
 const parseAmount = (text) => {
@@ -309,15 +326,15 @@ const handleResetEntry = async (msg) => {
     { parse_mode: 'HTML', reply_markup: kb });
 };
 
-// ===== 🎁 HANDLER CLAIM TRIAL (MULTI-TOKEN) =====
+// ===== 🎁 HANDLER CLAIM TRIAL =====
 const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
   try {
-       const result = await trial.claimTrial(db, {
+    const result = await trial.claimTrial(db, {
       uid, telegramUsername,
       telegramApi: TELEGRAM_API,
       publicGroupId: PUBLIC_GROUP_ID,
       source: 'bot'
-    }, redis);
+    });
 
     if (!result.ok) {
       const tplKey = {
@@ -331,29 +348,12 @@ const handleTrialClaim = async (uid, telegramUsername, chatId, firstName) => {
       return;
     }
 
-    // 🔥 FORMAT MULTI-TOKEN UNTUK PESAN
-    const tokenLines = (result.tokens || []).map(t => {
-      const shortPkg = t.packageName.split('.').pop();
-      let label = `📱 <b>${shortPkg}</b>`;
-      if (t.packageName.includes('grab') || t.packageName.includes('driver')) label = '🚗 <b>App Grab Driver</b>';
-      else if (t.packageName.includes('phantom')) label = '👻 <b>App Phantom</b>';
-      return `${label}:\n<code>${t.code}</code>`;
-    }).join('\n\n');
-
-    const pesan = `🎁 <b>TRIAL AKTIF!</b>
-
-Hai <b>${escapeHtml(firstName || telegramUsername || 'Teman')}</b>! Token trial Anda siap:
-
-${tokenLines}
-
-⏳ Berlaku <b>${result.days} hari</b> (mulai saat login pertama)
-${result.deferred ? '\n\n⏳ <i>Sistem sedang sinkron penuh — token akan aktif penuh di database dalam ≤1 jam.</i>' : ''}
-
-⚠️ Kode ini rahasia — 1 akun = 1 perangkat per app. Jangan dibagikan.
-
-📸 Screenshot token untuk backup!`;
-
-    await sendTelegramMessage(chatId, pesan, { parse_mode: 'HTML' });
+    await sendTelegramMessage(chatId, await getTpl('trial_success', {
+      nama: escapeHtml(firstName || telegramUsername || 'Teman'),
+      token: result.code,
+      hari: result.days,
+      package: result.package
+    }), { parse_mode: 'HTML' });
   } catch (e) {
     console.error('Trial claim error:', e.message);
     try { await sendTelegramMessage(chatId, '⚠️ Terjadi kesalahan. Coba lagi sebentar.'); } catch (err) {}
@@ -366,7 +366,7 @@ const DISABLE_PING = process.env.DISABLE_PING === 'true';
 if (!DISABLE_PING) {
   const { ipKeyGenerator } = require('express-rate-limit');
   const pingLimiter = rateLimit({
-    windowMs:2 * 1000,
+    windowMs: 2 * 1000,
     max: 1,
     keyGenerator: (req) => req.body?.jwt || ipKeyGenerator(req.ip)
   });
@@ -379,18 +379,22 @@ if (!DISABLE_PING) {
       if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'Koordinat tidak valid' });
 
       let decoded;
-      try { decoded = jwt.verify(jwtToken, JWT_USER_SECRET); } 
-      catch (e) { return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid' }); }
+      try {
+        decoded = jwt.verify(jwtToken, JWT_USER_SECRET);
+      } catch (e) {
+        return res.status(401).json({ status: 'INVALID_JWT', message: 'Sesi tidak valid atau kedaluwarsa' });
+      }
 
       const uid = decoded.uid;
+
       if (decoded.status !== 'ACTIVE') return res.status(403).json({ status: 'INACTIVE' });
       if (decoded.deviceId !== deviceId) return res.status(403).json({ status: 'HWID_MISMATCH' });
       if (consent !== true) return res.status(200).json({ status: 'NO_CONSENT' });
 
       if (paused === true) {
         if (redis) {
-          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); } 
-          catch (e) { /* abaikan */ }
+          try { await redis.set(`loc:${uid}`, JSON.stringify({ uid, paused: true, ts: new Date().toISOString() }), { ex: 60 }); }
+          catch (e) { console.error("Redis paused error:", e.message); }
         }
         return res.status(200).json({ status: 'PAUSED' });
       }
@@ -403,22 +407,24 @@ if (!DISABLE_PING) {
         appState: appState || 'foreground', consent: true, paused: false, ts: now.toISOString()
       };
 
-      // 🔥 OPTIMASI: Hanya tulis ke Firestore MAKSIMAL 1x per 5 menit, DAN hanya jika Redis sehat.
       if (redis) {
-        try {
-          const lastDbWrite = await redis.get(`last_db_write:${uid}`);
-          if (!lastDbWrite) {
-            // 1 Write saja (merge), HAPUS location_history dari sini untuk hemat kuota
-            await safeFirestoreWrite(() => db.collection('user_locations').doc(uid).set(point, { merge: true }));
-            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 }); // 5 menit
+        try { await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 }); }
+        catch (redisErr) { console.error("Redis loc error:", redisErr.message); }
+      }
+
+      try {
+        const lastDbWrite = redis ? await redis.get(`last_db_write:${uid}`) : null;
+        if (!lastDbWrite) {
+          await db.collection('user_locations').doc(uid).set(point, { merge: true });
+          await db.collection('location_history').doc(uid).collection('points').add({
+            lat, lng, accuracy: point.accuracy, speed: point.speed, bearing: point.bearing, ts: point.ts
+          });
+          if (redis) {
+            await redis.set(`last_db_write:${uid}`, 'done', { ex: 300 });
           }
-          // Simpan lokasi real-time di Redis (murah & cepat)
-          await redis.set(`loc:${uid}`, JSON.stringify(point), { ex: 60 });
-        } catch (redisErr) {
-          // 🔥 CIRCUIT BREAKER FALLBACK: Jika Redis error, JANGAN tulis ke Firestore. 
-          // Biarkan aplikasi tetap dapat 200 OK agar tidak hang.
-          console.error("Redis loc error (fallback to silent OK):", redisErr.message);
         }
+      } catch (dbErr) {
+        console.error('DB write error:', dbErr.message);
       }
 
       res.status(200).json({ status: 'OK', ts: now.toISOString(), pingInterval: 60 });
@@ -437,7 +443,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
     return res.status(403).send('Invalid Telegram Secret Token');
   }
 
-  
+  db.collection('settings').doc('app').set({ lastTelegramPing: new Date().toISOString() }, { merge: true }).catch(() => {});
 
   try {
     const update = req.body;
@@ -688,147 +694,78 @@ app.post('/api/telegram-webhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      // 🎁 DEEP-LINK: Trial Claim (match: /start, /start trial, /start trial_123456)
-if (msg.chat.type === 'private' && (text === '/start' || text.startsWith('/start trial') || text === '/trial' || text.startsWith('/trial '))) {
-  await db.collection('telegram_chats').doc(uid).set({
-    chatId: msg.chat.id, username: msg.from.username || null,
-    firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
-  }, { merge: true });
-  
-  // Kalau cuma /start biasa (tanpa parameter), tampilkan menu
-  if (text === '/start') {
-    const setDoc2 = await db.collection('settings').doc('app').get();
-    if (setDoc2.exists && setDoc2.data().maintenance === true) {
-      await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
-      return res.status(200).json({ status: 'ok' });
-    }
-
-    let statusText = '🔴 Belum ada langganan aktif';
-    try {
-      const uDoc = await db.collection('users').doc(uid).get();
-      if (uDoc.exists) {
-        const u = uDoc.data();
-        if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
-        else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
-          statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
-        else statusText = '🟠 Langganan kedaluwarsa';
+      if (text.startsWith('/start trial') || text === '/start trial') {
+        if (msg.chat.type === 'private') {
+          await db.collection('telegram_chats').doc(uid).set({
+            chatId: msg.chat.id, username: msg.from.username || null,
+            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+          }, { merge: true });
+          await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
+        }
+        return res.status(200).json({ status: 'ok' });
       }
-    } catch (e) { }
 
-    const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
-    const trialSet = await trial.getTrialSettings(db);
-    const pesan = await getTpl('beli_intro', {
-      nama: escapeHtml(msg.from.first_name),
-      status: statusText,
-      link: payLink,
-      trialDays: trialSet.days
-    });
-
-    const markup = {
-      inline_keyboard: [
-        [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
-        [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
-      ]
-    };
-
-    await sendTelegramMessage(msg.chat.id, pesan, {
-      parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
-    });
-  } else {
-    // /start trial, /start trial_123, /trial, /trial <something>
-    // 🔥 PROSES TRIAL + UPSELL VIP
-    await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
-    
-    // 🔥 BONUS: Kirim upsell VIP 1.5 detik setelah trial success (biar UX smooth)
-    setTimeout(async () => {
-      try {
-        const setDoc2 = await db.collection('settings').doc('app').get();
-        const price = (setDoc2.exists && setDoc2.data().price) ? parseInt(setDoc2.data().price) : 10000;
-        const planDays = (setDoc2.exists && setDoc2.data().planDays) ? parseInt(setDoc2.data().planDays) : 30;
-        
-        const pesan = `━━━━━━━━━━━━━━━━━━━━━━━
-
-💎 <b>MAU AKSES LEBIH LAMA?</b>
-
-Trial cuma sebentar. Upgrade ke VIP buat:
-✅ Akses <b>${planDays} hari</b> penuh
-✅ Semua fitur premium
-✅ Support prioritas
-✅ Update eksklusif
-
-Mulai dari <b>Rp ${price.toLocaleString('id-ID')}</b> aja!
-
-👇 Klik di bawah buat lanjut VIP`;
-        
-        const markup = {
-          inline_keyboard: [
-            [{ text: '💳 UPGRADE KE VIP', callback_data: 'pay_qris' }]
-          ]
-        };
-        
-        await sendTelegramMessage(msg.chat.id, pesan, {
-          parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
-        });
-      } catch (e) { 
-        console.error('Upsell message error:', e.message); 
+      if (text === '/trial' || text.startsWith('/trial ')) {
+        if (msg.chat.type === 'private') {
+          await db.collection('telegram_chats').doc(uid).set({
+            chatId: msg.chat.id, username: msg.from.username || null,
+            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+          }, { merge: true });
+          await handleTrialClaim(uid, msg.from.username, msg.chat.id, msg.from.first_name);
+        } else {
+          await sendTelegramMessage(msg.chat.id, '📩 Ketik /trial di chat pribadi bot untuk klaim trial.');
+        }
+        return res.status(200).json({ status: 'ok' });
       }
-    }, 1500);
-  }
-  return res.status(200).json({ status: 'ok' });
-}
 
-// 💳 DEEP-LINK: Beli / Donasi VIP (match: /start beli, /start beli_123456, /beli)
-if (msg.chat.type === 'private' && (text.startsWith('/start beli') || text === '/beli' || text.startsWith('/beli '))) {
-  await db.collection('telegram_chats').doc(uid).set({
-    chatId: msg.chat.id, username: msg.from.username || null,
-    firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
-  }, { merge: true });
+      if (text.startsWith('/start') || text.startsWith('/beli')) {
+        if (msg.chat.type !== 'private') {
+          await sendTelegramMessage(msg.chat.id, await getTpl('pm_redirect'));
+        } else {
+          await db.collection('telegram_chats').doc(uid).set({
+            chatId: msg.chat.id, username: msg.from.username || null,
+            firstName: msg.from.first_name || null, updatedAt: new Date().toISOString()
+          }, { merge: true });
 
-  const setDoc2 = await db.collection('settings').doc('app').get();
-  if (setDoc2.exists && setDoc2.data().maintenance === true) {
-    await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
-    return res.status(200).json({ status: 'ok' });
-  }
+          const setDoc2 = await db.collection('settings').doc('app').get();
+          if (setDoc2.exists && setDoc2.data().maintenance === true) {
+            await sendTelegramMessage(msg.chat.id, await getTpl('beli_maintenance'), { parse_mode: 'HTML' });
+            return res.status(200).json({ status: 'ok' });
+          }
 
-  let statusText = '🔴 Belum ada langganan aktif';
-  try {
-    const uDoc = await db.collection('users').doc(uid).get();
-    if (uDoc.exists) {
-      const u = uDoc.data();
-      if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
-      else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
-        statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
-      else statusText = '🟠 Langganan kedaluwarsa';
-    }
-  } catch (e) { }
+          let statusText = '🔴 Belum ada langganan aktif';
+          try {
+            const uDoc = await db.collection('users').doc(uid).get();
+            if (uDoc.exists) {
+              const u = uDoc.data();
+              if (u.status === 'BANNED') statusText = '⚫ Akun diblokir';
+              else if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate() > new Date())
+                statusText = `🟢 Aktif sampai ${u.expiredAt.toDate().toLocaleString('id-ID')}`;
+              else statusText = '🟠 Langganan kedaluwarsa';
+            }
+          } catch (e) { }
 
-  const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
-  const trialSet = await trial.getTrialSettings(db);
-  const pesan = await getTpl('beli_intro', {
-    nama: escapeHtml(msg.from.first_name),
-    status: statusText,
-    link: payLink,
-    trialDays: trialSet.days
-  });
+          const payLink = `${PAYMENT_WEB_URL}?uid=${uid}`;
+          const trialSet = await trial.getTrialSettings(db);
+          const pesan = await getTpl('beli_intro', {
+            nama: escapeHtml(msg.from.first_name),
+            status: statusText,
+            link: payLink,
+            trialDays: trialSet.days
+          });
 
-  const markup = {
-    inline_keyboard: [
-      [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
-      [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
-    ]
-  };
+          const markup = {
+            inline_keyboard: [
+              [{ text: '💳 BAYAR VIA QRIS', callback_data: 'pay_qris' }],
+              [{ text: '🎁 COBA TRIAL GRATIS', callback_data: 'trial_claim' }]
+            ]
+          };
 
-  await sendTelegramMessage(msg.chat.id, pesan, {
-    parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
-  });
-  return res.status(200).json({ status: 'ok' });
-}
-
-      // 🚨 REDIRECT GRUP: Kalau user ketik command di grup, suruh ke PM
-if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.chat.type !== 'private') {
-  await sendTelegramMessage(msg.chat.id, await getTpl('pm_redirect'));
-  return res.status(200).json({ status: 'ok' });
-}
+          await sendTelegramMessage(msg.chat.id, pesan, {
+            parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup
+          });
+        }
+      }
 
       const isBotAdmin = (String(uid) === String(process.env.OWNER_TELEGRAM_ID)) ||
         (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean).includes(String(uid));
@@ -966,16 +903,14 @@ if ((text.startsWith('/start') || text === '/trial' || text === '/beli') && msg.
         let vipCardSent = false; // flag: kartu VIP berhasil dikirim?
 
         // 📒 REGISTRY IDENTITAS ASLI (patokan sync check): dari event Telegram, anti-typo
-try {
-  const joinedAtIso = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString();
-  await db.collection('tg_registry').doc(uid).set({
-    username: username !== '-' ? String(username).toLowerCase() : null,
-    firstName,
-    src: isVip ? 'vip' : 'public',
-    joinedAt: joinedAtIso,          // ✅ waktu join akurat, tersimpan permanen
-    updatedAt: joinedAtIso          // ✅ konsisten sama joinedAt
-  }, { merge: true });
-} catch (e) { /* abaikan */ }
+        try {
+          await db.collection('tg_registry').doc(uid).set({
+            username: username !== '-' ? String(username).toLowerCase() : null,
+            firstName,
+            src: isVip ? 'vip' : 'public',
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+        } catch (e) { /* abaikan */ }
 
         // ===== 🌟 GRUP VIP: Coba kirim kartu keanggotaan otomatis =====
         if (isVip && username && username !== '-') {
@@ -998,12 +933,10 @@ try {
 
                 const setDoc = await db.collection('settings').doc('app').get();
                 const planDays = (setDoc.exists && setDoc.data().planDays) ? parseInt(setDoc.data().planDays) : 30;
-                // ✅ BARU — waktu event JOIN dari Telegram (msg.date = UNIX timestamp sisi Telegram, akurat detik)
-const joinedAt = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000);
-const joinDate = joinedAt.toLocaleString('id-ID', {
-  day: '2-digit', month: '2-digit', year: 'numeric',
-  hour: '2-digit', minute: '2-digit', hour12: false
-});
+                const joinDate = new Date().toLocaleString('id-ID', {
+                  day: 'numeric', month: 'short', year: 'numeric',
+                  hour: '2-digit', minute: '2-digit', hour12: false
+                });
 
                 let expiredLabel = '⏳ Aktif s/d : <b>mulai dihitung saat login pertama di app</b>';
                 if (u.status === 'ACTIVE' && u.expiredAt && u.expiredAt.toDate) {
@@ -1065,12 +998,9 @@ const joinDate = joinedAt.toLocaleString('id-ID', {
         // ===== 📢 WELCOME STANDAR (untuk PUBLIK atau VIP yang belum terdaftar) =====
 
         // ===== 📢 GRUP PUBLIK: Welcome lama (upsell) =====
-        // ✅ BARU — pakai joinedAt yang udah dihitung di FIX #1 (kalau lu taruh perhitungannya di atas loop)
-// Atau hitung ulang di sini biar self-contained:
-const joinedAtPub = new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000);
-const tanggal = joinedAtPub.toLocaleDateString('id-ID', {
-  day: '2-digit', month: '2-digit', year: 'numeric'
-});
+        const tanggal = new Date().toLocaleDateString('id-ID', {
+          day: 'numeric', month: 'long', year: 'numeric'
+        });
 
         const setDoc = await db.collection('settings').doc('app').get();
         const price = (setDoc.exists && setDoc.data().price) ? parseInt(setDoc.data().price) : 10000;
@@ -1223,7 +1153,7 @@ app.post('/api/payment-webhook', async (req, res) => {
     }
     if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
 
-    
+    db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
 
     const setDocP = await db.collection('settings').doc('app').get();
     const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
@@ -1524,29 +1454,10 @@ app.post('/api/mod/check', checkLimiter, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🔁 FLUSH FALLBACK QUEUE: Redis → Firestore (aman dipanggil berkala, idempoten)
-app.get('/api/cron/sync-fallback', async (req, res) => {
-  try {
-    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).send('Unauthorized');
-    const r = await drain(redis, db, FALLBACK_HANDLERS);
-    res.json({ status: 'OK', ...r });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// 👀 PANTAU ukuran antrean fallback (debug endpoint)
-app.get('/api/fallback-status', async (req, res) => {
-  const q = redis ? await redis.llen('fb:queue') : -1;
-  const d = redis ? await redis.scard('fb:done')  : -1;
-  res.json({ queue: q, done: d });
-});
-
-
 // E. Cron
 app.get('/api/cron/check-expired', async (req, res) => {
   try {
     if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).send('Unauthorized');
-    // 🔥 AUTO-FLUSH fallback queue tiap cron tick (biar data di Redis masuk Firestore saat kuota pulih)
-    try { await drain(redis, db, FALLBACK_HANDLERS); } catch (e) { console.error('drain error:', e.message); }
     const now = new Date();
     const snapshot = await db.collection('users').where('status', '==', 'ACTIVE').where('expiredAt', '<', now).get();
     let expiredCount = 0;
@@ -1663,11 +1574,3 @@ app.get('/api/cron/check-expired', async (req, res) => {
 app.use('/api/admin', require('./adminRoutes'));
 
 module.exports = app;
-
-// ===== FIX BUAT VPS / DOCKER =====
-if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Aphelion backend listening on port ${PORT}`);
-  });
-}
