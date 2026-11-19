@@ -443,7 +443,6 @@ if (!DISABLE_PING) {
       res.status(500).json({ error: e.message });
     }
   });
-}
 } else {
   console.log('🔴 Location ping endpoint disabled (DISABLE_PING=true)');
 }
