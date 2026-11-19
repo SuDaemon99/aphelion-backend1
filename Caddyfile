@@ -1,0 +1,15 @@
+api.aphelion.my.id {
+  reverse_proxy app:3000
+  encode gzip zstd
+  header {
+    Strict-Transport-Security "max-age=63072000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+  }
+}
+
+pay.aphelion.my.id {
+  root * /app/pay
+  file_server
+  encode gzip
+}
