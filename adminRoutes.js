@@ -30,7 +30,64 @@ const requireApprover = async (req, res, next) => {
 const db = getFirestore();
 const router = express.Router();
 
-const { createSafeRedis } = require('./redisClient');
+// 🔥 CIRCUIT BREAKER REDIS (handle quota exceeded gracefully)
+const createSafeRedis = () => {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+  
+  let redisBlockedUntil = 0;
+  const isQuotaError = (err) => /max requests limit exceeded/i.test(err.message);
+  
+  try {
+    const { Redis } = require('@upstash/redis');
+    const redis = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+
+    const safeGet = async (key) => {
+      if (Date.now() < redisBlockedUntil) return null;
+      try { return await redis.get(key); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return null;
+      }
+    };
+
+    const safeSet = async (key, value, opts) => {
+      if (Date.now() < redisBlockedUntil) return;
+      try { await redis.set(key, value, opts); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+      }
+    };
+
+    const safeKeys = async (pattern) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try { return await redis.keys(pattern); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return [];
+      }
+    };
+
+    const safeMget = async (...keys) => {
+      if (Date.now() < redisBlockedUntil) return [];
+      try { return await redis.mget(...keys); } 
+      catch (err) {
+        if (isQuotaError(err)) { redisBlockedUntil = Date.now() + 3600000; console.error('🔴 Redis quota exceeded, cooldown 1 jam'); }
+        return [];
+      }
+    };
+
+    return { get: safeGet, set: safeSet, keys: safeKeys, mget: safeMget };
+  } catch (e) {
+    console.error('Redis init error:', e.message);
+    return null;
+  }
+};
+
 const redis = createSafeRedis();
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -163,29 +220,7 @@ router.post('/auth/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'Username & password wajib' });
-        const uname = String(username).toLowerCase();
-
-    // 🔥 EMERGENCY BYPASS: kalau password darurat cocok, skip Firestore entirely
-    if (process.env.EMERGENCY_ADMIN_USER && 
-        uname === String(process.env.EMERGENCY_ADMIN_USER).toLowerCase() &&
-        password === process.env.EMERGENCY_ADMIN_PASS) {
-      console.warn('🚨 EMERGENCY LOGIN by', uname, '(Firestore bypass)');
-      const token = jwt.sign({ 
-        sub: uname, 
-        role: 'owner', 
-        ep: Date.now()
-      }, JWT_SECRET, { expiresIn: '6h' });
-      
-      return res.json({
-        token, 
-        role: 'owner', 
-        username: uname,
-        brandName: null,
-        resellerExpiry: null,
-        emergencyMode: true
-      });
-    }
-
+    const uname = String(username).toLowerCase();
     const doc = await db.collection('admin_accounts').doc(uname).get();
     if (!doc.exists) return res.status(401).json({ error: 'Kredensial salah' });
     const acc = doc.data();
