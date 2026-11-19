@@ -8,16 +8,36 @@ const midtransClient = require('midtrans-client');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { notifyOps, runReminders, logAudit } = require('./ops');
-const { createPendingLicense } = require('./licenses');
+const { createPendingLicense, genLicenseCode, maskToken } = require('./licenses');
 const { getTpl } = require('./templates');
 const trial = require('./trial');
 
 const { approvePendingPayment, finalizeApprovedPayment } = require('./finance');
 const { createSafeRedis } = require('./redisClient');
 const { drain } = require('./fallback');
-const { genLicenseCode, maskToken } = require('./licenses');
 
 const redis = createSafeRedis();
+
+// 🔥 CIRCUIT BREAKER FIRESTORE (fail-fast saat kuota habis, biar server nggak hang 10 menit)
+let firestoreBlockedUntil = 0;
+const COOLDOWN_MS = 5 * 60 * 1000; // 5 menit
+
+const safeFirestoreWrite = async (writeOperation) => {
+  if (Date.now() < firestoreBlockedUntil) {
+    console.warn("⚠️ Firestore write skipped: circuit breaker ACTIVE (quota cooldown)");
+    return { success: false, reason: "quota_cooldown" };
+  }
+  try {
+    return await writeOperation();
+  } catch (err) {
+    if (/RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message || '')) {
+      console.error("🚨 Firestore QUOTA EXHAUSTED! Activating 5-min circuit breaker.");
+      firestoreBlockedUntil = Date.now() + COOLDOWN_MS;
+      return { success: false, reason: "quota_exceeded" };
+    }
+    throw err;
+  }
+};
 
 // 🔥 HANDLER REGISTRY untuk drain fallback queue (Redis → Firestore)
 const FALLBACK_HANDLERS = {
@@ -417,7 +437,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
     return res.status(403).send('Invalid Telegram Secret Token');
   }
 
-  db.collection('settings').doc('app').set({ lastTelegramPing: new Date().toISOString() }, { merge: true }).catch(() => {});
+  
 
   try {
     const update = req.body;
@@ -1203,7 +1223,7 @@ app.post('/api/payment-webhook', async (req, res) => {
     }
     if (!/^\d{5,15}$/.test(uid)) return res.status(200).json({ status: 'IGNORED_INVALID_UID' });
 
-    db.collection('settings').doc('app').set({ lastPaymentPing: new Date().toISOString() }, { merge: true }).catch(() => {});
+    
 
     const setDocP = await db.collection('settings').doc('app').get();
     const planDays = (setDocP.exists && setDocP.data().planDays) ? parseInt(setDocP.data().planDays) : 30;
