@@ -13,17 +13,14 @@ const maskToken = (t) => {
 };
 
 // 1 request = 1 token. Durasi BELUM jalan (expiredAt null) sampai login pertama.
-// ✅ DUKUNG PRE-GEN ID + CODE (buat fallback idempoten). Kalau tidak dikirim, auto-generate (backward compat).
-const createPendingLicense = async (db, { packageName, durationDays, createdBy, source, docId, code, username, ownerTgUid }) => {
-  const finalCode = code || genLicenseCode();
-  const ref = docId ? db.collection('users').doc(docId) : db.collection('users').doc();
-  await ref.set({
+const createPendingLicense = async (db, { packageName, durationDays, createdBy, source }) => {
+  const code = genLicenseCode();
+  const ref = await db.collection('users').add({
     uid: null,
-    username: username || null,
-    ownerTgUid: ownerTgUid || null,
+    username: null,
     email: null,
-    token: finalCode,
-    tokenMasked: maskToken(finalCode),
+    token: code,
+    tokenMasked: maskToken(code),
     packageName: packageName || null,
     durationDays: parseInt(durationDays) || 30,
     status: 'PENDING',
@@ -39,7 +36,7 @@ const createPendingLicense = async (db, { packageName, durationDays, createdBy, 
     remindedH1: false,
     createdAt: new Date().toISOString()
   });
-  return { id: ref.id, code: finalCode, masked: maskToken(finalCode) };
+  return { id: ref.id, code, masked: maskToken(code) };
 };
 
-module.exports = { genLicenseCode, maskToken, createPendingLicense };
+module.exports = { genLicenseCode, maskToken, createPendingLicense }; 
